@@ -1,0 +1,6 @@
+{
+  "name": "Battle Royale FPS",
+  "description": "Full-bleed 3D battle royale tactical shooter featuring test range and harbor terrain, procedural IK-rigged dummies, customizable abilities, and multi-tier arsenal.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
