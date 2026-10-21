@@ -5136,6 +5136,22 @@ export default function BattleRoyaleGame() {
       updateVitals();
     }
 
+    // ----------------------------------------------------
+    // Headless-only test hook (never active for real players)
+    // Enables automated e2e verification of grenade/cover mechanics.
+    // ----------------------------------------------------
+    if (isHeadless) {
+      (window as any).__brTest = {
+        giveGrenade: (kind: string = 'blast', n: number = 1) => {
+          (grenades as any)[kind] = ((grenades as any)[kind] ?? 0) + n;
+          refreshGrenades();
+        },
+        grenadeCounts: () => ({ ...(grenades as any) }),
+        destructibleCount: () => destructibles.size,
+        isPlayerDown: () => playerDown,
+      };
+    }
+
     renderer.autoClear = false;
     scene.traverse((o: any) => {
       if (o.isLight) o.layers.enable(1);
