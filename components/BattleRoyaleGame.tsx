@@ -8,11 +8,11 @@ import {
   blastShare,
   calculateXpProgression,
   calculateShieldRegen,
-  LEVEL_COST,
-  MAX_LEVEL,
-  isCoverBlocked,
   calculateStructureDamage,
   calculateVoxelImpulse,
+  isCoverBlocked,
+  LEVEL_COST,
+  MAX_LEVEL,
 } from '@/lib/game-math';
 
 export default function BattleRoyaleGame() {
@@ -61,8 +61,6 @@ export default function BattleRoyaleGame() {
     const downedEl = $('downed');
     const downedTimerEl = $('downedTimer');
     const creditsEl = $('credits');
-    const buildWallBtn = $('buildWallBtn');
-    const touchBuildBtn = $('touchBuildBtn');
 
     // Touch device detection
     const touchDevice =
@@ -468,51 +466,498 @@ export default function BattleRoyaleGame() {
     const shootable: THREE.Object3D[] = [];
 
     // ----------------------------------------------------
-    // Fortnite-Style Physical Voxel Destruction & Building
+    // Voxel Destruction — Fortnite-style structural damage
+    // Every wall / crate / slab is secretly a grid of voxel
+    // chunks. Blasts and bullets chew chunks away; collision
+    // is rebuilt from the survivors, so cover wears out.
     // ----------------------------------------------------
-    interface DestructibleObject {
-      id: string;
-      mesh: THREE.Object3D;
-      solid: SolidBox;
-      hp: number;
-      maxHp: number;
-      kind: 'crate' | 'wood' | 'building' | 'brick' | 'metal';
-      color: number | THREE.Color;
-      bounds: { x: number; y: number; z: number; w: number; h: number; d: number };
-      healthBarGroup?: THREE.Group;
-      healthBarFill?: THREE.Mesh;
-      healthBarTimer?: number;
+    const VOX_SIZE = 0.55;
+    const VOX_MAX_DIM = 96;
+    const voxHpMap = new WeakMap<THREE.Material, number>();
+    const voxBoxes: VoxelBox[] = [];
+    const voxFlashGeo = new THREE.SphereGeometry(1, 12, 8);
+    const voxTmpM = new THREE.Matrix4();
+    const voxTmpC = new THREE.Color();
+    const voxTmpP = new THREE.Vector3();
+    const voxTmpQ = new THREE.Quaternion();
+    const voxTmpS = new THREE.Vector3();
+
+    interface VoxelBox {
+      mesh: THREE.Mesh;
+      color: THREE.Color;
+      nx: number;
+      ny: number;
+      nz: number;
+      sx: number;
+      sy: number;
+      sz: number;
+      x0: number;
+      y0: number;
+      z0: number;
+      hp: Float32Array;
+      alive: Uint8Array;
+      order: Int32Array;
+      slotOf: Int32Array;
+      aliveCount: number;
+      total: number;
+      inst: THREE.InstancedMesh | null;
+      solidRefs: SolidBox[];
+      deadSinceBuild: number;
+      gone: boolean;
+      // Fortnite-style structural integrity (same kind as BR-web):
+      // every structure tracks a total HP pool, shows a health bar and
+      // collapses once it has been gutted past the point of no return.
+      voxHp: number;
+      poolHp: number;
+      dmgTaken: number;
+      barGroup: THREE.Group | null;
+      barFill: THREE.Mesh | null;
+      barTimer: number;
+      collapsed: boolean;
     }
 
-    const destructibles = new Map<THREE.Object3D, DestructibleObject>();
-    const solidToDestructible = new Map<SolidBox, DestructibleObject>();
+    function registerDestructible(b: SolidBox, mesh: THREE.Mesh, mat: THREE.Material) {
+      const bottom = b.bottom ?? 0;
+      const nx = Math.max(1, Math.min(VOX_MAX_DIM, Math.round((b.hx * 2) / VOX_SIZE)));
+      const ny = Math.max(1, Math.min(VOX_MAX_DIM, Math.round((b.top - bottom) / VOX_SIZE)));
+      const nz = Math.max(1, Math.min(VOX_MAX_DIM, Math.round((b.hz * 2) / VOX_SIZE)));
+      const total = nx * ny * nz;
+      const voxHp = voxHpMap.get(mat) ?? 100;
+      const order = new Int32Array(total);
+      const slotOf = new Int32Array(total);
+      for (let i = 0; i < total; i++) {
+        order[i] = i;
+        slotOf[i] = i;
+      }
+      const v: VoxelBox = {
+        mesh,
+        color: (mat as THREE.MeshLambertMaterial).color.clone(),
+        nx,
+        ny,
+        nz,
+        sx: (b.hx * 2) / nx,
+        sy: (b.top - bottom) / ny,
+        sz: (b.hz * 2) / nz,
+        x0: b.x - b.hx,
+        y0: bottom,
+        z0: b.z - b.hz,
+        hp: new Float32Array(total).fill(voxHp),
+        alive: new Uint8Array(total).fill(1),
+        order,
+        slotOf,
+        aliveCount: total,
+        total,
+        inst: null,
+        solidRefs: [b],
+        deadSinceBuild: 0,
+        gone: false,
+        voxHp,
+        poolHp: total * voxHp,
+        dmgTaken: 0,
+        barGroup: null,
+        barFill: null,
+        barTimer: 0,
+        collapsed: false,
+      };
+      mesh.userData.vox = v;
+      voxBoxes.push(v);
+    }
 
-    interface VoxelDebris {
+    function voxCenter(v: VoxelBox, idx: number, out: THREE.Vector3) {
+      const i = idx % v.nx;
+      const t = (idx / v.nx) | 0;
+      const j = t % v.ny;
+      const k = (t / v.ny) | 0;
+      out.set(v.x0 + (i + 0.5) * v.sx, v.y0 + (j + 0.5) * v.sy, v.z0 + (k + 0.5) * v.sz);
+      return out;
+    }
+
+    // First structural hit swaps the plain box for a chunky voxel InstancedMesh
+    function ensureInstanced(v: VoxelBox) {
+      if (v.inst || v.gone) return;
+      const inst = new THREE.InstancedMesh(
+        new THREE.BoxGeometry(1, 1, 1),
+        new THREE.MeshLambertMaterial({ color: 0xffffff }),
+        v.total
+      );
+      inst.frustumCulled = false;
+      inst.castShadow = true;
+      inst.receiveShadow = true;
+      inst.userData.vox = v;
+      voxTmpQ.identity();
+      voxTmpS.set(v.sx * 0.96, v.sy * 0.96, v.sz * 0.96);
+      for (let s = 0; s < v.aliveCount; s++) {
+        voxCenter(v, v.order[s], voxTmpP);
+        voxTmpM.compose(voxTmpP, voxTmpQ, voxTmpS);
+        inst.setMatrixAt(s, voxTmpM);
+        inst.setColorAt(s, voxTmpC.copy(v.color).multiplyScalar(0.86 + Math.random() * 0.28));
+      }
+      inst.count = v.aliveCount;
+      inst.instanceMatrix.needsUpdate = true;
+      world.add(inst);
+      shootable.push(inst);
+      v.mesh.visible = false;
+      const si = shootable.indexOf(v.mesh);
+      if (si >= 0) shootable.splice(si, 1);
+      v.inst = inst;
+      rebuildSolids(v);
+    }
+
+    function killVoxel(v: VoxelBox, slot: number, chips: number) {
+      const inst = v.inst;
+      if (!inst || v.gone) return;
+      const idx = v.order[slot];
+      v.alive[idx] = 0;
+      v.hp[idx] = 0;
+      v.slotOf[idx] = -1;
+      const last = v.aliveCount - 1;
+      if (slot !== last) {
+        const moved = v.order[last];
+        v.order[slot] = moved;
+        v.slotOf[moved] = slot;
+        inst.getMatrixAt(last, voxTmpM);
+        inst.setMatrixAt(slot, voxTmpM);
+        inst.getColorAt(last, voxTmpC);
+        inst.setColorAt(slot, voxTmpC);
+      }
+      v.aliveCount = last;
+      inst.count = last;
+      inst.instanceMatrix.needsUpdate = true;
+      if (inst.instanceColor) inst.instanceColor.needsUpdate = true;
+      v.deadSinceBuild++;
+      voxCenter(v, idx, voxTmpP);
+      spawnDebris(voxTmpP.x, voxTmpP.y, voxTmpP.z, v.color, chips);
+      if (v.aliveCount === 0) {
+        v.gone = true;
+        world.remove(inst);
+        const si = shootable.indexOf(inst);
+        if (si >= 0) shootable.splice(si, 1);
+        inst.geometry.dispose();
+        (inst.material as THREE.Material).dispose();
+        inst.dispose();
+        v.inst = null;
+        for (const r of v.solidRefs) {
+          const i = solids.indexOf(r);
+          if (i >= 0) solids.splice(i, 1);
+        }
+        v.solidRefs.length = 0;
+        if (v.barGroup) {
+          disposeBar(v.barGroup);
+          v.barGroup = null;
+          v.barFill = null;
+          v.barTimer = 0;
+        }
+        // Fully carved out on its own (no collapse involved): same
+        // demolition fanfare as the BR-web version.
+        if (!v.collapsed) {
+          v.collapsed = true;
+          playSfx('shatter');
+          const anchor = voxBarAnchor(v, voxTmpP).clone();
+          anchor.y += 0.5;
+          showDamagePopup('💥 DESTROYED', anchor, '#ef4444', true);
+          const ring = new THREE.Mesh(
+            shockGeo,
+            new THREE.MeshBasicMaterial({ color: 0x9ca3af, transparent: true, opacity: 0.5, depthWrite: false })
+          );
+          ring.position.set(anchor.x, groundAt(anchor.x, anchor.z) + 0.1, anchor.z);
+          scene.add(ring);
+          effects.push({ kind: 'shock', mesh: ring, t: 0, life: 0.35, radius: Math.max(v.nx * v.sx, v.nz * v.sz) * 1.5 });
+        }
+      }
+    }
+
+    // Re-derive movement / grenade collision from surviving voxels: every vertical
+    // run of chunks in a column becomes one box; identical columns merge along x
+    function rebuildSolids(v: VoxelBox) {
+      v.deadSinceBuild = 0;
+      for (const r of v.solidRefs) {
+        const i = solids.indexOf(r);
+        if (i >= 0) solids.splice(i, 1);
+      }
+      v.solidRefs.length = 0;
+      if (v.gone || v.aliveCount === 0) return;
+      const { nx, ny, nz, sx, sy, sz, x0, y0, z0 } = v;
+      const spansAt = (i: number, k: number) => {
+        const out: number[] = [];
+        let j0 = -1;
+        for (let j = 0; j < ny; j++) {
+          if (v.alive[i + nx * (j + ny * k)]) {
+            if (j0 < 0) j0 = j;
+          } else if (j0 >= 0) {
+            out.push(j0 * 256 + (j - 1));
+            j0 = -1;
+          }
+        }
+        if (j0 >= 0) out.push(j0 * 256 + (ny - 1));
+        return out;
+      };
+      for (let k = 0; k < nz; k++) {
+        let runI = 0;
+        let runSpans: number[] | null = null;
+        for (let i = 0; i <= nx; i++) {
+          const spans = i < nx ? spansAt(i, k) : null;
+          const prev = runSpans;
+          const same = !!(spans && prev && spans.length === prev.length && spans.every((s, q) => s === prev[q]));
+          if (!same) {
+            if (runSpans) {
+              for (const s of runSpans) {
+                const j0 = (s / 256) | 0;
+                const j1 = s % 256;
+                v.solidRefs.push({
+                  x: x0 + (runI + (i - runI) / 2) * sx,
+                  z: z0 + (k + 0.5) * sz,
+                  hx: ((i - runI) * sx) / 2,
+                  hz: sz / 2,
+                  top: y0 + (j1 + 1) * sy,
+                  bottom: y0 + j0 * sy,
+                });
+              }
+            }
+            runI = i;
+            runSpans = spans;
+          }
+        }
+      }
+      for (const r of v.solidRefs) solids.push(r);
+    }
+
+    // Bullets chip the voxel they strike
+    function chipVoxelAtPoint(v: VoxelBox, p: THREE.Vector3, dmg: number) {
+      if (v.gone || v.aliveCount === 0) return;
+      ensureInstanced(v);
+      const i = Math.min(v.nx - 1, Math.max(0, Math.floor((p.x - v.x0) / v.sx)));
+      const j = Math.min(v.ny - 1, Math.max(0, Math.floor((p.y - v.y0) / v.sy)));
+      const k = Math.min(v.nz - 1, Math.max(0, Math.floor((p.z - v.z0) / v.sz)));
+      const idx = i + v.nx * (j + v.ny * k);
+      if (!v.alive[idx]) return;
+      v.hp[idx] -= dmg;
+      // Fortnite-style feedback: damage number, health bar, hit SFX
+      noteVoxDamage(v, dmg, p);
+      if (v.hp[idx] <= 0) {
+        const slot = v.slotOf[idx];
+        if (slot >= 0) killVoxel(v, slot, 2);
+        if (v.deadSinceBuild >= Math.max(2, v.total >> 5)) rebuildSolids(v);
+      }
+    }
+
+    // A blast eats voxel chunks out of every structure within reach
+    function carveBlast(x: number, y: number, z: number, radius: number, dmg: number) {
+      const r = Math.min(radius * 0.4, 3.6);
+      const r2 = r * r;
+      for (const v of voxBoxes) {
+        if (v.gone) continue;
+        const x1 = v.x0 + v.nx * v.sx;
+        const y1 = v.y0 + v.ny * v.sy;
+        const z1 = v.z0 + v.nz * v.sz;
+        const dx = Math.max(v.x0 - x, 0, x - x1);
+        const dy = Math.max(v.y0 - y, 0, y - y1);
+        const dz = Math.max(v.z0 - z, 0, z - z1);
+        if (dx * dx + dy * dy + dz * dz > r2) continue;
+        ensureInstanced(v);
+        let changed = false;
+        let acc = 0;
+        for (let s = 0; s < v.aliveCount; s++) {
+          const idx = v.order[s];
+          voxCenter(v, idx, voxTmpP);
+          const dxc = voxTmpP.x - x;
+          const dyc = voxTmpP.y - y;
+          const dzc = voxTmpP.z - z;
+          const d2 = dxc * dxc + dyc * dyc + dzc * dzc;
+          if (d2 >= r2) continue;
+          const d = Math.sqrt(d2);
+          const hit = dmg * (1 - d / r);
+          v.hp[idx] -= hit;
+          acc += hit;
+          if (v.hp[idx] <= 0) {
+            killVoxel(v, s, d < r * 0.35 ? 3 : d < r * 0.7 ? 2 : 1);
+            s--;
+            changed = true;
+          }
+        }
+        if (changed) rebuildSolids(v);
+        // Total demolition damage pops once per structure (same as BR-web)
+        if (acc > 0) noteVoxDamage(v, acc);
+      }
+    }
+
+    // Line-of-sight test: any solid box between the blast and its target eats the damage,
+    // so taking cover behind a wall really protects you (until the wall is blown apart)
+    function blastClear(x0: number, y0: number, z0: number, x1: number, y1: number, z1: number) {
+      const dx = x1 - x0;
+      const dy = y1 - y0;
+      const dz = z1 - z0;
+      for (const b of solids) {
+        const bot = b.bottom ?? 0;
+        let tmin = 0;
+        let tmax = 1;
+        const slab = (lo: number, hi: number, o: number, d: number) => {
+          if (Math.abs(d) < 1e-9) return o >= lo && o <= hi;
+          let tA = (lo - o) / d;
+          let tB = (hi - o) / d;
+          if (tA > tB) {
+            const tt = tA;
+            tA = tB;
+            tB = tt;
+          }
+          if (tA > tmin) tmin = tA;
+          if (tB < tmax) tmax = tB;
+          return tmin <= tmax;
+        };
+        if (!slab(b.x - b.hx, b.x + b.hx, x0, dx)) continue;
+        if (!slab(b.z - b.hz, b.z + b.hz, z0, dz)) continue;
+        if (!slab(bot, b.top, y0, dy)) continue;
+        return false; // a structure stands between blast and target
+      }
+      return true;
+    }
+
+    // Fire zones respect cover too: deep inside the flames you always burn,
+    // at the rim a wall between you and the fire shields you
+    function fireClear(ex: number, ez: number, dd: number, deepR: number, tx: number, ty: number, tz: number) {
+      if (dd <= deepR) return true;
+      const ux = (tx - ex) / dd;
+      const uz = (tz - ez) / dd;
+      const px = ex + ux * deepR;
+      const pz = ez + uz * deepR;
+      return blastClear(px, groundAt(px, pz) + 0.45, pz, tx, ty, tz);
+    }
+
+    interface DebrisPiece {
       mesh: THREE.Mesh;
       vx: number;
       vy: number;
       vz: number;
       rx: number;
       ry: number;
-      rz: number;
       t: number;
       life: number;
-      baseScaleX: number;
-      baseScaleY: number;
-      baseScaleZ: number;
+      s: number;
+      on: boolean;
     }
-    const activeVoxels: VoxelDebris[] = [];
-    const sharedVoxelGeo = new THREE.BoxGeometry(1, 1, 1);
+    const debrisGeo = new THREE.BoxGeometry(1, 1, 1);
+    const debrisPool: DebrisPiece[] = [];
+    const DEBRIS_MAX = 130;
 
-    interface DamagePopup {
-      sprite: THREE.Sprite;
-      texture: THREE.CanvasTexture;
-      mat: THREE.SpriteMaterial;
-      t: number;
-      life: number;
-      vy: number;
+    function spawnDebris(
+      x: number,
+      y: number,
+      z: number,
+      color: THREE.Color,
+      n: number,
+      scale = 1,
+      vel?: { vx: number; vy: number; vz: number }
+    ) {
+      for (let q = 0; q < n; q++) {
+        let p = debrisPool.find((d) => !d.on);
+        if (!p) {
+          if (debrisPool.length >= DEBRIS_MAX) return;
+          p = {
+            mesh: new THREE.Mesh(debrisGeo, new THREE.MeshLambertMaterial({ color: 0xffffff })),
+            vx: 0,
+            vy: 0,
+            vz: 0,
+            rx: 0,
+            ry: 0,
+            t: 0,
+            life: 1,
+            s: 0.25,
+            on: false,
+          };
+          world.add(p.mesh);
+          debrisPool.push(p);
+        }
+        p.on = true;
+        p.t = 0;
+        p.life = 0.9 + Math.random() * 0.7;
+        p.s = (0.18 + Math.random() * 0.2) * scale;
+        p.mesh.visible = true;
+        p.mesh.position.set(x, y, z);
+        p.mesh.rotation.set(Math.random() * 3, Math.random() * 3, Math.random() * 3);
+        p.mesh.scale.setScalar(p.s);
+        (p.mesh.material as THREE.MeshLambertMaterial).color.copy(color).multiplyScalar(0.7 + Math.random() * 0.55);
+        if (vel) {
+          p.vx = vel.vx;
+          p.vy = vel.vy;
+          p.vz = vel.vz;
+        } else {
+          const a = Math.random() * Math.PI * 2;
+          const sp = 1.5 + Math.random() * 4;
+          p.vx = Math.cos(a) * sp;
+          p.vz = Math.sin(a) * sp;
+          p.vy = 2.5 + Math.random() * 5;
+        }
+        p.rx = (Math.random() - 0.5) * 16;
+        p.ry = (Math.random() - 0.5) * 16;
+      }
     }
-    const damagePopups: DamagePopup[] = [];
+
+    function updateDebris(dt: number) {
+      for (const p of debrisPool) {
+        if (!p.on) continue;
+        p.t += dt;
+        if (p.t >= p.life) {
+          p.on = false;
+          p.mesh.visible = false;
+          continue;
+        }
+        p.vy -= 22 * dt;
+        p.mesh.position.x += p.vx * dt;
+        p.mesh.position.y += p.vy * dt;
+        p.mesh.position.z += p.vz * dt;
+        const g = groundAt(p.mesh.position.x, p.mesh.position.z) + p.s * 0.5;
+        if (p.mesh.position.y < g) {
+          p.mesh.position.y = g;
+          if (p.vy < 0) p.vy = -p.vy * 0.35;
+          p.vx *= 0.6;
+          p.vz *= 0.6;
+          p.rx *= 0.5;
+          p.ry *= 0.5;
+        }
+        p.mesh.rotation.x += p.rx * dt;
+        p.mesh.rotation.y += p.ry * dt;
+        p.mesh.scale.setScalar(p.s * Math.min(1, (p.life - p.t) / (p.life * 0.35)));
+      }
+    }
+
+    function resetVox() {
+      resetBuildables();
+      for (const v of voxBoxes) {
+        if (v.inst) {
+          world.remove(v.inst);
+          const si = shootable.indexOf(v.inst);
+          if (si >= 0) shootable.splice(si, 1);
+          v.inst.geometry.dispose();
+          (v.inst.material as THREE.Material).dispose();
+          v.inst.dispose();
+          v.inst = null;
+        }
+        for (const r of v.solidRefs) {
+          const i = solids.indexOf(r);
+          if (i >= 0) solids.splice(i, 1);
+        }
+        v.solidRefs.length = 0;
+        v.gone = true;
+        if (v.barGroup) {
+          disposeBar(v.barGroup);
+          v.barGroup = null;
+          v.barFill = null;
+          v.barTimer = 0;
+        }
+      }
+      voxBoxes.length = 0;
+      for (const p of debrisPool) {
+        p.on = false;
+        p.mesh.visible = false;
+      }
+    }
+
+    // ----------------------------------------------------
+    // Fortnite-Style Destruction Feedback (ported from BR-web)
+    // Procedural Web Audio SFX, floating damage numbers,
+    // structure health bars and structural collapse — layered
+    // on top of the voxel system so carved-out structures
+    // still show their remaining integrity before failing.
+    // ----------------------------------------------------
 
     // Procedural Web Audio Synthesizer (Zero External Dependencies)
     let audioCtx: AudioContext | null = null;
@@ -620,8 +1065,19 @@ export default function BattleRoyaleGame() {
     }
 
     // Floating 3D Damage Numbers (Fortnite Style)
+    interface DamagePopup {
+      sprite: THREE.Sprite;
+      texture: THREE.CanvasTexture;
+      mat: THREE.SpriteMaterial;
+      t: number;
+      life: number;
+      vy: number;
+    }
+    const damagePopups: DamagePopup[] = [];
+
     function showDamagePopup(text: string, pos: THREE.Vector3, color = '#facc15', isBig = false) {
       if (typeof document === 'undefined') return;
+      if (damagePopups.length > 60) return; // soft cap for sustained fire
       const cvs = document.createElement('canvas');
       cvs.width = 256;
       cvs.height = 128;
@@ -651,115 +1107,182 @@ export default function BattleRoyaleGame() {
       damagePopups.push({ sprite, texture, mat, t: 0, life: 1.1, vy: 1.6 });
     }
 
-    function registerDestructible(dest: DestructibleObject) {
-      destructibles.set(dest.mesh, dest);
-      solidToDestructible.set(dest.solid, dest);
-      dest.mesh.userData.destructible = dest;
-      // Also register children if group
-      dest.mesh.traverse((child) => {
-        child.userData.destructible = dest;
+    // World-space structure health bar shared by voxel boxes and built walls
+    function makeHealthBar(): { group: THREE.Group; fill: THREE.Mesh } {
+      const g = new THREE.Group();
+      const bgGeo = new THREE.PlaneGeometry(1.6, 0.16);
+      const bgMat = new THREE.MeshBasicMaterial({ color: 0x090d14, side: THREE.DoubleSide });
+      const bg = new THREE.Mesh(bgGeo, bgMat);
+      g.add(bg);
+      const fillGeo = new THREE.PlaneGeometry(1.56, 0.12);
+      const fillMat = new THREE.MeshBasicMaterial({ color: 0x22c55e, side: THREE.DoubleSide });
+      const fill = new THREE.Mesh(fillGeo, fillMat);
+      fill.position.z = 0.01;
+      g.add(fill);
+      return { group: g, fill };
+    }
+
+    function setBarFill(fill: THREE.Mesh, pct: number) {
+      const p = Math.max(0, Math.min(1, pct));
+      fill.scale.x = p;
+      fill.position.x = -(1 - p) * 0.78;
+      const col = p > 0.5 ? 0x22c55e : p > 0.25 ? 0xf59e0b : 0xef4444;
+      (fill.material as THREE.MeshBasicMaterial).color.setHex(col);
+    }
+
+    function disposeBar(g: THREE.Group | null) {
+      if (!g) return;
+      world.remove(g);
+      g.traverse((o: any) => {
+        o.geometry?.dispose?.();
+        o.material?.dispose?.();
       });
     }
 
-    function showHealthBar(dest: DestructibleObject) {
-      if (!dest.healthBarGroup) {
-        const g = new THREE.Group();
-        const bgGeo = new THREE.PlaneGeometry(1.6, 0.16);
-        const bgMat = new THREE.MeshBasicMaterial({ color: 0x090d14, side: THREE.DoubleSide });
-        const bg = new THREE.Mesh(bgGeo, bgMat);
-        g.add(bg);
+    // VoxelBox aggregate integrity: health bar + collapse
+    function voxBarAnchor(v: VoxelBox, out: THREE.Vector3) {
+      out.set(v.x0 + (v.nx * v.sx) / 2, v.y0 + v.ny * v.sy, v.z0 + (v.nz * v.sz) / 2);
+      return out;
+    }
 
-        const fillGeo = new THREE.PlaneGeometry(1.56, 0.12);
-        const fillMat = new THREE.MeshBasicMaterial({ color: 0x22c55e, side: THREE.DoubleSide });
-        const fill = new THREE.Mesh(fillGeo, fillMat);
-        fill.position.z = 0.01;
-        g.add(fill);
-
-        g.position.set(dest.bounds.x, dest.bounds.y + dest.bounds.h / 2 + 0.35, dest.bounds.z);
-        world.add(g);
-        dest.healthBarGroup = g;
-        dest.healthBarFill = fill;
+    function voxShowBar(v: VoxelBox) {
+      if (!v.barGroup) {
+        const { group, fill } = makeHealthBar();
+        voxBarAnchor(v, voxTmpP);
+        group.position.set(voxTmpP.x, voxTmpP.y + 0.35, voxTmpP.z);
+        world.add(group);
+        v.barGroup = group;
+        v.barFill = fill;
       }
-      dest.healthBarTimer = 3.0;
-      const pct = Math.max(0, Math.min(1, dest.hp / dest.maxHp));
-      if (dest.healthBarFill) {
-        dest.healthBarFill.scale.x = pct;
-        dest.healthBarFill.position.x = -(1 - pct) * 0.78;
-        const col = pct > 0.5 ? 0x22c55e : pct > 0.25 ? 0xf59e0b : 0xef4444;
-        (dest.healthBarFill.material as THREE.MeshBasicMaterial).color.setHex(col);
+      v.barTimer = 3.0;
+      if (v.barFill) setBarFill(v.barFill, 1 - v.dmgTaken / v.poolHp);
+    }
+
+    /**
+     * Register structural damage against a voxel structure: pops a damage
+     * number, shows the health bar and collapses the structure once its
+     * integrity pool has been gutted past the point of no return.
+     */
+    function noteVoxDamage(v: VoxelBox, amount: number, pos?: THREE.Vector3) {
+      if (v.gone || amount <= 0) return;
+      v.dmgTaken = Math.min(v.poolHp, v.dmgTaken + amount);
+      const frac = 1 - v.dmgTaken / v.poolHp;
+      const shown = Math.round(amount);
+      if (shown > 0) {
+        const anchor = pos ?? voxBarAnchor(v, voxTmpP);
+        const isCrit = shown >= 120;
+        showDamagePopup(`${shown}`, anchor, isCrit ? '#f59e0b' : '#fde047', isCrit);
+      }
+      voxShowBar(v);
+      playSfx('wood_hit');
+      if (frac <= 0.25 && !v.collapsed) collapseVoxBox(v);
+    }
+
+    // Fortnite-style structural collapse: a mostly-destroyed structure
+    // loses cohesion and the surviving chunks rain down as debris.
+    function collapseVoxBox(v: VoxelBox) {
+      if (v.gone || v.collapsed) return;
+      v.collapsed = true;
+      playSfx('shatter');
+      const anchor = voxBarAnchor(v, voxTmpP).clone();
+      anchor.y += 0.5;
+      showDamagePopup('💥 DESTROYED', anchor, '#ef4444', true);
+      const ring = new THREE.Mesh(
+        shockGeo,
+        new THREE.MeshBasicMaterial({ color: 0x9ca3af, transparent: true, opacity: 0.5, depthWrite: false })
+      );
+      ring.position.set(anchor.x, groundAt(anchor.x, anchor.z) + 0.1, anchor.z);
+      scene.add(ring);
+      effects.push({ kind: 'shock', mesh: ring, t: 0, life: 0.35, radius: Math.max(v.nx * v.sx, v.nz * v.sz) * 1.5 });
+      ensureInstanced(v);
+      let guard = v.aliveCount + 1;
+      while (v.aliveCount > 0 && guard-- > 0) {
+        killVoxel(v, v.aliveCount - 1, Math.random() < 0.12 ? 2 : 1);
       }
     }
 
-    function damageDestructible(
-      dest: DestructibleObject,
+    // ----------------------------------------------------
+    // Player-Built Fortnite Walls (whole-object destructibles,
+    // same kind as the BR-web repo: 250 HP, health bar, damage
+    // numbers, shatters into voxel debris chunks)
+    // ----------------------------------------------------
+    interface BuiltWall {
+      id: string;
+      mesh: THREE.Object3D;
+      solid: SolidBox;
+      hp: number;
+      maxHp: number;
+      kind: 'crate' | 'wood' | 'building' | 'brick' | 'metal';
+      color: number | THREE.Color;
+      bounds: { x: number; y: number; z: number; w: number; h: number; d: number };
+      barGroup?: THREE.Group;
+      barFill?: THREE.Mesh;
+      barTimer?: number;
+    }
+
+    const wallDests = new Map<THREE.Object3D, BuiltWall>();
+    const solidToWall = new Map<SolidBox, BuiltWall>();
+
+    function registerWallDest(dest: BuiltWall) {
+      wallDests.set(dest.mesh, dest);
+      solidToWall.set(dest.solid, dest);
+      dest.mesh.userData.wallDest = dest;
+      // Also register children if group
+      dest.mesh.traverse((child) => {
+        child.userData.wallDest = dest;
+      });
+    }
+
+    function showWallBar(dest: BuiltWall) {
+      if (!dest.barGroup) {
+        const { group, fill } = makeHealthBar();
+        group.position.set(dest.bounds.x, dest.bounds.y + dest.bounds.h / 2 + 0.35, dest.bounds.z);
+        world.add(group);
+        dest.barGroup = group;
+        dest.barFill = fill;
+      }
+      dest.barTimer = 3.0;
+      if (dest.barFill) setBarFill(dest.barFill, dest.hp / dest.maxHp);
+    }
+
+    function damageWall(
+      dest: BuiltWall,
       amount: number,
       hitPoint?: THREE.Vector3,
-      hitDir?: THREE.Vector3,
       blastOrigin?: { x: number; y: number; z: number }
     ) {
-      if (dest.hp <= 0) return;
+      if (dest.hp <= 0 || amount <= 0) return;
       dest.hp = Math.max(0, dest.hp - amount);
-      const pos = hitPoint ? hitPoint.clone() : new THREE.Vector3(dest.bounds.x, dest.bounds.y, dest.bounds.z);
+      const pos = hitPoint
+        ? hitPoint.clone()
+        : new THREE.Vector3(dest.bounds.x, dest.bounds.y, dest.bounds.z);
 
       // Popup damage text
       const isCrit = amount >= 120;
       showDamagePopup(`${Math.round(amount)}`, pos, isCrit ? '#f59e0b' : '#fde047', isCrit);
-      showHealthBar(dest);
+      showWallBar(dest);
 
-      // Small voxel chips flying off
+      // Small voxel chips flying off the impact
       const chipCount = Math.min(6, Math.max(2, Math.round(amount / 30)));
-      for (let c = 0; c < chipCount; c++) {
-        const chipMat = new THREE.MeshLambertMaterial({ color: dest.color });
-        const chip = new THREE.Mesh(sharedVoxelGeo, chipMat);
-        const sz = 0.12 + Math.random() * 0.14;
-        chip.scale.set(sz, sz, sz);
-        chip.position.set(
-          pos.x + (Math.random() - 0.5) * 0.25,
-          pos.y + (Math.random() - 0.5) * 0.25,
-          pos.z + (Math.random() - 0.5) * 0.25
-        );
-        const impulse = calculateVoxelImpulse(
-          { x: chip.position.x, y: chip.position.y, z: chip.position.z },
-          blastOrigin ?? (hitPoint ? { x: hitPoint.x - (hitDir?.x ?? 0), y: hitPoint.y, z: hitPoint.z - (hitDir?.z ?? 0) } : { x: dest.bounds.x, y: dest.bounds.y, z: dest.bounds.z }),
-          5 + Math.random() * 4,
-          2.5
-        );
-        world.add(chip);
-        activeVoxels.push({
-          mesh: chip,
-          vx: impulse.x,
-          vy: impulse.y,
-          vz: impulse.z,
-          rx: (Math.random() - 0.5) * 14,
-          ry: (Math.random() - 0.5) * 14,
-          rz: (Math.random() - 0.5) * 14,
-          t: 0,
-          life: 2.0 + Math.random() * 1.0,
-          baseScaleX: sz,
-          baseScaleY: sz,
-          baseScaleZ: sz,
-        });
-      }
+      spawnDebris(pos.x, pos.y, pos.z, new THREE.Color(dest.color as number), chipCount);
 
       playSfx('wood_hit');
 
       if (dest.hp <= 0) {
-        destroyDestructible(dest, blastOrigin ? blastOrigin : hitPoint ? { x: hitPoint.x, y: hitPoint.y, z: hitPoint.z } : undefined);
+        destroyWall(dest, blastOrigin ?? { x: pos.x, y: pos.y, z: pos.z });
       }
     }
 
-    function damageDestructibleBySolid(
+    function damageWallBySolid(
       solidBox: SolidBox,
       amount: number,
       blastOrigin?: { x: number; y: number; z: number }
     ) {
-      const dest = solidToDestructible.get(solidBox);
-      if (dest) {
-        damageDestructible(dest, amount, undefined, undefined, blastOrigin);
-      }
+      const dest = solidToWall.get(solidBox);
+      if (dest) damageWall(dest, amount, undefined, blastOrigin);
     }
 
-    function destroyDestructible(dest: DestructibleObject, blastOrigin?: { x: number; y: number; z: number }) {
+    function destroyWall(dest: BuiltWall, blastOrigin?: { x: number; y: number; z: number }) {
       playSfx('shatter');
       const origin = blastOrigin ?? { x: dest.bounds.x, y: dest.bounds.y, z: dest.bounds.z };
       showDamagePopup('💥 DESTROYED', new THREE.Vector3(dest.bounds.x, dest.bounds.y + 0.5, dest.bounds.z), '#ef4444', true);
@@ -767,7 +1290,7 @@ export default function BattleRoyaleGame() {
       // 1. Remove solid from collision immediately so player and projectiles can pass through
       const sIdx = solids.indexOf(dest.solid);
       if (sIdx !== -1) solids.splice(sIdx, 1);
-      solidToDestructible.delete(dest.solid);
+      solidToWall.delete(dest.solid);
 
       // 2. Remove mesh from shootables and world
       dest.mesh.traverse((obj) => {
@@ -775,16 +1298,13 @@ export default function BattleRoyaleGame() {
         if (shIdx !== -1) shootable.splice(shIdx, 1);
       });
       world.remove(dest.mesh);
-      destructibles.delete(dest.mesh);
+      wallDests.delete(dest.mesh);
 
       // Clean up health bar
-      if (dest.healthBarGroup) {
-        world.remove(dest.healthBarGroup);
-        dest.healthBarGroup.traverse((o: any) => {
-          o.geometry?.dispose?.();
-          o.material?.dispose?.();
-        });
-        dest.healthBarGroup = undefined;
+      if (dest.barGroup) {
+        disposeBar(dest.barGroup);
+        dest.barGroup = undefined;
+        dest.barFill = undefined;
       }
 
       // 3. Generate physical 3D voxel debris chunks
@@ -795,10 +1315,7 @@ export default function BattleRoyaleGame() {
       const sizeX = b.w / countX;
       const sizeY = b.h / countY;
       const sizeZ = b.d / countZ;
-
-      const voxelMat = new THREE.MeshLambertMaterial({
-        color: dest.color,
-      });
+      const chunkScale = Math.min(3.5, Math.max(1, Math.max(sizeX, sizeY, sizeZ) / 0.28));
 
       for (let ix = 0; ix < countX; ix++) {
         for (let iy = 0; iy < countY; iy++) {
@@ -806,37 +1323,11 @@ export default function BattleRoyaleGame() {
             const vx0 = b.x - b.w / 2 + (ix + 0.5) * sizeX + (Math.random() - 0.5) * 0.05;
             const vy0 = b.y - b.h / 2 + (iy + 0.5) * sizeY + (Math.random() - 0.5) * 0.05;
             const vz0 = b.z - b.d / 2 + (iz + 0.5) * sizeZ + (Math.random() - 0.5) * 0.05;
-
-            const voxelMesh = new THREE.Mesh(sharedVoxelGeo, voxelMat.clone());
-            const sx = sizeX * 0.92;
-            const sy = sizeY * 0.92;
-            const sz = sizeZ * 0.92;
-            voxelMesh.scale.set(sx, sy, sz);
-            voxelMesh.position.set(vx0, vy0, vz0);
-            voxelMesh.castShadow = true;
-            voxelMesh.receiveShadow = true;
-            world.add(voxelMesh);
-
-            const impulse = calculateVoxelImpulse(
-              { x: vx0, y: vy0, z: vz0 },
-              origin,
-              8.5 + Math.random() * 5.0,
-              3.6
-            );
-
-            activeVoxels.push({
-              mesh: voxelMesh,
+            const impulse = calculateVoxelImpulse({ x: vx0, y: vy0, z: vz0 }, origin, 8.5 + Math.random() * 5.0, 3.6);
+            spawnDebris(vx0, vy0, vz0, new THREE.Color(dest.color as number), 1, chunkScale, {
               vx: impulse.x,
               vy: impulse.y,
               vz: impulse.z,
-              rx: (Math.random() - 0.5) * 12,
-              ry: (Math.random() - 0.5) * 12,
-              rz: (Math.random() - 0.5) * 12,
-              t: 0,
-              life: 4.2 + Math.random() * 1.8,
-              baseScaleX: sx,
-              baseScaleY: sy,
-              baseScaleZ: sz,
             });
           }
         }
@@ -892,7 +1383,7 @@ export default function BattleRoyaleGame() {
       const plankGeo = new THREE.BoxGeometry(2.76, 0.46, 0.14);
       for (let p = 0; p < 4; p++) {
         const plank = new THREE.Mesh(plankGeo, woodMat);
-        plank.position.set((p % 2 === 0 ? 0.02 : -0.02), 0.45 + p * 0.52, (p % 2 === 0 ? 0.02 : -0.02));
+        plank.position.set(p % 2 === 0 ? 0.02 : -0.02, 0.45 + p * 0.52, p % 2 === 0 ? 0.02 : -0.02);
         plank.castShadow = true;
         plank.receiveShadow = true;
         g.add(plank);
@@ -930,7 +1421,7 @@ export default function BattleRoyaleGame() {
         if (c instanceof THREE.Mesh) shootable.push(c);
       });
 
-      registerDestructible({
+      registerWallDest({
         id: 'wall_' + Math.random().toString(36).slice(2, 7),
         mesh: g,
         solid,
@@ -992,51 +1483,30 @@ export default function BattleRoyaleGame() {
       toggleBuildWall(false);
     }
 
-    function updateVoxels(dt: number) {
-      for (let i = activeVoxels.length - 1; i >= 0; i--) {
-        const v = activeVoxels[i];
-        v.t += dt;
-        v.vy -= 22 * dt;
-        v.mesh.position.x += v.vx * dt;
-        v.mesh.position.z += v.vz * dt;
-        v.mesh.position.y += v.vy * dt;
-        v.mesh.rotation.x += v.rx * dt;
-        v.mesh.rotation.y += v.ry * dt;
-        v.mesh.rotation.z += v.rz * dt;
-
-        const gy = groundAt(v.mesh.position.x, v.mesh.position.z);
-        const floorY = gy + v.baseScaleY * 0.5;
-        if (v.mesh.position.y < floorY) {
-          v.mesh.position.y = floorY;
-          if (v.vy < -1.5) {
-            v.vy = -v.vy * 0.35;
-            v.vx *= 0.65;
-            v.vz *= 0.65;
-            v.rx *= 0.6;
-            v.rz *= 0.6;
-          } else {
-            v.vy = 0;
-            const k = Math.exp(-6 * dt);
-            v.vx *= k;
-            v.vz *= k;
-            v.rx *= k;
-            v.rz *= k;
-          }
-        }
-
-        if (v.t > v.life - 0.7) {
-          const s = Math.max(0.01, (v.life - v.t) / 0.7);
-          v.mesh.scale.set(v.baseScaleX * s, v.baseScaleY * s, v.baseScaleZ * s);
-        }
-
-        if (v.t >= v.life) {
-          world.remove(v.mesh);
-          (v.mesh.material as any)?.dispose?.();
-          activeVoxels.splice(i, 1);
+    // Damage whichever structure (voxel or built wall) owns a given solid box —
+    // used when a wall eats a grenade blast for whoever hides behind it.
+    function damageStructureSolid(
+      box: SolidBox,
+      amount: number,
+      origin: { x: number; y: number; z: number }
+    ) {
+      if (amount <= 0) return;
+      const wall = solidToWall.get(box);
+      if (wall) {
+        damageWall(wall, amount, undefined, origin);
+        return;
+      }
+      for (const v of voxBoxes) {
+        if (v.gone) continue;
+        if (v.solidRefs.indexOf(box) !== -1) {
+          noteVoxDamage(v, amount);
+          return;
         }
       }
     }
 
+    // Per-frame update: floating damage numbers, health bar billboard timers
+    // and the build mode hologram preview.
     function updateDestructibles(dt: number) {
       // 1. Update floating damage popups
       for (let i = damagePopups.length - 1; i >= 0; i--) {
@@ -1055,17 +1525,26 @@ export default function BattleRoyaleGame() {
         }
       }
 
-      // 2. Update health bar timers and orientation
-      for (const dest of destructibles.values()) {
-        if (dest.healthBarGroup) {
-          dest.healthBarGroup.quaternion.copy(camera.quaternion);
-          if (dest.healthBarTimer !== undefined) {
-            dest.healthBarTimer -= dt;
-            if (dest.healthBarTimer <= 0) {
-              dest.healthBarGroup.visible = false;
-            } else {
-              dest.healthBarGroup.visible = true;
-            }
+      // 2. Update health bar timers and orientation (voxel structures)
+      for (const v of voxBoxes) {
+        if (v.barGroup) {
+          v.barGroup.quaternion.copy(camera.quaternion);
+          if (v.barTimer > 0) {
+            v.barTimer -= dt;
+            v.barGroup.visible = v.barTimer > 0;
+          } else {
+            v.barGroup.visible = false;
+          }
+        }
+      }
+
+      // Built walls
+      for (const dest of wallDests.values()) {
+        if (dest.barGroup) {
+          dest.barGroup.quaternion.copy(camera.quaternion);
+          if (dest.barTimer !== undefined) {
+            dest.barTimer -= dt;
+            dest.barGroup.visible = dest.barTimer > 0;
           }
         }
       }
@@ -1083,6 +1562,47 @@ export default function BattleRoyaleGame() {
         previewMesh.rotation.y = Math.atan2(forward.x, forward.z);
       }
     }
+
+    // Clear every destructible-feedback artefact (popups, bars, built walls)
+    // when switching maps / modes.
+    function resetBuildables() {
+      for (const p of damagePopups) {
+        world.remove(p.sprite);
+        p.mat.dispose();
+        p.texture.dispose();
+      }
+      damagePopups.length = 0;
+
+      for (const dest of Array.from(wallDests.values())) {
+        const sIdx = solids.indexOf(dest.solid);
+        if (sIdx !== -1) solids.splice(sIdx, 1);
+        solidToWall.delete(dest.solid);
+        dest.mesh.traverse((obj) => {
+          const shIdx = shootable.indexOf(obj);
+          if (shIdx !== -1) shootable.splice(shIdx, 1);
+        });
+        world.remove(dest.mesh);
+        if (dest.barGroup) disposeBar(dest.barGroup);
+        wallDests.delete(dest.mesh);
+      }
+
+      for (const v of voxBoxes) {
+        if (v.barGroup) {
+          disposeBar(v.barGroup);
+          v.barGroup = null;
+          v.barFill = null;
+          v.barTimer = 0;
+        }
+      }
+
+      buildMode = false;
+      previewMesh.visible = false;
+      const buildBtnEl = $('buildWallBtn');
+      if (buildBtnEl) buildBtnEl.classList.remove('active');
+      const touchBuildEl = $('touchBuildBtn');
+      if (touchBuildEl) touchBuildEl.classList.remove('active');
+    }
+
     interface DummyObject {
       group: THREE.Group;
       parts: THREE.Mesh[];
@@ -1416,24 +1936,17 @@ export default function BattleRoyaleGame() {
     }
 
     function addCrate(x: number, z: number, w: number, h: number, depth: number, color: THREE.Color) {
-      const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, h, depth), new THREE.MeshLambertMaterial({ color }));
+      const mat = new THREE.MeshLambertMaterial({ color });
+      const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, h, depth), mat);
       mesh.position.set(x, h / 2, z);
       mesh.castShadow = true;
       mesh.receiveShadow = true;
       world.add(mesh);
-      const solid: SolidBox = { x, z, hx: w / 2, hz: depth / 2, top: h };
-      solids.push(solid);
+      const sb: SolidBox = { x, z, hx: w / 2, hz: depth / 2, top: h };
+      solids.push(sb);
       shootable.push(mesh);
-      registerDestructible({
-        id: 'crate_' + Math.random().toString(36).slice(2, 7),
-        mesh,
-        solid,
-        hp: 120,
-        maxHp: 120,
-        kind: 'crate',
-        color,
-        bounds: { x, y: h / 2, z, w, h, d: depth },
-      });
+      voxHpMap.set(mat, 70); // wooden crates splinter easily
+      registerDestructible(sb, mesh, mat);
     }
 
     // Spawn initial dummies
@@ -1876,13 +2389,19 @@ export default function BattleRoyaleGame() {
     const aiming = () => aimMouse || aimId !== null;
 
     function showPause() {
-      if (isHeadless) return;
       if (!overlay || !btn) return;
       overlay.hidden = false;
       btn.textContent = touchDevice ? 'Tap to resume' : 'Click to resume';
       keys.clear();
       mouseHeld = aimMouse = false;
       releaseTouch();
+      // Never leave build mode armed behind the pause screen
+      buildMode = false;
+      previewMesh.visible = false;
+      const bp = $('buildWallBtn');
+      if (bp) bp.classList.remove('active');
+      const tb = $('touchBuildBtn');
+      if (tb) tb.classList.remove('active');
       document.exitPointerLock?.();
     }
 
@@ -1893,7 +2412,7 @@ export default function BattleRoyaleGame() {
 
     const onPointerLockChange = () => {
       locked = document.pointerLockElement === canvas;
-      if (!locked && running() && !isHeadless) showPause();
+      if (!locked && running()) showPause();
     };
     document.addEventListener('pointerlockchange', onPointerLockChange);
 
@@ -1903,6 +2422,7 @@ export default function BattleRoyaleGame() {
         return;
       }
       if (e.code === 'Escape') {
+        if (buildMode) toggleBuildWall(false);
         if (running()) showPause();
         return;
       }
@@ -1914,6 +2434,7 @@ export default function BattleRoyaleGame() {
       if (e.code === 'KeyX' && !e.repeat) rollReq = 1;
       if (e.code === 'KeyR') startReload();
       if (e.code === 'KeyF') forcePick();
+      if (e.code === 'KeyV' && !e.repeat) toggleBuildWall();
       if (e.code === 'Digit1' && !e.repeat) {
         if (buildMode) toggleBuildWall(false);
         pressSlot(0);
@@ -1922,8 +2443,10 @@ export default function BattleRoyaleGame() {
         if (buildMode) toggleBuildWall(false);
         pressSlot(1);
       }
-      if (e.code === 'KeyV' && !e.repeat) toggleBuildWall();
-      if (e.code === 'KeyQ' && !e.repeat) toggleBuildWall();
+      if (e.code === 'KeyQ') {
+        if (buildMode) toggleBuildWall(false);
+        cycleWeapon();
+      }
       if (e.code === 'KeyE' && (!e.repeat || character !== 'barrage')) {
         if (buildMode) toggleBuildWall(false);
         primaryAction();
@@ -1933,7 +2456,10 @@ export default function BattleRoyaleGame() {
         grenadeDown('key', 'KeyG', null);
       }
       if (gPress?.open && (e.code === 'ArrowUp' || e.code === 'ArrowDown')) grenadeWheel(e.code === 'ArrowUp' ? 1 : -1);
-      if (e.code === 'KeyB' && !e.repeat) openInventory();
+      if (e.code === 'KeyB' && !e.repeat) {
+        if (buildMode) toggleBuildWall(false);
+        openInventory();
+      }
     };
 
     const onKeyUp = (e: KeyboardEvent) => {
@@ -1947,13 +2473,19 @@ export default function BattleRoyaleGame() {
       if (!running()) return;
       getAudio(); // Ensure audio context is running on user interaction
       if (buildMode) {
-        if (e.button === 0) {
-          placeWall();
-          return;
-        }
-        if (e.button === 2) {
-          toggleBuildWall(false);
-          return;
+        // Don't place/cancel when the click lands on a HUD build plate
+        const onPlate =
+          inRect($('buildWallBtn'), e.clientX, e.clientY, 8) ||
+          inRect($('touchBuildBtn'), e.clientX, e.clientY, 12);
+        if (!onPlate) {
+          if (e.button === 0) {
+            placeWall();
+            return;
+          }
+          if (e.button === 2) {
+            toggleBuildWall(false);
+            return;
+          }
         }
       }
       if (inRect(sliderEl, e.clientX, e.clientY, 6)) {
@@ -1961,10 +2493,7 @@ export default function BattleRoyaleGame() {
         sliderEl?.classList.add('is-pressed');
         return;
       }
-      if (e.button === 0) {
-        mouseHeld = true;
-        shoot();
-      }
+      if (e.button === 0) mouseHeld = true;
       if (e.button === 2) {
         aimMouse = true;
         aimPressed();
@@ -1981,6 +2510,7 @@ export default function BattleRoyaleGame() {
 
     const onContextMenu = (e: MouseEvent) => {
       if (running()) e.preventDefault();
+      if (running() && buildMode) toggleBuildWall(false);
     };
 
     const onWheel = (e: WheelEvent) => {
@@ -2051,6 +2581,7 @@ export default function BattleRoyaleGame() {
       spots.length = 0;
       solids.length = 0;
       shootable.length = 0;
+      resetVox();
       pickups.length = 0;
       BUILDINGS.length = 0;
       terrainSeed = 1 + Math.floor(Math.random() * 1000000);
@@ -2117,23 +2648,73 @@ export default function BattleRoyaleGame() {
 
     playBtn?.addEventListener('click', startGame);
 
-    buildWallBtn?.addEventListener('click', (e) => {
-      e.stopPropagation();
-      getAudio();
-      toggleBuildWall();
-    });
-    touchBuildBtn?.addEventListener('click', (e) => {
-      e.stopPropagation();
-      getAudio();
-      toggleBuildWall();
-    });
-
     // Check for ?autostart=1 query param (Ultra Mode requirement)
     if (typeof window !== 'undefined') {
       const params = new URLSearchParams(window.location.search);
       if (params.get('autostart') === '1') {
         setTimeout(startGame, 100);
       }
+      if (params.get('debug') === '1') {
+        // Dev-only test hook (?debug=1): drive explosions and teleports so
+        // voxel destruction and blast-cover mechanics can be verified live
+        setTimeout(() => {
+          (window as any).__debug = {
+            blast: (bx: number, bz: number) =>
+              explode(bx, bz, GREN.blast.radius, GREN.blast.dmg, GREN.blast.selfDmg),
+            buildings: () => BUILDINGS.map((b: any) => ({ x: b.x, z: b.z, hx: b.hx, hz: b.hz, kind: b.kind, rot: b.rot })),
+            moveTo: (mx: number, mz: number) => {
+              camera.position.set(mx, groundAt(mx, mz) + EYE, mz);
+              vy = 0;
+              grounded = true;
+            },
+            grenades: () => {
+              grenades.blast = 9;
+              refreshGrenades();
+            },
+            buildWall: (bx: number, bz: number, ang = 0) => buildFortniteWall(bx, groundAt(bx, bz), bz, ang),
+            popupInfo: () => ({
+              cam: { x: +camera.position.x.toFixed(1), y: +camera.position.y.toFixed(1), z: +camera.position.z.toFixed(1) },
+              popups: damagePopups.map((p) => ({
+                x: +p.sprite.position.x.toFixed(1),
+                y: +p.sprite.position.y.toFixed(1),
+                z: +p.sprite.position.z.toFixed(1),
+                o: +p.mat.opacity.toFixed(2),
+                s: p.sprite.scale.x.toFixed(1),
+              })),
+            }),
+            voxStats: () => ({
+              boxes: voxBoxes.length,
+              alive: voxBoxes.reduce((n, v) => n + (v.gone ? 0 : 1), 0),
+              collapsed: voxBoxes.reduce((n, v) => n + (v.collapsed ? 1 : 0), 0),
+              walls: wallDests.size,
+              popups: damagePopups.length,
+            }),
+          };
+        }, 300);
+      }
+    }
+
+    // ----------------------------------------------------
+    // Headless-only test hook (never active for real players).
+    // Parity with the BR-web repo's window.__brTest so the same
+    // e2e scripts verify grenade/cover/destruction mechanics.
+    // ----------------------------------------------------
+    if (isHeadless) {
+      (window as any).__brTest = {
+        giveGrenade: (kind: string = 'blast', n: number = 1) => {
+          (grenades as any)[kind] = ((grenades as any)[kind] ?? 0) + n;
+          refreshGrenades();
+        },
+        grenadeCounts: () => ({ ...(grenades as any) }),
+        destructibleCount: () => wallDests.size + voxBoxes.reduce((n, v) => n + (v.gone ? 0 : 1), 0),
+        isPlayerDown: () => playerDown,
+        buildAt: (x: number, z: number, ang = 0) => buildFortniteWall(x, groundAt(x, z), z, ang),
+        wallCount: () => wallDests.size,
+        damageWallByIndex: (i: number, amount: number) => {
+          const dest = Array.from(wallDests.values())[i];
+          if (dest) damageWall(dest, amount);
+        },
+      };
     }
 
     // ----------------------------------------------------
@@ -2191,8 +2772,8 @@ export default function BattleRoyaleGame() {
       if (near(stickBase, 1.5)) return 'stick';
       if (near(aimBtn, 1.2)) return 'aim';
       if (near(turretEl, 1)) return 'turret';
+      if (near($('touchBuildBtn'), 1.2)) return 'build';
       if (inRect(gBtnEl, x, y, 12)) return 'grenade';
-      if (inRect(touchBuildBtn, x, y, 10)) return 'build';
       if (inRect(inventoryBtnEl, x, y, 6)) return 'inventory';
       if (pickOffer && pickBtn) {
         const r = pickBtn.getBoundingClientRect();
@@ -2242,19 +2823,8 @@ export default function BattleRoyaleGame() {
     const onTouchStart = (e: TouchEvent) => {
       if (!running()) return;
       e.preventDefault();
-      getAudio();
       for (const t of Array.from(e.changedTouches)) {
         let role = roleAt(t.clientX, t.clientY);
-        if (role === 'build') {
-          toggleBuildWall();
-          touchBuildBtn?.classList.add('is-pressed');
-          setTimeout(() => touchBuildBtn?.classList.remove('is-pressed'), 120);
-          continue;
-        }
-        if (buildMode && role === 'look') {
-          placeWall();
-          continue;
-        }
         if (role === 'stick' && stickId !== null) role = 'look';
         if (role === 'aim' && aimId !== null) role = 'look';
         if (role === 'slider' && sliderTouch !== null) role = 'look';
@@ -2288,6 +2858,15 @@ export default function BattleRoyaleGame() {
           grenadeDown('touch', t.identifier, t.clientY);
           gBtnEl?.classList.add('is-pressed');
           setTimeout(() => gBtnEl?.classList.remove('is-pressed'), 120);
+        }
+        if (role === 'build') {
+          toggleBuildWall();
+          touchBuildBtnEl?.classList.add('is-pressed');
+          setTimeout(() => touchBuildBtnEl?.classList.remove('is-pressed'), 120);
+        }
+        if (role === 'look' && buildMode) {
+          // Tap anywhere (outside controls) to place the wall
+          placeWall();
         }
         if (role === 'inventory') openInventory();
       }
@@ -2404,6 +2983,7 @@ export default function BattleRoyaleGame() {
     const WEAPONS: Record<string, any> = {
       sk: {
         name: 'SK',
+        kind: 'sk',
         ammo: 'heavy',
         mag: 30,
         loaded: 30,
@@ -2420,6 +3000,7 @@ export default function BattleRoyaleGame() {
       },
       smg: {
         name: 'Sharkteeth',
+        kind: 'smg',
         ammo: 'light',
         mag: 40,
         loaded: 0,
@@ -2436,6 +3017,7 @@ export default function BattleRoyaleGame() {
       },
       sniper: {
         name: 'Sniper',
+        kind: 'sniper',
         ammo: 'heavy',
         mag: 5,
         loaded: 0,
@@ -2453,6 +3035,7 @@ export default function BattleRoyaleGame() {
       },
       betgun: {
         name: 'Betgun',
+        kind: 'betgun',
         ammo: 'heavy',
         mag: 6,
         loaded: 0,
@@ -2798,17 +3381,23 @@ export default function BattleRoyaleGame() {
           ? hit.point
           : raycaster.ray.at(reach, new THREE.Vector3());
       tracer(from, to);
-      if (sd === Infinity && hit?.object) {
-        if (hit.object.userData.dummy) {
+      if (sd === Infinity && hit?.object.userData.dummy) {
+        const s = shotDamage(w, hit.distance);
+        hitDummy(hit.object.userData.dummy, s.dmg, s.pen);
+      } else if (sd === Infinity && hit?.object) {
+        const wall = hit.object.userData.wallDest || (hit.object.parent && hit.object.parent.userData.wallDest);
+        if (wall) {
+          // Bullets chew player-built walls (structure damage, same kind as BR-web)
           const s = shotDamage(w, hit.distance);
-          hitDummy(hit.object.userData.dummy, s.dmg, s.pen);
-        } else {
-          const dest = hit.object.userData.destructible || (hit.object.parent && hit.object.parent.userData.destructible);
-          if (dest) {
-            const s = shotDamage(w, hit.distance);
-            const structDmg = calculateStructureDamage(w.kind || 'sk', s.dmg);
-            damageDestructible(dest, structDmg, hit.point, raycaster.ray.direction);
-          }
+          damageWall(wall, calculateStructureDamage(w.kind || 'sk', s.dmg), hit.point);
+        } else if (hit.object.userData.vox) {
+          // Bullets chew chunks out of walls and crates
+          const s = shotDamage(w, hit.distance);
+          chipVoxelAtPoint(
+            hit.object.userData.vox as VoxelBox,
+            hit.point,
+            calculateStructureDamage(w.kind || 'sk', s.dmg)
+          );
         }
       }
       kick = w.recoil;
@@ -2987,6 +3576,20 @@ export default function BattleRoyaleGame() {
     const bmCrate = new THREE.MeshLambertMaterial({ color: 0x8f6b3e });
     const bmWood = new THREE.MeshLambertMaterial({ color: 0x7a5a3a });
 
+    // Structure toughness: hit points of one voxel chunk per material
+    voxHpMap.set(bmWall, 110);
+    voxHpMap.set(bmCream, 110);
+    voxHpMap.set(bmTile, 130);
+    voxHpMap.set(bmSlab, 150);
+    voxHpMap.set(bmStair, 90);
+    voxHpMap.set(bmRoof, 90);
+    voxHpMap.set(bmConcrete, 170);
+    voxHpMap.set(bmConcreteDark, 170);
+    voxHpMap.set(bmSteel, 230);
+    voxHpMap.set(bmSteelDark, 230);
+    voxHpMap.set(bmCrate, 70);
+    voxHpMap.set(bmWood, 70);
+
     function turnPoint(B: any, u: number, v: number) {
       return B.rot ? { x: B.x - v, z: B.z + u } : { x: B.x + u, z: B.z + v };
     }
@@ -3008,19 +3611,10 @@ export default function BattleRoyaleGame() {
       mesh.castShadow = true;
       mesh.receiveShadow = true;
       world.add(mesh);
-      const solid: SolidBox = { x: w.x, z: w.z, hx: w.hx, hz: w.hz, top: y1, bottom: y0 };
-      solids.push(solid);
+      const sb: SolidBox = { x: w.x, z: w.z, hx: w.hx, hz: w.hz, top: y1, bottom: y0 };
+      solids.push(sb);
       shootable.push(mesh);
-      registerDestructible({
-        id: 'wall_' + Math.random().toString(36).slice(2, 7),
-        mesh,
-        solid,
-        hp: 280,
-        maxHp: 280,
-        kind: 'building',
-        color: (mat as any).color ? (mat as any).color : 0x7c8594,
-        bounds: { x: w.x, y: (y0 + y1) / 2, z: w.z, w: w.hx * 2, h: y1 - y0, d: w.hz * 2 },
-      });
+      registerDestructible(sb, mesh, mat);
     }
 
     function bPane(B: any, axisName: string, f0: number, f1: number, a0: number, a1: number, y0: number, y1: number) {
@@ -3734,6 +4328,7 @@ export default function BattleRoyaleGame() {
     const gBtnEl = $('gBtn');
     const gBtnName = $('gBtnName');
     const gBtnCount = $('gBtnCount');
+    const touchBuildBtnEl = $('touchBuildBtn');
     const smokeFxEl = $('smokeFx');
     const shockGeo = new THREE.SphereGeometry(1, 16, 12);
     const puffGeo = new THREE.SphereGeometry(1, 12, 10);
@@ -3958,75 +4553,97 @@ export default function BattleRoyaleGame() {
       selfDmg: number,
       share: (d: number) => number = linearShare(radius),
       selfShare: (d: number) => number = share,
-      customY?: number
+      y?: number
     ) {
-      const blastY = customY ?? (groundAt(x, z) + 0.35);
-      const blastOrigin = { x, y: blastY, z };
-
-      // 1. Dummies: detect walls and cover
+      const by = y ?? groundAt(x, z) + 0.5;
+      const blastOrigin = { x, y: by, z };
+      // Cover first: decide who the blast reaches BEFORE chewing structures,
+      // so an intact wall eats the damage of the grenade that breaks it
+      const hits: Array<[DummyObject, number]> = [];
+      const wallHits: Array<[SolidBox, number]> = [];
       for (const d of dummies) {
         const dist = Math.hypot(d.group.position.x - x, d.group.position.z - z);
-        if (dist < radius) {
-          const dTarget = { x: d.group.position.x, y: d.group.position.y + 0.9, z: d.group.position.z };
-          const cover = isCoverBlocked(blastOrigin, dTarget, solids);
-          if (cover.blocked && cover.blockingBox) {
-            // Wall detected between grenade and dummy! Dummy is protected behind cover
-            const wallDmg = calculateStructureDamage('blast', dmg * share(dist));
-            damageDestructibleBySolid(cover.blockingBox, wallDmg, blastOrigin);
-          } else {
-            hitDummy(d, dmg * share(dist));
-          }
+        if (dist >= radius) continue;
+        const ty = groundAt(d.group.position.x, d.group.position.z) + 1.25;
+        const cover = isCoverBlocked(blastOrigin, { x: d.group.position.x, y: ty, z: d.group.position.z }, solids);
+        if (cover.blocked && cover.blockingBox) {
+          // Wall detected between grenade and dummy! Dummy is protected behind cover
+          wallHits.push([cover.blockingBox as SolidBox, calculateStructureDamage('blast', dmg * share(dist))]);
+          continue;
         }
+        hits.push([d, dmg * share(dist)]);
       }
-
-      // 2. Player: detect walls and cover
       const pd = Math.hypot(camera.position.x - x, camera.position.z - z);
+      let selfHit = false;
+      let playerCoverBox: SolidBox | null = null;
+      let playerCoverDmg = 0;
       if (pd < radius) {
-        const playerTarget = { x: camera.position.x, y: camera.position.y - 0.4, z: camera.position.z };
-        const cover = isCoverBlocked(blastOrigin, playerTarget, solids);
+        const cover = isCoverBlocked(
+          blastOrigin,
+          { x: camera.position.x, y: camera.position.y - 0.4, z: camera.position.z },
+          solids
+        );
         if (cover.blocked && cover.blockingBox) {
           // GRENADE DETECTED A WALL! Player is safely taking cover behind the wall!
-          const wallDmg = calculateStructureDamage('blast', selfDmg * selfShare(pd));
-          damageDestructibleBySolid(cover.blockingBox, wallDmg, blastOrigin);
-          playSfx('cover_block');
-          showMessage('🛡️ Cover blocked grenade blast! Protected behind wall!', 2.4);
-          if (shieldFx) {
-            shieldFx.style.background = 'rgba(56, 189, 248, 0.35)';
-            shieldFx.style.opacity = '1';
-            setTimeout(() => {
-              if (shieldFx) {
-                shieldFx.style.opacity = '0';
-                shieldFx.style.background = '';
-              }
-            }, 220);
-          }
+          playerCoverBox = cover.blockingBox as SolidBox;
+          playerCoverDmg = calculateStructureDamage('blast', selfDmg * selfShare(pd));
         } else {
-          // Player is exposed to blast
-          hurtPlayer(selfDmg * selfShare(pd));
+          selfHit = true;
         }
       }
-
-      // 3. Demolition: damage all nearby destructible structures in blast radius
-      for (const dest of Array.from(destructibles.values())) {
+      // Structures eat what is left: chew voxel chunks near the centre
+      carveBlast(x, by, z, radius, dmg);
+      // Demolition: player-built walls inside the blast radius take structural damage
+      for (const dest of Array.from(wallDests.values())) {
         const dDist = Math.hypot(dest.bounds.x - x, dest.bounds.z - z);
         if (dDist < radius) {
-          const structDmg = calculateStructureDamage('blast', dmg * share(dDist));
-          damageDestructible(dest, structDmg, undefined, undefined, blastOrigin);
+          damageWall(dest, calculateStructureDamage('blast', dmg * share(dDist)), undefined, blastOrigin);
         }
       }
-
+      // Blocking walls soak the blast for whoever hid behind them
+      for (const [box, amount] of wallHits) damageStructureSolid(box, amount, blastOrigin);
+      if (playerCoverBox) {
+        damageStructureSolid(playerCoverBox, playerCoverDmg, blastOrigin);
+        playSfx('cover_block');
+        showMessage('🛡️ Cover blocked grenade blast! Protected behind wall!', 2.4);
+        if (shieldFx) {
+          shieldFx.style.background = 'rgba(56, 189, 248, 0.35)';
+          shieldFx.style.opacity = '1';
+          setTimeout(() => {
+            if (shieldFx) {
+              shieldFx.style.opacity = '';
+              shieldFx.style.background = '';
+            }
+          }, 220);
+        }
+      }
+      for (const [d, amount] of hits) hitDummy(d, amount);
+      if (selfHit) hurtPlayer(selfDmg * selfShare(pd));
       const ring = new THREE.Mesh(
         shockGeo,
         new THREE.MeshBasicMaterial({ color: 0xffb020, transparent: true, opacity: 0.6, depthWrite: false })
       );
-      ring.position.set(x, blastY + 0.25, z);
+      ring.position.set(x, groundAt(x, z) + 0.6, z);
       scene.add(ring);
       effects.push({ kind: 'shock', mesh: ring, t: 0, life: 0.35, radius });
+      const flash = new THREE.Mesh(
+        voxFlashGeo,
+        new THREE.MeshBasicMaterial({
+          color: 0xffb050,
+          transparent: true,
+          opacity: 0.9,
+          depthWrite: false,
+          blending: THREE.AdditiveBlending,
+        })
+      );
+      flash.position.set(x, by + 0.35, z);
+      scene.add(flash);
+      effects.push({ kind: 'flash', mesh: flash, t: 0, life: 0.22, radius: radius * 0.32 });
     }
 
-    function blast(x: number, z: number, y?: number) {
+    function blast(x: number, z: number, y: number) {
       const G = GREN.blast;
-      explode(x, z, G.radius, G.dmg, G.selfDmg, blastShare, () => 1, y);
+      explode(x, z, G.radius, G.dmg, G.selfDmg, blastShare, () => 1, y - 0.15);
     }
 
     function fireZone(x: number, z: number) {
@@ -4151,6 +4768,9 @@ export default function BattleRoyaleGame() {
         }
       }
 
+      updateDebris(dt);
+      updateDestructibles(dt);
+
       for (let i = effects.length - 1; i >= 0; i--) {
         const e = effects[i];
         e.t += dt;
@@ -4168,33 +4788,34 @@ export default function BattleRoyaleGame() {
             f.scale.y = 0.8 + 0.4 * Math.sin(e.t * 12 + j * 1.7);
           });
           e.disc.material.opacity = (0.4 + 0.15 * Math.sin(e.t * 9)) * Math.min(1, (e.life - e.t) / 0.6);
-          const fireOrigin = { x: e.x, y: groundAt(e.x, e.z) + 0.35, z: e.z };
           for (const d of dummies) {
-            if (Math.hypot(d.group.position.x - e.x, d.group.position.z - e.z) < GREN.fire.radius) {
-              const cover = isCoverBlocked(
-                fireOrigin,
-                { x: d.group.position.x, y: d.group.position.y + 0.9, z: d.group.position.z },
-                solids
+            const dd = Math.hypot(d.group.position.x - e.x, d.group.position.z - e.z);
+            const burning =
+              dd < GREN.fire.radius &&
+              fireClear(
+                e.x,
+                e.z,
+                dd,
+                GREN.fire.radius * 0.45,
+                d.group.position.x,
+                groundAt(d.group.position.x, d.group.position.z) + 1.25,
+                d.group.position.z
               );
-              if (cover.blocked && cover.blockingBox) {
-                damageDestructibleBySolid(cover.blockingBox, GREN.fire.dps * dt * 0.6, fireOrigin);
-              } else {
-                burnDummy(d, GREN.fire.dps * dt, GREN.fire.pen * dt);
-              }
+            if (burning) {
+              burnDummy(d, GREN.fire.dps * dt, GREN.fire.pen * dt);
             }
           }
-          if (Math.hypot(camera.position.x - e.x, camera.position.z - e.z) < GREN.fire.radius) {
-            const cover = isCoverBlocked(
-              fireOrigin,
-              { x: camera.position.x, y: camera.position.y - 0.4, z: camera.position.z },
-              solids
-            );
-            if (cover.blocked && cover.blockingBox) {
-              damageDestructibleBySolid(cover.blockingBox, GREN.fire.dps * dt * 0.6, fireOrigin);
-            } else {
-              hurtPlayer(GREN.fire.dps * dt, GREN.fire.pen * dt);
-            }
+          const pdd = Math.hypot(camera.position.x - e.x, camera.position.z - e.z);
+          if (
+            pdd < GREN.fire.radius &&
+            fireClear(e.x, e.z, pdd, GREN.fire.radius * 0.45, camera.position.x, camera.position.y - 0.4, camera.position.z)
+          ) {
+            hurtPlayer(GREN.fire.dps * dt, GREN.fire.pen * dt);
           }
+        } else if (e.kind === 'flash') {
+          const k = e.t / e.life;
+          e.mesh.scale.setScalar(0.3 + k * e.radius * 2.4);
+          e.mesh.material.opacity = 0.9 * (1 - k);
         } else {
           const fade = Math.min(1, (e.life - e.t) / 1.5);
           for (const m of e.puffs) m.material.opacity = 0.85 * fade;
@@ -4366,6 +4987,18 @@ export default function BattleRoyaleGame() {
 
     inventoryCloseEl?.addEventListener('click', closeInventory);
     inventoryBtnEl?.addEventListener('click', openInventory);
+
+    // Fortnite Wall Build plates (desktop plate + touch button)
+    $('buildWallBtn')?.addEventListener('click', (e) => {
+      e.stopPropagation();
+      getAudio();
+      toggleBuildWall();
+    });
+    touchBuildBtnEl?.addEventListener('click', (e) => {
+      e.stopPropagation();
+      getAudio();
+      toggleBuildWall();
+    });
 
     if (inventoryWeaponsEl) inventoryWeaponsEl.innerHTML = '';
     if (inventoryAmmoEl) inventoryAmmoEl.innerHTML = '';
@@ -5114,8 +5747,6 @@ export default function BattleRoyaleGame() {
         }
         updateTurret(dt);
         updateGrenades(dt);
-        updateDestructibles(dt);
-        updateVoxels(dt);
         updateVitals();
         return;
       }
@@ -5131,25 +5762,7 @@ export default function BattleRoyaleGame() {
       }
       updateTurret(dt);
       updateGrenades(dt);
-      updateDestructibles(dt);
-      updateVoxels(dt);
       updateVitals();
-    }
-
-    // ----------------------------------------------------
-    // Headless-only test hook (never active for real players)
-    // Enables automated e2e verification of grenade/cover mechanics.
-    // ----------------------------------------------------
-    if (isHeadless) {
-      (window as any).__brTest = {
-        giveGrenade: (kind: string = 'blast', n: number = 1) => {
-          (grenades as any)[kind] = ((grenades as any)[kind] ?? 0) + n;
-          refreshGrenades();
-        },
-        grenadeCounts: () => ({ ...(grenades as any) }),
-        destructibleCount: () => destructibles.size,
-        isPlayerDown: () => playerDown,
-      };
     }
 
     renderer.autoClear = false;
@@ -5479,6 +6092,13 @@ export default function BattleRoyaleGame() {
             <li>Sniper: hold <kbd>Right click</kbd> to look through its 8x scope</li>
             <li>Betgun: 150 damage within 30 m. Within 10 m, 80 more skips the shield. Less damage beyond 30 m</li>
             <li>Jump into a crate in front of you to climb onto it</li>
+            <li>Take cover: walls and crates block grenade blasts and fire — for you and for the dummies</li>
+            <li>Cover fails eventually: blasts chew voxel holes through walls and crates, and bullets chip chunks off</li>
+            <li>Structures have health: damage numbers pop, health bars show, and a gutted building collapses</li>
+            <li>
+              <kbd>V</kbd> builds a 250 HP wooden wall where you look — deployable cover that blocks gunfire and
+              blasts until it shatters
+            </li>
             <li>Bullets lose power with range: SMG past 20 m, SK past 60 m, sniper past 200 m</li>
             <li>Shield takes hits first, then life. It recharges after 6 s without damage</li>
             <li>Dummies have a shield too: it takes hits first, then life, and it recharges</li>
@@ -5488,16 +6108,7 @@ export default function BattleRoyaleGame() {
             </li>
             <li><kbd>E</kbd> summons a turret. Reload with light ammo or pick up and relocate</li>
             <li>The red dummy shoots back. Teal dummies patrol, spot you, and take cover</li>
-            <li>
-              <kbd>V</kbd> or <kbd>Q</kbd> toggles <b>Fortnite Wall Build</b> mode. Left click to place a wooden cover wall (250 HP) to take cover from gunfire and grenades!
-            </li>
-            <li>
-              <b>Wall Cover Detection:</b> Grenade explosions detect walls and solid cover! Taking cover behind any wall or crate completely shields you from blast damage while the wall absorbs the explosion.
-            </li>
-            <li>
-              <b>Physical Voxel Destruction:</b> Crates, walls, and placed structures break apart into tumbling physical voxel blocks with bouncing physics, scattering debris when shot or hit by explosions.
-            </li>
-            <li><kbd>R</kbd> reload, <kbd>1</kbd> <kbd>2</kbd> switch weapon slot, <kbd>Esc</kbd> pause</li>
+            <li><kbd>R</kbd> reload, <kbd>1</kbd> <kbd>2</kbd> or <kbd>Q</kbd> switch weapon slot, <kbd>Esc</kbd> pause</li>
             <li>
               <kbd>G</kbd> arms the selected grenade, right click throws. Hold <kbd>G</kbd> and scroll to pick Blast, Fire or Smoke
             </li>
@@ -5508,9 +6119,9 @@ export default function BattleRoyaleGame() {
             <li>Left stick to move. Push fully forward to run</li>
             <li>Slide the screen to look</li>
             <li>Hold AIM to aim and turn the view</li>
-            <li>Tap 🧱 WALL to enter build mode, tap screen to place cover wall</li>
             <li>Tap slider to jump. Slide left/right to roll, down to crouch/slide</li>
-            <li>Tap GRENADE to arm, tap AIM to throw. Walls & crates block grenade blasts!</li>
+            <li>Tap GRENADE to arm, tap AIM to throw. Hold GRENADE and slide up to pick kind</li>
+            <li>Tap WALL to arm build mode, then tap anywhere to place a 250 HP wooden wall</li>
             <li>Tap INVENTORY to purchase weapons, ammo and customize dummies</li>
           </ul>
           <button className="btn" id="btn" type="button">

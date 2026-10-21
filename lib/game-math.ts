@@ -1,135 +1,125 @@
-// Pure mathematical and rule logic for Battle Royale FPS
+/**
+ * game-math — pure combat/economy math for the Battle Royale FPS.
+ *
+ * Everything here is framework-free so it can be unit-tested in isolation
+ * and shared between the player, dummies, turrets and grenades.
+ */
 
-export interface WeaponConfig {
-  name: string;
-  ammo: 'heavy' | 'light';
-  mag: number;
+/** Falloff band of a weapon: full power up to `start`, zero power at `end`. */
+export type Falloff = [start: number, end: number];
+
+export interface WeaponLike {
+  /** Base damage per shot at full power. */
   damage: number;
-  delay: number;
-  reload: number;
-  recoil: number;
-  falloff: [number, number];
+  /** Range band over which the bullet keeps / loses its power. */
+  falloff: Falloff;
+  /** Shotguns carry a shield-piercing bonus at very close range. */
   shotgun?: boolean;
 }
 
-export const POWER_LEVELS = [1, 0.6, 0.3] as const;
+/** Grenade blast behaviour (Blast grenade). */
+export const BLAST = {
+  /** Radius (m) in which the blast can damage anything. */
+  radius: 12,
+  /** Distance (m) inside which the blast deals its full damage. */
+  fullRadius: 3,
+} as const;
 
-export function powerAt(w: { falloff: [number, number] }, dist: number): number {
-  if (dist < w.falloff[0]) return POWER_LEVELS[0];
-  return dist < w.falloff[1] ? POWER_LEVELS[1] : POWER_LEVELS[2];
-}
-
-export const BETGUN = {
-  damage: 150,
-  pen: 80,
-  close: 10,
-  full: 30,
-  far: 60,
-  low: 30,
-};
-
-export function shotDamage(
-  w: { shotgun?: boolean; damage: number; falloff: [number, number] },
-  dist: number
-): { dmg: number; pen: number } {
-  if (!w.shotgun) {
-    return { dmg: w.damage * powerAt(w, dist), pen: 0 };
-  }
-  if (dist <= BETGUN.close) return { dmg: BETGUN.damage, pen: BETGUN.pen };
-  if (dist < BETGUN.full) return { dmg: BETGUN.damage, pen: 0 };
-  const t = Math.min(1, (dist - BETGUN.full) / (BETGUN.far - BETGUN.full));
-  return { dmg: BETGUN.damage + (BETGUN.low - BETGUN.damage) * t, pen: 0 };
-}
-
+/** Damage share of a Blast grenade at `dist` metres from the epicentre.
+ * Full damage inside the inner radius, then linear falloff to zero. */
 export function blastShare(dist: number): number {
-  if (dist <= 4) return 1;
-  if (dist <= 8) return 2 / 3;
-  if (dist <= 12) return 1 / 3;
-  return 0;
+  if (dist <= BLAST.fullRadius) return 1;
+  if (dist >= BLAST.radius) return 0;
+  return 1 - (dist - BLAST.fullRadius) / (BLAST.radius - BLAST.fullRadius);
 }
 
-export const LEVEL_COST = [100, 300, 500, 700] as const;
-export const MAX_LEVEL = LEVEL_COST.length + 1;
+/** Remaining bullet power (0..1) at `dist` metres for weapon `w`. */
+export function powerAt(w: WeaponLike, dist: number): number {
+  const [start, end] = w.falloff;
+  if (dist <= start) return 1;
+  if (dist >= end) return 0;
+  return 1 - (dist - start) / (end - start);
+}
 
-export function calculateXpProgression(
-  currentLevel: number,
-  currentXp: number,
-  earnedXp: number
-): { newLevel: number; newXp: number; levelsGained: number[] } {
-  let level = currentLevel;
-  let xp = currentXp + earnedXp;
+/** Close range (m) inside which shotgun pellets pierce shields. */
+const SHOTGUN_PEN_RANGE = 10;
+/** Shield damage skipped by a shotgun when fired point-blank. */
+const SHOTGUN_PEN_FLAT = 80;
+
+export interface ShotResult {
+  /** Damage that hits the shield first. */
+  dmg: number;
+  /** Damage that skips the shield entirely. */
+  pen: number;
+}
+
+/** Resolve a single bullet at `dist` metres into shield + piercing damage. */
+export function shotDamage(w: WeaponLike, dist: number): ShotResult {
+  const power = powerAt(w, dist);
+  const dmg = w.damage * power;
+  // Betgun: within 10 m an extra 80 damage skips the shield.
+  const pen = w.shotgun && dist <= SHOTGUN_PEN_RANGE ? SHOTGUN_PEN_FLAT : 0;
+  return { dmg, pen };
+}
+
+/** Highest reachable level (levels 3 & 5 upgrade turret / bombardment). */
+export const MAX_LEVEL = 5;
+
+/** XP required to advance from level `n` to `n + 1` (index 0 = level 1 -> 2). */
+export const LEVEL_COST: readonly number[] = [100, 250, 500, 1000];
+
+export interface XpResult {
+  newLevel: number;
+  newXp: number;
+  /** Every level crossed during this gain, in order. */
+  levelsGained: number[];
+}
+
+/** Add `amount` XP to a player at (`level`, `xp`) and resolve level-ups. */
+export function calculateXpProgression(level: number, xp: number, amount: number): XpResult {
+  let newLevel = level;
+  let newXp = xp + amount;
   const levelsGained: number[] = [];
 
-  while (level < MAX_LEVEL && xp >= LEVEL_COST[level - 1]) {
-    xp -= LEVEL_COST[level - 1];
-    level += 1;
-    levelsGained.push(level);
+  while (newLevel < MAX_LEVEL && newXp >= LEVEL_COST[newLevel - 1]) {
+    newXp -= LEVEL_COST[newLevel - 1];
+    newLevel += 1;
+    levelsGained.push(newLevel);
   }
 
-  return { newLevel: level, newXp: xp, levelsGained };
+  if (newLevel >= MAX_LEVEL) newXp = Math.min(newXp, LEVEL_COST[MAX_LEVEL - 2]);
+  return { newLevel, newXp, levelsGained };
 }
 
+/**
+ * Shield recharge after `delay` seconds without taking damage.
+ * Recharges `regen` (fraction of max shield) per second while standing up.
+ */
 export function calculateShieldRegen(
-  currentShield: number,
-  maxShield: number,
+  shield: number,
+  shieldMax: number,
   sinceHurt: number,
   delay: number,
-  rate: number,
+  regen: number,
   dt: number,
-  isDown: boolean
+  down: boolean
 ): number {
-  if (isDown || sinceHurt < delay || currentShield >= maxShield) {
-    return currentShield;
-  }
-  return Math.min(maxShield, currentShield + rate * maxShield * dt);
+  if (down || sinceHurt < delay || shield >= shieldMax) return shield;
+  return Math.min(shieldMax, shield + shieldMax * regen * dt);
 }
 
-// ----------------------------------------------------------------------------
-// CoD / Apex Slide Physics Logic
-// ----------------------------------------------------------------------------
-export const SLIDE_INITIAL_SPEED = 16.5; // m/s burst
-export const SLIDE_DECAY_RATE = 1.15;
-export const SLIDE_MIN_SPEED = 3.0;
-export const SLIDE_MAX_TIME = 1.4;
+// ----------------------------------------------------
+// Fortnite-style destruction math (ported from BR-web)
+// ----------------------------------------------------
 
-export function calculateSlideVelocity(
-  time: number,
-  initialSpeed = SLIDE_INITIAL_SPEED,
-  decayRate = SLIDE_DECAY_RATE,
-  slopeBonus = 0
-): number {
-  const base = initialSpeed * Math.exp(-decayRate * time);
-  return Math.max(0, base + slopeBonus);
+/** Minimal 3D position (metres, world space). */
+export interface Vec3Like {
+  x: number;
+  y: number;
+  z: number;
 }
 
-// ----------------------------------------------------------------------------
-// Souls-like Dodge Roll Logic & i-Frames
-// ----------------------------------------------------------------------------
-export const SOULS_ROLL_DURATION = 0.75; // seconds
-export const SOULS_ROLL_IFRAMES = 0.42;  // ~13 frames at 30fps invincibility window
-export const SOULS_ROLL_DISTANCE = 4.8;  // meters
-export const SOULS_ROLL_COOLDOWN = 0.35; // recovery cooldown
-
-export function isRollInvulnerable(rollT: number, iframes = SOULS_ROLL_IFRAMES): boolean {
-  return rollT >= 0 && rollT < iframes;
-}
-
-export function soulsRollEyeHeight(
-  progress: number, // 0 to 1
-  standingEyeH = 1.7
-): number {
-  const p = Math.max(0, Math.min(1, progress));
-  const angle = 2 * Math.PI * p;
-  // Center drops down during tuck, head swings over in somersault
-  const center = 0.45 + 0.35 * Math.abs(Math.cos(angle));
-  const reach = 0.45 + 0.45 * Math.abs(Math.cos(angle / 2));
-  const rawH = center + reach * Math.cos(angle);
-  return Math.max(0.38, (rawH * standingEyeH) / 1.7);
-}
-
-// ----------------------------------------------------------------------------
-// Wall / Cover Detection & Fortnite-style Physical Destruction
-// ----------------------------------------------------------------------------
+/** Axis-aligned solid box used for movement / cover / ray casts. */
 export interface SolidBoxAABB {
   x: number;
   z: number;
@@ -139,16 +129,7 @@ export interface SolidBoxAABB {
   bottom?: number;
 }
 
-export interface Vec3Like {
-  x: number;
-  y: number;
-  z: number;
-}
-
-/**
- * Checks if a 3D line segment from p0 to p1 intersects an axis-aligned box.
- * Returns intersection parameter t in [0, 1] or null if no hit.
- */
+/** Slab-method segment vs AABB test: returns entry t in [0, 1] or null. */
 export function segmentIntersectsBox(
   p0: Vec3Like,
   p1: Vec3Like,
@@ -222,6 +203,13 @@ export function segmentIntersectsBox(
   return tMin;
 }
 
+export interface CoverResult {
+  blocked: boolean;
+  blockingBox: SolidBoxAABB | null;
+  /** Straight-line distance from origin to the blocking surface. */
+  distance: number;
+}
+
 /**
  * Checks if a wall or solid cover blocks direct line of sight between an explosion
  * and a target (player or dummy).
@@ -231,7 +219,7 @@ export function isCoverBlocked(
   targetPos: Vec3Like,
   solids: SolidBoxAABB[],
   ignoredBox?: SolidBoxAABB | null
-): { blocked: boolean; blockingBox: SolidBoxAABB | null; distance: number } {
+): CoverResult {
   let closestT = 1;
   let blocking: SolidBoxAABB | null = null;
 
@@ -306,4 +294,3 @@ export function calculateVoxelImpulse(
     z: normZ * speed,
   };
 }
-
