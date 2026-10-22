@@ -2911,6 +2911,10 @@ export default function BattleRoyaleGame() {
 
     const HARBOR_E = Math.SQRT1_2; // the sea lies toward the +X/+Z diagonal
     let harborAnchor: { x: number; z: number; t: number } | null = null;
+    // Landmark chips the top compass tracks in Harbor mode. buildHarbor
+    // swaps in a fresh array each entry; the compass reconfigures on change.
+    type HarborMark = { x: number; z: number; label: string; cls: string };
+    let harborMarks: HarborMark[] = [];
 
     function clearHarbor() {
       harborGroup.traverse((o: any) => {
@@ -2971,6 +2975,7 @@ export default function BattleRoyaleGame() {
 
     function buildHarbor() {
       clearHarbor();
+      harborMarks = []; // fresh chip set for this layout
       const tWater = marchWaterFrom(HARBOR_SPAWN.x, HARBOR_SPAWN.z, 1700);
       if (tWater < 0) return; // no coastline this seed — bail out safely
       const wx0 = HARBOR_SPAWN.x + HARBOR_E * tWater;
@@ -3024,6 +3029,7 @@ export default function BattleRoyaleGame() {
       bBox(WB, 'x', -5.5, 5.5, -7.5, 7.5, W1, W1 + 0.35, bmSteelDark, harborGroup); // roof
       bBox(WB, 'z', -2.4, -0.6, -4.2, -2.6, W0, W0 + 1.3, bmCrate, harborGroup); // interior crates
       bBox(WB, 'z', 1.0, 2.8, 2.0, 3.4, W0, W0 + 1.3, bmCrate, harborGroup);
+      harborMarks.push({ x: wbx, z: wbz, label: 'WHSE', cls: 'c-whse' }); // compass chip
 
       // Portal gantry crane straddling the yard: legs, beam, trolley,
       // cables and a hanging container that makes elevated cover.
@@ -3036,6 +3042,7 @@ export default function BattleRoyaleGame() {
       bBox({ x: yx + 2.2, z: yz, rot: 0 }, 'z', -0.08, 0.08, -0.55, -0.35, legTop - 4.6, legTop - 1.2, bmSteelDark, harborGroup); // cables
       bBox({ x: yx + 2.2, z: yz, rot: 0 }, 'z', -0.08, 0.08, 0.35, 0.55, legTop - 4.6, legTop - 1.2, bmSteelDark, harborGroup);
       bBox({ x: yx + 2.2, z: yz, rot: 0 }, 'z', -1.8, 1.8, -1.3, 1.3, legTop - 7.2, legTop - 4.6, bmContainerBlue, harborGroup); // hanging box
+      harborMarks.push({ x: yx + 2.2, z: yz, label: 'CRANE', cls: 'c-crane' }); // compass chip (trolley)
 
       // Shipping containers in the yard — singles, a stacked pair, and
       // one half-sunk at the waterline for cover while swimming.
@@ -3045,6 +3052,7 @@ export default function BattleRoyaleGame() {
       cont(yx - 2, yz + 4.4, bmContainerGreen, padTop);
       cont(yx + 3.5, yz + 4.4, bmContainerOrange, padTop);
       cont(yx + 3.5, yz + 4.4, bmContainerBlue, padTop + 2.6); // stacked
+      harborMarks.push({ x: yx, z: yz, label: 'YARD', cls: 'c-yard' }); // compass chip (container yard)
       const fx = wx0 + HARBOR_E * bestK + HARBOR_E * 7 - HARBOR_E * 3.6;
       const fz = wz0 - HARBOR_E * bestK + HARBOR_E * 7 + HARBOR_E * 3.6;
       const fTop = Math.max(WATER_Y + 0.62, terrainHeight(fx, fz) + 0.4);
@@ -3054,7 +3062,8 @@ export default function BattleRoyaleGame() {
       // own waterline so the walk from the yard onto the dock is short.
       const dWater = marchWaterFrom(yx, yz, 140);
       if (dWater >= 0) {
-        buildPier(yx + HARBOR_E * dWater, yz + HARBOR_E * dWater);
+        const head = buildPier(yx + HARBOR_E * dWater, yz + HARBOR_E * dWater);
+        harborMarks.push({ x: head.hx, z: head.hz, label: 'PIER', cls: 'c-pier' }); // compass chip
       }
     }
 
@@ -3099,6 +3108,141 @@ export default function BattleRoyaleGame() {
       // warehouse and gantry crane — all voxel-destructible.
       harborGroup.visible = true;
       buildHarbor();
+    }
+
+    // ----------------------------------------------------
+    // Top compass: a scrolling N/E/S/W strip at the top of the
+    // HUD that tracks the camera yaw. In Harbor mode it also
+    // carries landmark chips (PIER / YARD / CRANE / WHSE) with
+    // live bearing and distance, so the facilities are easy to
+    // find. Chips pin to the strip edge (with ‹ › arrows) when
+    // the landmark is off-screen — turn that way to reach it.
+    // ----------------------------------------------------
+    const compassEl = $('compass');
+    const compassWin = $('compassWindow');
+    const compassStrip = $('compassStrip');
+    const compassMarksEl = $('compassMarks');
+    const compassDegEl = $('compassDeg');
+    const COMPASS_PX = 4; // pixels per degree of bearing
+    const COMPASS_PERIOD = 360 * COMPASS_PX; // one full ring of the strip
+    const CARD8 = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
+
+    if (compassStrip) {
+      // Three copies of the tick ring so the strip can scroll through
+      // the 0/360 seam without ever showing a gap.
+      for (let copy = 0; copy < 3; copy++) {
+        for (let d = 0; d < 360; d += 15) {
+          const x = copy * COMPASS_PERIOD + d * COMPASS_PX;
+          const tick = document.createElement('i');
+          tick.className = 'compass-tick' + (d % 90 === 0 ? ' major' : d % 45 === 0 ? ' mid' : '');
+          tick.style.left = x + 'px';
+          compassStrip.appendChild(tick);
+          if (d % 45 === 0) {
+            const card = document.createElement('b');
+            const name = CARD8[d / 45];
+            card.className = 'compass-card' + (d % 90 === 0 ? '' : ' minor') + (name === 'N' ? ' n' : '');
+            card.textContent = name;
+            card.style.left = x + 'px';
+            compassStrip.appendChild(card);
+          }
+        }
+      }
+    }
+
+    // Up to four landmark chips, reconfigured whenever the harbor
+    // rebuilds (buildHarbor swaps in a fresh harborMarks array).
+    const compassChips: HTMLSpanElement[] = [];
+    if (compassMarksEl) {
+      for (let i = 0; i < 4; i++) {
+        const chip = document.createElement('span');
+        chip.className = 'compass-mark';
+        chip.style.display = 'none';
+        const lbl = document.createElement('b');
+        const dist = document.createElement('small');
+        chip.appendChild(lbl);
+        chip.appendChild(dist);
+        compassMarksEl.appendChild(chip);
+        compassChips.push(chip);
+      }
+    }
+    let compassChipsFor: HarborMark[] | null = null;
+
+    function updateCompass() {
+      if (!compassEl || !compassWin || !compassStrip) return;
+      if (!running()) {
+        if (!compassEl.hidden) compassEl.hidden = true; // menu / pause / inventory
+        return;
+      }
+      if (compassEl.hidden) compassEl.hidden = false;
+      const w = compassWin.clientWidth || 1;
+      // Yaw 0 faces -Z (north); turning right lowers yaw, so compass
+      // bearing is -yaw wrapped to 0..360 (N -> E -> S -> W clockwise).
+      const bearing = (((-yaw * 180) / Math.PI) % 360 + 360) % 360;
+      compassStrip.style.transform = `translateX(${w / 2 - (COMPASS_PERIOD + bearing * COMPASS_PX)}px)`;
+      if (compassDegEl) {
+        const txt = `${CARD8[Math.round(bearing / 45) % 8]} ${Math.round(bearing)}\u00b0`;
+        if (compassDegEl.textContent !== txt) compassDegEl.textContent = txt;
+      }
+      if (harborMarks !== compassChipsFor) {
+        compassChipsFor = harborMarks;
+        for (let i = 0; i < compassChips.length; i++) {
+          const chip = compassChips[i];
+          const m = harborMarks[i];
+          chip.style.display = m ? '' : 'none';
+          if (!m) continue;
+          chip.className = 'compass-mark ' + m.cls;
+          const lbl = chip.querySelector('b');
+          if (lbl) lbl.textContent = m.label;
+        }
+      }
+      if (!compassChips.length) return;
+      const maxOff = w / 2 - 26;
+      const p = camera.position;
+      // Chip half-widths, read once per frame (single reflow).
+      const hws = compassChips.map((c) => (c.offsetWidth || 36) / 2);
+      const placed: { c: number; hw: number }[] = [];
+      for (let i = 0; i < compassChips.length; i++) {
+        const chip = compassChips[i];
+        const m = harborMarks[i];
+        if (!m) continue;
+        const hw = hws[i];
+        const dx = m.x - p.x;
+        const dz = m.z - p.z;
+        const dist = Math.round(Math.hypot(dx, dz));
+        const rel = (((Math.atan2(dx, -dz) * 180) / Math.PI - bearing + 540) % 360) - 180;
+        const relPx = rel * COMPASS_PX;
+        const offScreen = relPx < -maxOff || relPx > maxOff;
+        let off = Math.max(-maxOff, Math.min(maxOff, relPx));
+        // Landmarks that share a bearing fan out along the strip so chips
+        // never overlap: the first chip keeps the exact bearing, later
+        // ones step toward the strip centre by measured chip width.
+        const collide = (x: number) => placed.some((q) => Math.abs(x - q.c) < hw + q.hw + 14);
+        if (collide(off)) {
+          const dir = off >= 0 ? -1 : 1;
+          const step = hw * 2 + 14;
+          const tryFan = (allowCross: boolean) => {
+            let c = off;
+            for (let t = 0; t < 8; t++) {
+              c += dir * step;
+              if (Math.abs(c) > maxOff || (!allowCross && c * off < 0)) return null;
+              if (!collide(c)) return c;
+            }
+            return null;
+          };
+          off = tryFan(false) ?? tryFan(true) ?? off;
+        }
+        placed.push({ c: off, hw });
+        // Off-screen landmarks go compact (label only); an edge arrow marks
+        // the chip still sitting exactly at the strip border.
+        let cls = 'compass-mark ' + m.cls + (offScreen ? ' pinned' : '');
+        if (off <= -maxOff + 0.5) cls += ' pin-l';
+        else if (off >= maxOff - 0.5) cls += ' pin-r';
+        if (chip.className !== cls) chip.className = cls;
+        chip.style.transform = `translate(calc(${off}px - 50%), 0px)`;
+        const dTxt = dist + 'm';
+        const sm = chip.querySelector('small');
+        if (sm && sm.textContent !== dTxt) sm.textContent = dTxt;
+      }
     }
 
     // Main menu & Character Pick
@@ -3186,6 +3330,20 @@ export default function BattleRoyaleGame() {
               return { floor: +s.floor.toFixed(2), wet: s.wet, swimming: s.swimming, depth: +(WATER_Y - s.floor).toFixed(2), underFx };
             },
             harborInfo: () => harborAnchor,
+            compassInfo: () => {
+              const b = (((-yaw * 180) / Math.PI) % 360 + 360) % 360;
+              const p = camera.position;
+              return {
+                bearing: +b.toFixed(1),
+                facing: CARD8[Math.round(b / 45) % 8],
+                visible: !!compassEl && !compassEl.hidden,
+                marks: harborMarks.map((m) => ({
+                  label: m.label,
+                  dist: Math.round(Math.hypot(m.x - p.x, m.z - p.z)),
+                  rel: +((((Math.atan2(m.x - p.x, -(m.z - p.z)) * 180) / Math.PI - b + 540) % 360) - 180).toFixed(1),
+                })),
+              };
+            },
             solidsNear: (nx: number, nz: number, r = 8) =>
               solids
                 .filter((b) => Math.hypot(b.x - nx, b.z - nz) < r)
@@ -6350,6 +6508,7 @@ export default function BattleRoyaleGame() {
       const dt = Math.min(clock.getDelta(), 0.05);
       if (running()) update(dt);
       applyView();
+      updateCompass();
       updateTracker();
       followSun();
 
@@ -6392,6 +6551,18 @@ export default function BattleRoyaleGame() {
       <div className="hurt-fx" id="hurtFx" aria-hidden="true" />
       <div className="smoke-fx" id="smokeFx" aria-hidden="true" />
       <div className="water-fx" id="waterFx" aria-hidden="true" />
+
+      {/* Top compass: N/E/S/W strip + harbor landmark chips */}
+      <div className="hud compass" id="compass" role="img" aria-label="Compass" hidden>
+        <div className="compass-window" id="compassWindow">
+          <div className="compass-strip" id="compassStrip" aria-hidden="true" />
+          <div className="compass-marks" id="compassMarks" aria-hidden="true" />
+          <span className="compass-caret" aria-hidden="true" />
+          <span className="compass-deg" id="compassDeg">
+            N 0&deg;
+          </span>
+        </div>
+      </div>
 
       {/* Top HUD: Downs and credits */}
       <div className="hud downs">
@@ -6691,6 +6862,10 @@ export default function BattleRoyaleGame() {
             <li>Cover fails eventually: blasts chew voxel holes through walls and crates, and bullets chip chunks off</li>
             <li>Structures have health: damage numbers pop, health bars show, and a gutted building collapses</li>
             <li>
+              Top compass points you around the map. In Harbor the <b>PIER</b>, <b>YARD</b>, <b>CRANE</b> and{' '}
+              <b>WHSE</b> chips show live distance — a chip pinned at the strip edge means turn that way
+            </li>
+            <li>
               <kbd>V</kbd> opens build mode with four pieces — <b>Wall</b>, <b>Door Wall</b>, <b>Floor</b> and{' '}
               <b>Ramp</b>. <kbd>T</kbd> or the mouse wheel cycles them, <kbd>Left click</kbd> places. Wall and Door
               stop gunfire and blasts until they shatter; Floors bridge water; Ramps run you onto roofs
@@ -6719,6 +6894,7 @@ export default function BattleRoyaleGame() {
             <li>Tap GRENADE to arm, tap AIM to throw. Hold GRENADE and slide up to pick kind</li>
             <li>Tap WALL to arm build mode, then tap AIM to place. Double-tap WALL to cycle Wall, Door, Floor, Ramp</li>
             <li>Wade into the sea: you slow down, then swim. Hold crouch to dive, tap jump to stroke up</li>
+            <li>The top compass tracks PIER, YARD, CRANE and WHSE — edge-pinned chips show which way to turn</li>
             <li>Tap INVENTORY to purchase weapons, ammo and customize dummies</li>
           </ul>
           <button className="btn" id="btn" type="button">

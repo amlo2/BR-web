@@ -1441,3 +1441,172 @@ body.touch .gplate { display: none; }
 
 body.touch .build-plate { display: none; }
 body:not(.touch) .touch-build { display: none; }
+
+/* ---------------------------------------------------------------
+   Top compass: scrolling N/E/S/W strip + harbor landmark chips
+   --------------------------------------------------------------- */
+.compass {
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: min(440px, 44vw);
+  padding: 0;
+  overflow: hidden;
+}
+
+.compass-window {
+  position: relative;
+  height: 48px;
+  overflow: hidden;
+}
+
+.compass-strip {
+  position: absolute;
+  top: 4px;
+  left: 0;
+  height: 40px;
+  width: 4320px;
+  will-change: transform;
+}
+
+.compass-tick {
+  position: absolute;
+  bottom: 6px;
+  width: 1px;
+  height: 6px;
+  background: rgba(245, 247, 250, 0.38);
+}
+
+.compass-tick.mid {
+  height: 8px;
+  background: rgba(245, 247, 250, 0.6);
+}
+
+.compass-tick.major {
+  width: 2px;
+  height: 11px;
+  background: var(--hud-ink);
+}
+
+.compass-card {
+  position: absolute;
+  top: 2px;
+  transform: translateX(-50%);
+  font: 800 0.92rem/1 var(--font-display);
+  letter-spacing: 0.05em;
+  color: var(--hud-ink);
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.55);
+}
+
+.compass-card.minor {
+  font-size: 0.7rem;
+  opacity: 0.75;
+  letter-spacing: 0.02em;
+}
+
+.compass-card.n { color: var(--danger); }
+
+.compass-caret {
+  position: absolute;
+  top: 0;
+  left: 50%;
+  width: 0;
+  height: 0;
+  margin-left: -5px;
+  border-left: 5px solid transparent;
+  border-right: 5px solid transparent;
+  border-top: 6px solid var(--accent);
+  z-index: 2;
+}
+
+.compass-deg {
+  position: absolute;
+  bottom: 3px;
+  left: 50%;
+  transform: translateX(-50%);
+  font: 700 0.66rem/1 var(--font-body);
+  letter-spacing: 0.08em;
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.7);
+  z-index: 2;
+}
+
+.compass-marks {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 3;
+}
+
+.compass-mark {
+  position: absolute;
+  top: 12px;
+  left: 50%;
+  display: grid;
+  justify-items: center;
+  gap: 1px;
+  padding: 2px 6px 1px;
+  border-radius: 6px;
+  background: rgba(6, 9, 14, 0.66);
+  border: 1px solid rgba(245, 247, 250, 0.25);
+  white-space: nowrap;
+  will-change: transform;
+}
+
+.compass-mark b {
+  font: 800 0.68rem/1 var(--font-display);
+  letter-spacing: 0.1em;
+}
+
+.compass-mark small {
+  font: 600 0.58rem/1 var(--font-body);
+  opacity: 0.8;
+  font-variant-numeric: tabular-nums;
+}
+
+.compass-mark.c-pier { border-color: rgba(231, 192, 122, 0.55); }
+.compass-mark.c-pier b { color: #e7c07a; }
+.compass-mark.c-yard { border-color: rgba(230, 135, 60, 0.55); }
+.compass-mark.c-yard b { color: #e6873c; }
+.compass-mark.c-crane { border-color: rgba(157, 184, 214, 0.55); }
+.compass-mark.c-crane b { color: #9db8d6; }
+.compass-mark.c-whse { border-color: rgba(103, 232, 249, 0.55); }
+.compass-mark.c-whse b { color: #67e8f9; }
+
+/* Off-screen landmarks go compact: label only, no distance row */
+.compass-mark.pinned {
+  padding: 3px 5px;
+}
+
+.compass-mark.pinned small {
+  display: none;
+}
+
+.compass-mark.pinned b {
+  font-size: 0.58rem;
+  letter-spacing: 0.05em;
+}
+
+/* Pinned to the strip edge: the target is off-screen — turn that way */
+.compass-mark.pin-l::before,
+.compass-mark.pin-r::after {
+  font: 800 0.7rem/1 var(--font-display);
+  color: var(--hud-ink);
+  opacity: 0.9;
+}
+
+.compass-mark.pin-l::before {
+  content: "\2039";
+  margin-right: 3px;
+}
+
+.compass-mark.pin-r::after {
+  content: "\203a";
+  margin-left: 3px;
+}
+
+body.touch .compass {
+  top: calc(8px + env(safe-area-inset-top, 0px));
+  width: min(440px, 72vw);
+}
