@@ -292,6 +292,23 @@ export default function BattleRoyaleGame() {
     const SEA_C = HARBOR_HALF * (2 - Math.SQRT2);
     const BEACH_Y = WATER_Y + 0.7;
 
+    // ----------------------------------------------------
+    // Procedural POI generator — terrain flattening zones.
+    // Each POI registers a pad: inside r-10 the terrain is
+    // pinned to the POI's base height (sampled from the raw
+    // FBM before the zone exists), then eases back to the
+    // natural landscape within +22 m. Structures always sit
+    // flush with the ground because both the streamed tiles
+    // and groundAt() consult the same list.
+    // ----------------------------------------------------
+    interface PoiZone {
+      x: number;
+      z: number;
+      r: number;
+      baseY: number;
+    }
+    const flatZones: PoiZone[] = [];
+
     function seaDist(x: number, z: number) {
       const base = (x + z - SEA_C) / Math.SQRT2;
       if (base < -(SEA_WARP + 200) || base > SEA_WARP + 300) return base;
@@ -300,7 +317,16 @@ export default function BattleRoyaleGame() {
 
     function terrainHeight(x: number, z: number) {
       const keep = THREE.MathUtils.smoothstep(Math.hypot(x - HARBOR_SPAWN.x, z - HARBOR_SPAWN.z), 8, 60);
-      const land = keep * Math.max(0.3, TERRAIN_LIFT + TERRAIN_HEIGHT * fbm(x / TERRAIN_SPAN, z / TERRAIN_SPAN, terrainSeed));
+      let land = keep * Math.max(0.3, TERRAIN_LIFT + TERRAIN_HEIGHT * fbm(x / TERRAIN_SPAN, z / TERRAIN_SPAN, terrainSeed));
+      // POI pads: blend the raw landscape toward each registered base
+      // height so structures sit level without floating or burying.
+      for (const f of flatZones) {
+        const fd = Math.hypot(x - f.x, z - f.z);
+        if (fd < f.r + 24) {
+          const t = 1 - THREE.MathUtils.smoothstep(fd, f.r - 10, f.r + 22);
+          land += (f.baseY - land) * t;
+        }
+      }
       const d = seaDist(x, z);
       const inland = THREE.MathUtils.smoothstep(-d, 10, 110);
       const shore = land * inland + BEACH_Y * (1 - inland);
@@ -736,6 +762,7 @@ export default function BattleRoyaleGame() {
                   hz: sz / 2,
                   top: y0 + (j1 + 1) * sy,
                   bottom: y0 + j0 * sy,
+                  group: v.group,
                 });
               }
             }
@@ -1171,7 +1198,7 @@ export default function BattleRoyaleGame() {
 
     function disposeBar(g: THREE.Group | null) {
       if (!g) return;
-      world.remove(g);
+      g.parent?.remove(g);
       g.traverse((o: any) => {
         o.geometry?.dispose?.();
         o.material?.dispose?.();
@@ -1189,7 +1216,7 @@ export default function BattleRoyaleGame() {
         const { group, fill } = makeHealthBar();
         voxBarAnchor(v, voxTmpP);
         group.position.set(voxTmpP.x, voxTmpP.y + 0.35, voxTmpP.z);
-        world.add(group);
+        scene.add(group);
         v.barGroup = group;
         v.barFill = fill;
       }
@@ -1276,7 +1303,7 @@ export default function BattleRoyaleGame() {
       if (!dest.barGroup) {
         const { group, fill } = makeHealthBar();
         group.position.set(dest.bounds.x, dest.bounds.y + dest.bounds.h / 2 + 0.35, dest.bounds.z);
-        world.add(group);
+        scene.add(group);
         dest.barGroup = group;
         dest.barFill = fill;
       }
@@ -2973,17 +3000,43 @@ export default function BattleRoyaleGame() {
       return { hx, hz, deckTop };
     }
 
-    function buildHarbor() {
-      clearHarbor();
-      harborMarks = []; // fresh chip set for this layout
+    // The port is the map's centerpiece: pier, container yard,
+    // warehouses, gantry + tower cranes, customs office, fuel
+    // depot, dry dock with a half-built ship, breakwater with a
+    // climbable lighthouse and a moored boat — all destructible.
+    // Planning happens BEFORE terrain tiles stream so the flat
+    // pads under the warehouses/office/tanks are part of the mesh.
+    interface PortPlan {
+      wx0: number;
+      wz0: number;
+      yx: number;
+      yz: number;
+      hYard: number;
+      padTop: number;
+      bestK: number;
+      wh1: { x: number; z: number };
+      wh2: { x: number; z: number };
+      office: { x: number; z: number };
+      tanks: { x: number; z: number };
+      dock: { x: number; z: number } | null;
+      bwall: { x: number; z: number };
+    }
+    let portPlan: PortPlan | null = null;
+
+    function planHarbor() {
       const tWater = marchWaterFrom(HARBOR_SPAWN.x, HARBOR_SPAWN.z, 1700);
-      if (tWater < 0) return; // no coastline this seed — bail out safely
+      if (tWater < 0) {
+        harborAnchor = null;
+        portPlan = null;
+        return;
+      }
       const wx0 = HARBOR_SPAWN.x + HARBOR_E * tWater;
       const wz0 = HARBOR_SPAWN.z + HARBOR_E * tWater;
       harborAnchor = { x: wx0, z: wz0, t: tWater };
+      const coastP = (k: number) => ({ x: wx0 + HARBOR_E * k, z: wz0 - HARBOR_E * k });
+      const inland = (p: { x: number; z: number }, d: number) => ({ x: p.x - HARBOR_E * d, z: p.z - HARBOR_E * d });
 
-      // Choose the flattest sand along the coast (perpendicular offsets)
-      // for the container yard so the structures sit sensibly.
+      // Flattest-sand scan for the container yard (unchanged heuristic)
       let bestK = 0;
       let bestScore = Infinity;
       for (let k = -45; k <= 45; k += 9) {
@@ -3007,19 +3060,62 @@ export default function BattleRoyaleGame() {
           bestK = k;
         }
       }
-      const yx = wx0 + HARBOR_E * bestK - HARBOR_E * 26;
-      const yz = wz0 - HARBOR_E * bestK - HARBOR_E * 26;
-      const hYard = terrainHeight(yx, yz);
-      const padTop = hYard + 0.16;
+      const yard = inland(coastP(bestK), 26);
+      const hYard = terrainHeight(yard.x, yard.z);
+      flatZones.push({ x: yard.x, z: yard.z, r: 21, baseY: hYard });
+      const wh1 = inland(yard, 22);
+      const wh2 = { x: wh1.x + HARBOR_E * 36, z: wh1.z - HARBOR_E * 36 };
+      const office = inland(coastP(bestK + 26), 9);
+      const tanks = inland(wh1, 21);
+      for (const [p, r] of [
+        [wh1, 12],
+        [wh2, 12],
+        [office, 10],
+        [tanks, 11],
+      ] as Array<[{ x: number; z: number }, number]>) {
+        flatZones.push({ x: p.x, z: p.z, r, baseY: terrainHeight(p.x, p.z) });
+      }
+      // Dry dock: a coast point 64 m along the bay, then due east
+      // (axis-aligned, so the ship and channel can be box-built).
+      const dockStart = coastP(bestK - 64);
+      let dockX: number | null = null;
+      for (let d = 0; d <= 300; d += 2) {
+        if (terrainHeight(dockStart.x + d, dockStart.z) < WATER_Y - 0.12) {
+          dockX = dockStart.x + d;
+          break;
+        }
+      }
+      portPlan = {
+        wx0,
+        wz0,
+        yx: yard.x,
+        yz: yard.z,
+        hYard,
+        padTop: hYard + 0.16,
+        bestK,
+        wh1,
+        wh2,
+        office,
+        tanks,
+        dock: dockX !== null ? { x: dockX, z: dockStart.z } : null,
+        bwall: coastP(bestK + 52),
+      };
+    }
 
-      // Concrete container-yard pad
+    function buildHarbor() {
+      clearHarbor();
+      harborMarks = []; // fresh chip set for this layout
+      if (!harborAnchor || !portPlan) return; // no coastline this seed — bail out safely
+      const { yx, yz, padTop, wh1, wh2, office, tanks, dock, bwall } = portPlan;
+      const coastP = (k: number) => ({ x: portPlan!.wx0 + HARBOR_E * k, z: portPlan!.wz0 - HARBOR_E * k });
+      const inland = (p: { x: number; z: number }, d: number) => ({ x: p.x - HARBOR_E * d, z: p.z - HARBOR_E * d });
+
+      // ---- Container yard pad ----
       bBox({ x: yx, z: yz, rot: 0 }, 'z', -8, 8, -8, 8, padTop - 1, padTop, bmConcrete, harborGroup);
 
-      // Warehouse behind the yard (walkable roof, big sea-side door)
-      const wbx = yx - HARBOR_E * 22;
-      const wbz = yz - HARBOR_E * 22;
-      const hWh = terrainHeight(wbx, wbz);
-      const WB = { x: wbx, z: wbz, rot: 0 };
+      // ---- Warehouse 1 behind the yard (walkable roof, sea-side door) ----
+      const hWh = terrainHeight(wh1.x, wh1.z);
+      const WB = { x: wh1.x, z: wh1.z, rot: 0 };
       const W0 = hWh - 0.6;
       const W1 = W0 + 5.2;
       bWall(WB, 'z', -7, -6.6, -5, 5, W0, W1, [], bmSteel, harborGroup); // west wall
@@ -3029,23 +3125,33 @@ export default function BattleRoyaleGame() {
       bBox(WB, 'x', -5.5, 5.5, -7.5, 7.5, W1, W1 + 0.35, bmSteelDark, harborGroup); // roof
       bBox(WB, 'z', -2.4, -0.6, -4.2, -2.6, W0, W0 + 1.3, bmCrate, harborGroup); // interior crates
       bBox(WB, 'z', 1.0, 2.8, 2.0, 3.4, W0, W0 + 1.3, bmCrate, harborGroup);
-      harborMarks.push({ x: wbx, z: wbz, label: 'WHSE', cls: 'c-whse' }); // compass chip
+      harborMarks.push({ x: wh1.x, z: wh1.z, label: 'WHSE', cls: 'c-whse' }); // compass chip
 
-      // Portal gantry crane straddling the yard: legs, beam, trolley,
-      // cables and a hanging container that makes elevated cover.
+      // ---- Warehouse 2 (reuse the range design) beside it ----
+      buildWarehouse({ x: wh2.x, z: wh2.z, rot: 1 }, terrainHeight(wh2.x, wh2.z) - 0.5, harborGroup);
+      harborMarks.push({ x: wh2.x, z: wh2.z, label: 'WHSE', cls: 'c-whse' });
+
+      // ---- Customs office: two storeys, roof parapet, sea view ----
+      buildOffice({ x: office.x, z: office.z, rot: 1 }, terrainHeight(office.x, office.z) - 0.25, harborGroup);
+
+      // ---- Port fuel depot behind the warehouses ----
+      const tY = terrainHeight(tanks.x, tanks.z);
+      buildTank({ x: tanks.x, z: tanks.z, rot: 0 }, tY, harborGroup);
+      const tank2 = { x: tanks.x + HARBOR_E * 15, z: tanks.z - HARBOR_E * 15 };
+      buildTank({ x: tank2.x, z: tank2.z, rot: 0 }, terrainHeight(tank2.x, tank2.z), harborGroup);
+
+      // ---- Portal gantry crane straddling the yard ----
       const legH = padTop + 8.6;
-      const legTop = legH;
-      bBox({ x: yx - 6.5, z: yz, rot: 0 }, 'z', -0.55, 0.55, -0.55, 0.55, padTop - 1, legTop, bmSteelDark, harborGroup);
-      bBox({ x: yx + 6.5, z: yz, rot: 0 }, 'z', -0.55, 0.55, -0.55, 0.55, padTop - 1, legTop, bmSteelDark, harborGroup);
-      bBox({ x: yx, z: yz, rot: 0 }, 'x', -0.6, 0.6, -7.4, 7.4, legTop, legTop + 0.9, bmSteel, harborGroup); // cross beam
-      bBox({ x: yx + 2.2, z: yz, rot: 0 }, 'z', -0.7, 0.7, -0.7, 0.7, legTop - 1.2, legTop, bmSteelDark, harborGroup); // trolley
-      bBox({ x: yx + 2.2, z: yz, rot: 0 }, 'z', -0.08, 0.08, -0.55, -0.35, legTop - 4.6, legTop - 1.2, bmSteelDark, harborGroup); // cables
-      bBox({ x: yx + 2.2, z: yz, rot: 0 }, 'z', -0.08, 0.08, 0.35, 0.55, legTop - 4.6, legTop - 1.2, bmSteelDark, harborGroup);
-      bBox({ x: yx + 2.2, z: yz, rot: 0 }, 'z', -1.8, 1.8, -1.3, 1.3, legTop - 7.2, legTop - 4.6, bmContainerBlue, harborGroup); // hanging box
+      bBox({ x: yx - 6.5, z: yz, rot: 0 }, 'z', -0.55, 0.55, -0.55, 0.55, padTop - 1, legH, bmSteelDark, harborGroup);
+      bBox({ x: yx + 6.5, z: yz, rot: 0 }, 'z', -0.55, 0.55, -0.55, 0.55, padTop - 1, legH, bmSteelDark, harborGroup);
+      bBox({ x: yx, z: yz, rot: 0 }, 'x', -0.6, 0.6, -7.4, 7.4, legH, legH + 0.9, bmSteel, harborGroup); // cross beam
+      bBox({ x: yx + 2.2, z: yz, rot: 0 }, 'z', -0.7, 0.7, -0.7, 0.7, legH - 1.2, legH, bmSteelDark, harborGroup); // trolley
+      bBox({ x: yx + 2.2, z: yz, rot: 0 }, 'z', -0.08, 0.08, -0.55, -0.35, legH - 4.6, legH - 1.2, bmSteelDark, harborGroup); // cables
+      bBox({ x: yx + 2.2, z: yz, rot: 0 }, 'z', -0.08, 0.08, 0.35, 0.55, legH - 4.6, legH - 1.2, bmSteelDark, harborGroup);
+      bBox({ x: yx + 2.2, z: yz, rot: 0 }, 'z', -1.8, 1.8, -1.3, 1.3, legH - 7.2, legH - 4.6, bmContainerBlue, harborGroup); // hanging box
       harborMarks.push({ x: yx + 2.2, z: yz, label: 'CRANE', cls: 'c-crane' }); // compass chip (trolley)
 
-      // Shipping containers in the yard — singles, a stacked pair, and
-      // one half-sunk at the waterline for cover while swimming.
+      // ---- Shipping containers: yard singles + stacked pair ----
       const cont = (cx: number, cz: number, mat: THREE.Material, base: number) =>
         bBox({ x: cx, z: cz, rot: 0 }, 'z', -3, 3, -1.3, 1.3, base, base + 2.6, mat, harborGroup);
       cont(yx - 2, yz - 5.2, bmContainerRed, padTop);
@@ -3053,22 +3159,522 @@ export default function BattleRoyaleGame() {
       cont(yx + 3.5, yz + 4.4, bmContainerOrange, padTop);
       cont(yx + 3.5, yz + 4.4, bmContainerBlue, padTop + 2.6); // stacked
       harborMarks.push({ x: yx, z: yz, label: 'YARD', cls: 'c-yard' }); // compass chip (container yard)
-      const fx = wx0 + HARBOR_E * bestK + HARBOR_E * 7 - HARBOR_E * 3.6;
-      const fz = wz0 - HARBOR_E * bestK + HARBOR_E * 7 + HARBOR_E * 3.6;
+      const fx = portPlan.wx0 + HARBOR_E * portPlan.bestK + HARBOR_E * 7 - HARBOR_E * 3.6;
+      const fz = portPlan.wz0 - HARBOR_E * portPlan.bestK + HARBOR_E * 7 + HARBOR_E * 3.6;
       const fTop = Math.max(WATER_Y + 0.62, terrainHeight(fx, fz) + 0.4);
       cont(fx, fz, bmContainerOrange, fTop - 2.6); // half-sunk floating cover
 
-      // The pier itself, marching straight out to sea from the yard's
-      // own waterline so the walk from the yard onto the dock is short.
+      // ---- Extra container rows flanking the yard on the sand ----
+      const rowA = inland(coastP(portPlan.bestK - 15), 5);
+      const rowB = inland(coastP(portPlan.bestK + 17), 7);
+      for (let i = 0; i < 3; i++) {
+        const px = rowA.x + i * 5.5 - 5.5;
+        const pz = rowA.z + i * 1.5 - 1.5;
+        cont(px, pz, i === 1 ? bmContainerGreen : bmContainerRed, Math.max(WATER_Y + 0.45, terrainHeight(px, pz) + 0.15));
+      }
+      for (let i = 0; i < 2; i++) {
+        const px = rowB.x + i * 5.5 - 2.8;
+        const pz = rowB.z - i * 2.2 + 1.1;
+        const bx = Math.max(WATER_Y + 0.45, terrainHeight(px, pz) + 0.15);
+        cont(px, pz, bmContainerOrange, bx);
+        if (i === 0) cont(px, pz, bmContainerBlue, bx + 2.6);
+      }
+
+      // ---- The pier, marching out to sea ----
       const dWater = marchWaterFrom(yx, yz, 140);
       if (dWater >= 0) {
         const head = buildPier(yx + HARBOR_E * dWater, yz + HARBOR_E * dWater);
         harborMarks.push({ x: head.hx, z: head.hz, label: 'PIER', cls: 'c-pier' }); // compass chip
+        // moored boat beside the pier head — a swim-out platform
+        buildBoat(head.hx + HARBOR_E * 10.6, head.hz - HARBOR_E * 10.6, harborGroup);
+      }
+
+      // ---- Dry dock with a half-built ship ----
+      if (dock) {
+        const DZ = dock.z;
+        const xIn = dock.x - 14;
+        const xOut = dock.x + 24;
+        const wallTop = WATER_Y + 1.05;
+        for (const s of [-1, 1]) {
+          for (let seg = 0; seg < 6; seg++) {
+            const sx = xIn + seg * (38 / 6) + 38 / 12;
+            const sz = DZ + s * 3.5;
+            const bed = Math.min(terrainHeight(sx, sz) - 0.5, WATER_Y - 4);
+            bBox({ x: sx, z: sz, rot: 0 }, 'x', -38 / 12, 38 / 12, -0.4, 0.4, bed, wallTop, bmConcreteDark, harborGroup);
+          }
+        }
+        for (let seg = 0; seg < 5; seg++) {
+          const sx = xIn + seg * (38 / 5) + 38 / 10;
+          bBox({ x: sx, z: DZ, rot: 0 }, 'x', -38 / 10, 38 / 10, -3.3, 3.3, WATER_Y - 0.85, WATER_Y - 0.22, bmConcrete, harborGroup);
+        }
+        // caisson gate sealing the seaward end — climbable lid
+        bBox({ x: xOut, z: DZ, rot: 0 }, 'z', -0.45, 0.45, -3.5, 3.5, WATER_Y - 0.7, WATER_Y + 1.45, bmConcrete, harborGroup);
+        // walk-out steps at the beach end
+        bBox({ x: xIn - 1.4, z: DZ, rot: 0 }, 'z', -0.6, 0.6, -2.2, 2.2, terrainHeight(xIn - 1.4, DZ) - 0.3, WATER_Y + 0.42, bmConcrete, harborGroup);
+        buildShip(dock.x + 4, WATER_Y - 0.22, DZ, harborGroup);
+        harborMarks.push({ x: dock.x + 4, z: DZ, label: 'DOCK', cls: 'c-dock' });
+      }
+
+      // ---- Breakwater arc + lighthouse at its tip ----
+      {
+        let bx = bwall.x;
+        let bz = bwall.z;
+        let lTop = 0;
+        for (let i = 0; i < 9; i++) {
+          const t = i * 4.8;
+          const drift = i * i * 0.11;
+          bx = bwall.x + HARBOR_E * t + HARBOR_E * drift * 0.6;
+          bz = bwall.z + HARBOR_E * t - HARBOR_E * drift * 0.6;
+          const w = (i === 8 ? 6.5 : 5.1 - i * 0.22) + hash2(i, 7, terrainSeed) * 0.9;
+          const top = WATER_Y + (i === 8 ? 0.85 : 0.45 + hash2(i, 3, terrainSeed) * 0.5);
+          const bed = terrainHeight(bx, bz) - 0.55;
+          bBox({ x: bx, z: bz, rot: 0 }, 'z', -w / 2, w / 2, -w / 2, w / 2, bed, top, bmRock, harborGroup);
+          lTop = top;
+        }
+        buildLighthouse({ x: bx, z: bz, rot: 0 }, lTop, harborGroup);
+        harborMarks.push({ x: bx, z: bz, label: 'LIGHT', cls: 'c-light' });
+      }
+
+      // ---- Port loot: the richest rewards on the coast ----
+      const rnd = mulberry32((terrainSeed ^ 0x5eed) >>> 0);
+      poiLoot(['smg', 'sniper', 'shield', 'heavy', 'shield'], wh1.x, wh1.z, 10, terrainHeight(wh1.x, wh1.z), -1, rnd);
+      poiLoot(['heavy', 'light'], wh2.x, wh2.z, 8, terrainHeight(wh2.x, wh2.z), -1, rnd);
+      poiLoot(['smg', 'shield'], office.x, office.z, 7, terrainHeight(office.x, office.z), -1, rnd);
+    }
+
+    // ----------------------------------------------------
+    // Procedural POI generator — the map's second layer.
+    // Seeded, spaced, above-water sites are scattered across the
+    // inland while the port owns the coast. Villages, farms,
+    // fuel depots, construction sites, camps, radio masts,
+    // ruins, outposts and water towers fill the map, each with
+    // loot and a compass chip. POIs materialize inside the fog
+    // radius (streamPois) as you explore and are reclaimed far
+    // beyond sight — every structure is voxel-destructible.
+    // ----------------------------------------------------
+    interface Poi {
+      id: number;
+      kind: string;
+      label: string;
+      cls: string;
+      x: number;
+      z: number;
+      rot: number;
+      gy: number;
+      r: number;
+      group: THREE.Group | null;
+      built: boolean;
+      tries: number;
+    }
+    const pois: Poi[] = [];
+    const POI_BUILD_R = 700; // build inside the fog so nothing pops in
+    const POI_KEEP_R = 980; // keep well past sight; beyond this, reclaim
+
+    function mulberry32(a: number) {
+      return function () {
+        a |= 0;
+        a = (a + 0x6d2b79f5) | 0;
+        let t = Math.imul(a ^ (a >>> 15), 1 | a);
+        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+      };
+    }
+
+    const POI_KINDS: Record<string, { label: string; cls: string; r: number; loot: string[]; n: number }> = {
+      village: { label: 'VILL', cls: 'c-vill', r: 44, loot: ['smg', 'shield', 'light', 'heavy'], n: 3 },
+      farm: { label: 'FARM', cls: 'c-farm', r: 40, loot: ['heavy', 'light', 'shield'], n: 2 },
+      fuel: { label: 'FUEL', cls: 'c-fuel', r: 32, loot: ['heavy', 'shield', 'smg'], n: 2 },
+      construction: { label: 'SITE', cls: 'c-site', r: 34, loot: ['heavy', 'smg', 'light'], n: 2 },
+      camp: { label: 'CAMP', cls: 'c-camp', r: 26, loot: ['sniper', 'smg', 'shield'], n: 3 },
+      radio: { label: 'MAST', cls: 'c-mast', r: 24, loot: ['sniper', 'shield'], n: 2 },
+      ruins: { label: 'RUIN', cls: 'c-ruin', r: 30, loot: ['betgun', 'heavy', 'light'], n: 2 },
+      outpost: { label: 'OUTP', cls: 'c-outp', r: 26, loot: ['sniper', 'heavy', 'shield'], n: 2 },
+      watertower: { label: 'WATER', cls: 'c-tow', r: 18, loot: ['shield', 'light'], n: 2 },
+    };
+
+    function generatePois() {
+      pois.length = 0;
+      const rnd = mulberry32((terrainSeed ^ 0x9e3779b9) >>> 0);
+      let id = 0;
+      for (const kind of Object.keys(POI_KINDS)) {
+        const def = POI_KINDS[kind];
+        for (let i = 0; i < def.n; i++) {
+          let best: { x: number; z: number; score: number } | null = null;
+          for (let t = 0; t < 90; t++) {
+            const x = (rnd() * 2 - 1) * (HARBOR_HALF - 330);
+            const z = (rnd() * 2 - 1) * (HARBOR_HALF - 330);
+            if (seaDist(x, z) > -160) continue; // dry land, well inland
+            if (Math.hypot(x - HARBOR_SPAWN.x, z - HARBOR_SPAWN.z) < 340) continue; // spawn stays clear
+            if (harborAnchor && Math.hypot(x - harborAnchor.x, z - harborAnchor.z) < 560) continue; // the port owns the coast
+            if (pois.some((p) => Math.hypot(p.x - x, p.z - z) < 300)) continue; // spread out
+            const h0 = terrainHeight(x, z);
+            if (h0 < WATER_Y + 2.5) continue;
+            let spread = 0;
+            const rr = def.r * 0.7;
+            for (const off of [
+              [rr, 0],
+              [-rr, 0],
+              [0, rr],
+              [0, -rr],
+            ]) {
+              spread = Math.max(spread, Math.abs(terrainHeight(x + off[0], z + off[1]) - h0));
+            }
+            if (spread > 8) continue; // too steep to flatten gently
+            const score = spread + rnd() * 2;
+            if (!best || score < best.score) best = { x, z, score };
+          }
+          if (!best) continue; // rough seed — this POI simply doesn't exist
+          const gy = terrainHeight(best.x, best.z);
+          pois.push({ id: id++, kind, label: def.label, cls: def.cls, x: best.x, z: best.z, rot: rnd() < 0.5 ? 0 : 1, gy, r: def.r, group: null, built: false, tries: 0 });
+          flatZones.push({ x: best.x, z: best.z, r: def.r * 0.65 + 10, baseY: gy });
+        }
+      }
+    }
+
+    // Loot spawner shared by POIs and the port (poiId -1 = port).
+    function poiLoot(kinds: string[], cx: number, cz: number, radius: number, gy: number, poiId: number, rnd: () => number) {
+      for (const kind of kinds) {
+        for (let t = 0; t < 24; t++) {
+          const a = rnd() * Math.PI * 2;
+          const d = 3 + rnd() * radius;
+          const lx = cx + Math.cos(a) * d;
+          const lz = cz + Math.sin(a) * d;
+          const ly = terrainHeight(lx, lz);
+          if (ly < gy - 1.6 || ly < WATER_Y + 0.2) continue; // off the pad / in water
+          if (solids.some((b) => Math.abs(lx - b.x) < b.hx + 1.1 && Math.abs(lz - b.z) < b.hz + 1.1)) continue;
+          const group = pickupMesh(kind);
+          group.position.set(lx, ly, lz);
+          group.userData.poi = poiId;
+          scene.add(group);
+          pickups.push({ kind, x: lx, z: lz, group, taken: false, timer: 0 });
+          break;
+        }
+      }
+    }
+
+    function buildPoiAt(p: Poi) {
+      if (p.built || p.tries >= 3) return;
+      const voxBefore = voxBoxes.length;
+      const g = new THREE.Group();
+      scene.add(g);
+      p.group = g;
+      p.built = true;
+      // NOTE: tries counts FAILURES only — successful builds must stay
+      // infinitely revisitable (dismantle-on-distance then rebuild fresh).
+      const rnd = mulberry32((terrainSeed ^ (p.id * 7919 + 13)) >>> 0);
+      const B = { x: p.x, z: p.z, rot: p.rot };
+      const place = (u: number, v: number) => turnPoint(B, u, v);
+      const gy = p.gy;
+      const fail = () => {
+        p.tries++;
+        dismantlePoi(p);
+      };
+      try {
+      switch (p.kind) {
+        case 'village': {
+          const ring: Array<[number, number]> = [
+            [-17, 2],
+            [16, -8],
+            [9, 15],
+            [-9, -16],
+            [1, -1],
+            [18, 9],
+          ];
+          for (let i = 0; i < ring.length; i++) {
+            const c = place(ring[i][0] + (rnd() - 0.5) * 4, ring[i][1] + (rnd() - 0.5) * 4);
+            const br = { x: c.x, z: c.z, rot: i % 2 };
+            if (i === 0 || i === 4) buildHouse(br, gy, g);
+            else if (i === 1 || i === 2) buildCottage(br, gy, g);
+            else buildShed(br, gy, g);
+          }
+          const w = place(-3, 8);
+          bBox({ x: w.x, z: w.z, rot: 0 }, 'z', -0.9, 0.9, -0.9, 0.9, gy, gy + 1.0, bmRock, g); // well
+          bBox({ x: w.x, z: w.z, rot: 0 }, 'z', -0.4, 0.4, -0.4, 0.4, gy + 1.0, gy + 1.4, bmWood, g);
+          const m = place(11, 3);
+          bBox({ x: m.x, z: m.z, rot: 0 }, 'x', -1.4, 1.4, -0.5, 0.5, gy, gy + 0.85, bmPlank, g); // market table
+          bBox({ x: m.x, z: m.z, rot: 0 }, 'x', -0.6, 0.6, -0.4, 0.4, gy + 0.85, gy + 1.05, bmCrate, g);
+          break;
+        }
+        case 'farm': {
+          buildBarn(B, gy, g);
+          const fh = place(-14, 10);
+          buildCottage({ x: fh.x, z: fh.z, rot: 1 }, gy, g);
+          const s1 = place(11, -7);
+          buildSilo({ x: s1.x, z: s1.z, rot: 0 }, gy, g);
+          const s2 = place(15, -1);
+          buildSilo({ x: s2.x, z: s2.z, rot: 0 }, gy, g);
+          const tr = place(-2, -13); // tractor
+          bBox({ x: tr.x, z: tr.z, rot: 0 }, 'x', -1.3, 1.1, -0.9, 0.9, gy, gy + 1.15, bmWarnOrange, g);
+          bBox({ x: tr.x, z: tr.z, rot: 0 }, 'x', 0.35, 0.85, -0.55, 0.55, gy + 1.15, gy + 2.05, bmSteelDark, g);
+          bBox({ x: tr.x, z: tr.z, rot: 0 }, 'z', -1.1, -0.5, -0.35, 0.35, gy, gy + 0.7, bmCrate, g);
+          bBox({ x: tr.x, z: tr.z, rot: 0 }, 'z', 0.5, 1.1, -0.35, 0.35, gy, gy + 0.7, bmCrate, g);
+          for (const [hu, hv] of [
+            [7, 9],
+            [-13, -6],
+            [3, -17],
+          ]) {
+            const hb = place(hu, hv);
+            bBox({ x: hb.x, z: hb.z, rot: 0 }, 'z', -0.75, 0.75, -0.75, 0.75, gy, gy + 1.4, bmHay, g); // hay bales
+          }
+          break;
+        }
+        case 'fuel': {
+          buildTank(B, gy, g);
+          const t2 = place(0, 21);
+          buildTank({ x: t2.x, z: t2.z, rot: p.rot }, gy, g);
+          bBox(
+            { x: (B.x + t2.x) / 2, z: (B.z + t2.z) / 2, rot: 0 },
+            'x',
+            -1.6,
+            1.6,
+            -0.14,
+            0.14,
+            gy + 0.55,
+            gy + 0.95,
+            bmSteelDark,
+            g
+          ); // pipe run between tanks
+          const sh = place(-12, 9);
+          buildShed({ x: sh.x, z: sh.z, rot: 1 }, gy, g);
+          const wp = place(9, -7); // warning post
+          bBox({ x: wp.x, z: wp.z, rot: 0 }, 'z', -0.1, 0.1, -0.1, 0.1, gy, gy + 2.4, bmSteelDark, g);
+          bBox({ x: wp.x, z: wp.z, rot: 0 }, 'z', -0.3, 0.3, -0.3, 0.3, gy + 2.4, gy + 2.8, bmWarnOrange, g);
+          break;
+        }
+        case 'construction': {
+          bBox(B, 'x', -9, 9, -6.5, 6.5, gy - 0.3, gy + 0.15, bmConcrete, g); // foundation
+          for (const cuv of [
+            [-7.5, -4.5],
+            [0, -4.5],
+            [7.5, -4.5],
+            [-7.5, 4.5],
+            [0, 4.5],
+            [7.5, 4.5],
+          ]) {
+            const c = place(cuv[0], cuv[1]);
+            bBox({ x: c.x, z: c.z, rot: 0 }, 'z', -0.22, 0.22, -0.22, 0.22, gy + 0.15, gy + 5.2, bmSteel, g); // columns
+          }
+          for (const cv of [-4.5, 4.5]) {
+            bBox(B, 'x', cv - 0.18, cv + 0.18, -7.7, 7.7, gy + 5.0, gy + 5.3, bmSteel, g); // top beams
+          }
+          bBox(B, 'x', -4.5, 4.6, -7.6, -0.2, gy + 5.3, gy + 5.62, bmConcreteDark, g); // partial slab
+          // stair to the slab — zig-zag steps along the south columns
+          const steps = Math.ceil(5.62 / 0.42);
+          for (let i = 0; i < steps; i++) {
+            const s = place(i % 2 === 0 ? -1.1 : 1.1, 6.4);
+            bBox({ x: s.x, z: s.z, rot: 0 }, 'x', -0.4, 0.4, -0.44, 0.44, gy + i * 0.42, gy + (i + 1) * 0.42, bmPlankDark, g);
+          }
+          const tc = place(17, -11);
+          buildTowerCrane({ x: tc.x, z: tc.z, rot: 0 }, gy, g);
+          const cb = place(-14, 1);
+          buildCabinBox({ x: cb.x, z: cb.z, rot: 0 }, gy, g);
+          for (const [bu, bv] of [
+            [-4, 10],
+            [2, 12],
+            [8, 9],
+          ]) {
+            const bb = place(bu, bv);
+            bBox({ x: bb.x, z: bb.z, rot: 0 }, 'x', -1.2, 1.2, -0.3, 0.3, gy, gy + 0.9, bmConcrete, g); // jersey barriers
+          }
+          for (const [pu, pv] of [
+            [4, -9],
+            [6.5, -10],
+          ]) {
+            const pp = place(pu, pv);
+            bBox({ x: pp.x, z: pp.z, rot: 0 }, 'z', -0.7, 0.7, -0.45, 0.45, gy, gy + 0.35, bmCrate, g); // pallets
+            bBox({ x: pp.x, z: pp.z, rot: 0 }, 'z', -0.55, 0.55, -0.35, 0.35, gy + 0.35, gy + 0.62, bmCrate, g);
+          }
+          const gp = place(-9, -11);
+          bBox({ x: gp.x, z: gp.z, rot: 0 }, 'z', -1.6, 1.6, -1.2, 1.2, gy, gy + 1.1, bmGravel, g); // gravel pile
+          break;
+        }
+        case 'camp': {
+          for (let i = 0; i < 3; i++) {
+            const a = (i / 3) * Math.PI * 2 + 0.5;
+            const c = place(Math.cos(a) * 8, Math.sin(a) * 8);
+            buildTent({ x: c.x, z: c.z, rot: 0 }, gy, g, i === 1 ? bmCanvasGreen : bmCanvasTan);
+          }
+          for (let i = 0; i < 6; i++) {
+            const a = (i / 6) * Math.PI * 2;
+            const st = place(Math.cos(a) * 1.15, Math.sin(a) * 1.15);
+            bBox({ x: st.x, z: st.z, rot: 0 }, 'z', -0.26, 0.26, -0.26, 0.26, gy, gy + 0.5, bmRock, g); // fire ring
+          }
+          bBox({ x: B.x, z: B.z, rot: 0 }, 'z', -0.4, 0.4, -0.4, 0.4, gy + 0.05, gy + 0.5, bmRock, g); // embers
+          for (let i = 0; i < 3; i++) {
+            const lg = place(1.6 + i * 0.75, -0.3);
+            bBox({ x: lg.x, z: lg.z, rot: 0 }, 'x', -0.35, 0.35, -0.35, 0.35, gy + 0.15, gy + 0.45, bmPlankDark, g); // logs
+          }
+          for (const [su, sv] of [
+            [3.4, 3.0],
+            [-3.6, -2.6],
+          ]) {
+            const seat = place(su, sv);
+            bBox({ x: seat.x, z: seat.z, rot: 0 }, 'x', -0.9, 0.9, -0.28, 0.28, gy, gy + 0.4, bmPlank, g); // log seats
+          }
+          const wr = place(-5.5, 5.5); // weapon rack
+          bBox({ x: wr.x, z: wr.z, rot: 0 }, 'z', -0.08, 0.08, -0.08, 0.08, gy, gy + 1.3, bmPlankDark, g);
+          bBox({ x: wr.x, z: wr.z, rot: 0 }, 'z', -0.08, 0.08, -0.08, 0.08, gy + 0.9, gy + 1.05, bmPlank, g);
+          const cr = place(5.5, -5);
+          bBox({ x: cr.x, z: cr.z, rot: 0 }, 'z', -0.55, 0.55, -0.55, 0.55, gy, gy + 1.0, bmCrate, g);
+          break;
+        }
+        case 'radio': {
+          buildRadioMast(B, gy, g);
+          const h = place(-10, 7);
+          buildShed({ x: h.x, z: h.z, rot: 1 }, gy, g);
+          for (const side of [-1, 1]) {
+            bBox(B, 'x', side * 10 - 0.12, side * 10 + 0.12, -10, 10, gy, gy + 1.1, bmWood, g);
+          }
+          bBox(B, 'z', -10, 10, -10.12, -9.88, gy, gy + 1.1, bmWood, g);
+          const gen = place(3.5, -6);
+          bBox({ x: gen.x, z: gen.z, rot: 0 }, 'z', -0.75, 0.75, -0.55, 0.55, gy, gy + 0.9, bmSteelDark, g); // generator
+          break;
+        }
+        case 'ruins': {
+          buildRuin(B, gy, g);
+          const r2 = place(-15, 5);
+          buildRuin({ x: r2.x, z: r2.z, rot: 1 }, gy, g);
+          const tw = place(13, -11); // broken tower
+          bBox({ x: tw.x, z: tw.z, rot: 0 }, 'z', -1.8, -1.5, -1.8, 1.8, gy, gy + 4.2, bmWall, g);
+          bBox({ x: tw.x, z: tw.z, rot: 0 }, 'z', 1.5, 1.8, -1.8, 1.8, gy, gy + 3.1, bmWall, g);
+          bBox({ x: tw.x, z: tw.z, rot: 0 }, 'x', -1.8, 1.8, -1.8, 1.8, gy + 4.2, gy + 4.5, bmSlab, g);
+          bBox({ x: tw.x, z: tw.z, rot: 0 }, 'x', -1.8, 1.8, 1.5, 1.8, gy, gy + 4.2, bmWall, g);
+          for (const [ru, rv] of [
+            [6, 8],
+            [-6, -13],
+            [15, 2],
+          ]) {
+            const rb = place(ru, rv);
+            bBox({ x: rb.x, z: rb.z, rot: 0 }, 'z', -0.5, 0.5, -0.5, 0.5, gy, gy + (0.4 + rnd() * 0.7), bmGravel, g); // rubble
+          }
+          break;
+        }
+        case 'outpost': {
+          buildGuardTower(B, gy, g);
+          const sh = place(-9, 9);
+          buildShed({ x: sh.x, z: sh.z, rot: 0 }, gy, g);
+          for (const [bu, bv] of [
+            [6, 6],
+            [-7, -6],
+            [2, -8],
+          ]) {
+            const bb = place(bu, bv);
+            bBox({ x: bb.x, z: bb.z, rot: 0 }, 'x', -1.2, 1.2, -0.3, 0.3, gy, gy + 0.9, bmConcrete, g); // barriers
+          }
+          const cr = place(4.5, -3.5);
+          bBox({ x: cr.x, z: cr.z, rot: 0 }, 'z', -0.55, 0.55, -0.55, 0.55, gy, gy + 1.0, bmCrate, g);
+          const fl = place(-3, 3); // floodlight post
+          bBox({ x: fl.x, z: fl.z, rot: 0 }, 'z', -0.1, 0.1, -0.1, 0.1, gy, gy + 3.6, bmSteelDark, g);
+          bBox({ x: fl.x, z: fl.z, rot: 0 }, 'z', -0.4, 0.4, -0.25, 0.25, gy + 3.6, gy + 4.1, bmLamp, g);
+          break;
+        }
+        case 'watertower': {
+          buildWaterTower(B, gy, g);
+          const sh = place(8, -8);
+          buildShed({ x: sh.x, z: sh.z, rot: 0 }, gy, g);
+          break;
+        }
+      }
+
+      poiLoot(POI_KINDS[p.kind].loot, p.x, p.z, p.r * 0.5, gy, p.id, rnd);
+      } catch (err) {
+        // A failed POI build must never kill the frame loop: record it,
+        // reclaim the half-built group and retry on a later frame.
+        console.error('POI build failed:', p.kind, err);
+        const w = window as any;
+        w.__poiBuildErr = w.__poiBuildErr || [];
+        w.__poiBuildErr.push(p.kind + ': ' + String(err));
+        fail();
+        return;
+      }
+      // Safety net: a truncated build (few boxes registered, no throw)
+      // re-arms itself for another attempt; three strikes and it stays down.
+      const diff = voxBoxes.length - voxBefore;
+      const w0 = window as any;
+      w0.__poiBuildLog = w0.__poiBuildLog || [];
+      w0.__poiBuildLog.push(p.kind + ' diff=' + diff + ' tries=' + p.tries);
+      if (diff < 12) fail();
+    }
+
+    function dismantlePoi(p: Poi) {
+      const g = p.group;
+      if (!g) return;
+      g.traverse((o: any) => {
+        if (o.isMesh) o.geometry?.dispose?.();
+      });
+      scene.remove(g);
+      for (let i = voxBoxes.length - 1; i >= 0; i--) {
+        const v = voxBoxes[i];
+        if (v.group === g) {
+          if (v.inst) {
+            v.group.remove(v.inst);
+            const si = shootable.indexOf(v.inst);
+            if (si >= 0) shootable.splice(si, 1);
+            v.inst.geometry.dispose();
+            (v.inst.material as THREE.Material).dispose();
+            v.inst.dispose();
+            v.inst = null;
+          }
+          if (v.barGroup) {
+            disposeBar(v.barGroup);
+            v.barGroup = null;
+            v.barFill = null;
+          }
+          voxBoxes.splice(i, 1);
+        }
+      }
+      for (let i = shootable.length - 1; i >= 0; i--) {
+        const s: any = shootable[i];
+        if (s.parent === g || s.userData?.vox?.group === g) shootable.splice(i, 1);
+      }
+      for (let i = solids.length - 1; i >= 0; i--) {
+        if (solids[i].group === g) solids.splice(i, 1);
+      }
+      for (let i = pickups.length - 1; i >= 0; i--) {
+        if (pickups[i].group.userData.poi === p.id) {
+          scene.remove(pickups[i].group);
+          pickups.splice(i, 1);
+        }
+      }
+      p.group = null;
+      p.built = false;
+    }
+
+    function clearPois() {
+      for (const p of pois) dismantlePoi(p);
+      pois.length = 0;
+      flatZones.length = 0;
+      // POI pickups (incl. the port's, id -1) live in the scene
+      for (let i = pickups.length - 1; i >= 0; i--) {
+        if ((pickups[i].group.userData as any).poi !== undefined) {
+          scene.remove(pickups[i].group);
+          pickups.splice(i, 1);
+        }
+      }
+    }
+
+    function streamPois() {
+      if (!terrainOn) return;
+      const px = camera.position.x;
+      const pz = camera.position.z;
+      let budget = 1; // one POI per frame — building is hitch-free
+      for (const p of pois) {
+        const d = Math.hypot(p.x - px, p.z - pz);
+        if (!p.built) {
+          if (p.tries >= 3) continue; // gave up after repeated failures
+          if (d < POI_BUILD_R && budget > 0) {
+            buildPoiAt(p);
+            budget--;
+          }
+        } else if (d > POI_KEEP_R) {
+          dismantlePoi(p);
+        }
       }
     }
 
     function enterHarbor() {
       world.visible = false;
+      clearPois(); // reclaim any previous map's POIs, pickups and pads
       dummies.length = 0;
       spots.length = 0;
       solids.length = 0;
@@ -3089,6 +3695,19 @@ export default function BattleRoyaleGame() {
       grid.visible = false;
       if (inventoryModeEl) inventoryModeEl.textContent = 'Harbor';
       if (dummySecEl) dummySecEl.hidden = true;
+      // Plan the whole map BEFORE any terrain tile is built: the port
+      // complex owns the coast, then seeded POIs (with their flatten
+      // pads) fill the inland — the streamed mesh carries the pads.
+      planHarbor();
+      generatePois();
+      streamTerrain(true);
+      // Harbor infrastructure: pier over the sea, container yard,
+      // warehouses, crane, customs office, fuel tanks, dry dock,
+      // breakwater + lighthouse — all voxel-destructible.
+      harborGroup.visible = true;
+      buildHarbor();
+      // POI chips join the port chips on the compass
+      for (const p of pois) harborMarks.push({ x: p.x, z: p.z, label: p.label, cls: p.cls });
       spawn = HARBOR_SPAWN;
       eyeH = EYE;
       camera.position.set(spawn.x, EYE + groundAt(spawn.x, spawn.z), spawn.z);
@@ -3103,11 +3722,6 @@ export default function BattleRoyaleGame() {
       airCarry = null;
       slideReq = false;
       rollReq = 0;
-      streamTerrain(true);
-      // Harbor infrastructure: pier over the sea, container yard,
-      // warehouse and gantry crane — all voxel-destructible.
-      harborGroup.visible = true;
-      buildHarbor();
     }
 
     // ----------------------------------------------------
@@ -3149,11 +3763,13 @@ export default function BattleRoyaleGame() {
       }
     }
 
-    // Up to four landmark chips, reconfigured whenever the harbor
-    // rebuilds (buildHarbor swaps in a fresh harborMarks array).
+    // Up to six landmark chips, reconfigured to the NEAREST marks
+    // whenever the set changes or the player travels 40+ m — with the
+    // port complex and every POI carrying a chip, the closest six are
+    // always the ones worth navigating by.
     const compassChips: HTMLSpanElement[] = [];
     if (compassMarksEl) {
-      for (let i = 0; i < 4; i++) {
+      for (let i = 0; i < 6; i++) {
         const chip = document.createElement('span');
         chip.className = 'compass-mark';
         chip.style.display = 'none';
@@ -3166,6 +3782,25 @@ export default function BattleRoyaleGame() {
       }
     }
     let compassChipsFor: HarborMark[] | null = null;
+    let compassSelFor: HarborMark[] | null = null;
+    let compassSelPx = NaN;
+    let compassSelPz = NaN;
+    let compassSel: HarborMark[] = [];
+
+    function compassSelection(): HarborMark[] {
+      const p = camera.position;
+      if (harborMarks !== compassSelFor || Math.hypot(p.x - compassSelPx, p.z - compassSelPz) > 40) {
+        compassSelFor = harborMarks;
+        compassSelPx = p.x;
+        compassSelPz = p.z;
+        compassSel = harborMarks
+          .map((m) => ({ m, d: Math.hypot(m.x - p.x, m.z - p.z) }))
+          .sort((a, b) => a.d - b.d)
+          .slice(0, compassChips.length)
+          .map((q) => q.m);
+      }
+      return compassSel;
+    }
 
     function updateCompass() {
       if (!compassEl || !compassWin || !compassStrip) return;
@@ -3183,11 +3818,12 @@ export default function BattleRoyaleGame() {
         const txt = `${CARD8[Math.round(bearing / 45) % 8]} ${Math.round(bearing)}\u00b0`;
         if (compassDegEl.textContent !== txt) compassDegEl.textContent = txt;
       }
-      if (harborMarks !== compassChipsFor) {
-        compassChipsFor = harborMarks;
+      const sel = compassSelection();
+      if (sel !== compassChipsFor) {
+        compassChipsFor = sel;
         for (let i = 0; i < compassChips.length; i++) {
           const chip = compassChips[i];
-          const m = harborMarks[i];
+          const m = sel[i];
           chip.style.display = m ? '' : 'none';
           if (!m) continue;
           chip.className = 'compass-mark ' + m.cls;
@@ -3203,7 +3839,7 @@ export default function BattleRoyaleGame() {
       const placed: { c: number; hw: number }[] = [];
       for (let i = 0; i < compassChips.length; i++) {
         const chip = compassChips[i];
-        const m = harborMarks[i];
+        const m = sel[i];
         if (!m) continue;
         const hw = hws[i];
         const dx = m.x - p.x;
@@ -3330,6 +3966,37 @@ export default function BattleRoyaleGame() {
               return { floor: +s.floor.toFixed(2), wet: s.wet, swimming: s.swimming, depth: +(WATER_Y - s.floor).toFixed(2), underFx };
             },
             harborInfo: () => harborAnchor,
+            port: () => portPlan,
+            pickupsInfo: () =>
+              pickups.map((p) => ({
+                k: p.kind,
+                x: +p.x.toFixed(0),
+                z: +p.z.toFixed(0),
+                poi: (p.group.userData as any).poi,
+                taken: p.taken,
+              })),
+            pois: () =>
+              pois.map((p) => ({
+                id: p.id,
+                kind: p.kind,
+                x: +p.x.toFixed(0),
+                z: +p.z.toFixed(0),
+                gy: +p.gy.toFixed(1),
+                r: p.r,
+                rot: p.rot,
+                built: p.built,
+                tries: p.tries,
+                dist: Math.round(Math.hypot(p.x - camera.position.x, p.z - camera.position.z)),
+              })),
+            streamInfo: () => ({
+              poisBuilt: pois.filter((p) => p.built).length,
+              poisTotal: pois.length,
+              solids: solids.length,
+              voxBoxes: voxBoxes.length,
+              shootable: shootable.length,
+              pickups: pickups.length,
+              marks: harborMarks.length,
+            }),
             compassInfo: () => {
               const b = (((-yaw * 180) / Math.PI) % 360 + 360) % 360;
               const p = camera.position;
@@ -4032,6 +4699,26 @@ export default function BattleRoyaleGame() {
       if (d.hp <= 0.001) dummyDown(d);
     }
 
+    // Horizontal distance pre-filter for bullet raycasts. With the POI
+    // generator streaming structures across the map, `shootable` can
+    // hold hundreds of far-away meshes; bullets never reach past ~170 m
+    // so only nearby objects are worth intersecting. InstancedMesh
+    // position sits at its group's origin, so use the voxel box's
+    // center for those.
+    function nearShootable(maxDist: number, ox = camera.position.x, oz = camera.position.z) {
+      const m2 = maxDist * maxDist;
+      const out: THREE.Object3D[] = [];
+      for (const o of shootable) {
+        const vox = (o as any).userData?.vox as VoxelBox | undefined;
+        const px = vox ? vox.x0 + (vox.nx * vox.sx) / 2 : o.position.x;
+        const pz = vox ? vox.z0 + (vox.nz * vox.sz) / 2 : o.position.z;
+        const dx = px - ox;
+        const dz = pz - oz;
+        if (dx * dx + dz * dz < m2) out.push(o);
+      }
+      return out;
+    }
+
     function shoot() {
       const w = current;
       if (!w || cooldown > 0 || reloadT > 0 || roll || buildMode || gArmed || bombArmed) return;
@@ -4045,7 +4732,7 @@ export default function BattleRoyaleGame() {
       refreshHud();
       applyView();
       raycaster.setFromCamera(centre, camera);
-      let hit = raycaster.intersectObjects(shootable, false)[0];
+      let hit = raycaster.intersectObjects(nearShootable(170), false)[0];
       const from = w.muzzle.getWorldPosition(new THREE.Vector3());
       let reach = hit ? hit.distance : 150;
       const gc = shotCut(raycaster.ray, reach);
@@ -4088,7 +4775,7 @@ export default function BattleRoyaleGame() {
       if (!current || reloadT > 0 || roll) return;
       applyView();
       raycaster.setFromCamera(centre, camera);
-      const hit = raycaster.intersectObjects(shootable, false)[0];
+      const hit = raycaster.intersectObjects(nearShootable(170), false)[0];
       const target = hit?.object.userData.dummy;
       if (!target || target.state !== 'up') return;
       if (smokeDist(raycaster.ray.origin, raycaster.ray.direction, hit.distance) < Infinity) return;
@@ -4299,13 +4986,13 @@ export default function BattleRoyaleGame() {
       registerDestructible(sb, mesh, mat);
     }
 
-    function bPane(B: any, axisName: string, f0: number, f1: number, a0: number, a1: number, y0: number, y1: number) {
+    function bPane(B: any, axisName: string, f0: number, f1: number, a0: number, a1: number, y0: number, y1: number, parent?: THREE.Object3D) {
       const fm = (f0 + f1) / 2;
       const w = turnBox(B, ...spanOf(axisName, fm, fm, a0, a1));
       const m = new THREE.Mesh(new THREE.PlaneGeometry(2 * Math.max(w.hx, w.hz), y1 - y0), bmGlass);
       m.position.set(w.x, (y0 + y1) / 2, w.z);
       m.rotation.y = w.hx > w.hz ? 0 : Math.PI / 2;
-      world.add(m);
+      (parent ?? world).add(m);
     }
 
     function bWall(
@@ -4326,7 +5013,7 @@ export default function BattleRoyaleGame() {
         if (o.a > at) bBox(B, axisName, f0, f1, at, o.a, y0, y1, mat, parent);
         if (o.sill > y0) bBox(B, axisName, f0, f1, o.a, o.b, y0, o.sill, mat, parent);
         if (o.head < y1) bBox(B, axisName, f0, f1, o.a, o.b, o.head, y1, mat, parent);
-        if (o.sill > y0 && o.glass !== false) bPane(B, axisName, f0, f1, o.a, o.b, o.sill, o.head);
+        if (o.sill > y0 && o.glass !== false) bPane(B, axisName, f0, f1, o.a, o.b, o.sill, o.head, parent);
         at = o.b;
       }
       if (at < a1) bBox(B, axisName, f0, f1, at, a1, y0, y1, mat, parent);
@@ -4335,7 +5022,7 @@ export default function BattleRoyaleGame() {
     const holes = (pairs: number[][], sill: number, head: number, glass?: boolean) =>
       pairs.map(([a, b]) => ({ a, b, sill, head, glass }));
 
-    function bGable(B: any, u0: number, u1: number, v0: number, v1: number, eaveY: number, ridgeY: number, mat: THREE.Material) {
+    function bGable(B: any, u0: number, u1: number, v0: number, v1: number, eaveY: number, ridgeY: number, mat: THREE.Material, parent?: THREE.Object3D) {
       const vm = (v0 + v1) / 2;
       const E = eaveY;
       const K = ridgeY;
@@ -4361,16 +5048,17 @@ export default function BattleRoyaleGame() {
       const mesh = new THREE.Mesh(geo, mat);
       mesh.castShadow = true;
       mesh.receiveShadow = true;
-      world.add(mesh);
+      (parent ?? world).add(mesh);
       shootable.push(mesh);
     }
 
-    function buildHouse(B: any) {
+    function buildHouse(B: any, gy = 0, parent?: THREE.Object3D) {
       const hx = 6;
       const hz = 4.5;
       const T = 0.4;
-      const FLOOR = 3.2;
-      const ROOF = 6.4;
+      const FLOOR = gy + 3.2;
+      const ROOF = gy + 6.4;
+      const G = gy;
       const L = -hx;
       const R = hx;
       const N = -hz;
@@ -4382,39 +5070,40 @@ export default function BattleRoyaleGame() {
       const winSide = [[-2.8, -1.2], [1.2, 2.8]];
       const winBack = [[-4.0, -2.4], [2.4, 4.0]];
 
-      bWall(B, 'z', L, iL, N, S, 0, FLOOR, holes(winSide, 0.9, 2.2), bmWall);
-      bWall(B, 'z', iR, R, N, S, 0, FLOOR, holes(winSide, 0.9, 2.2), bmWall);
-      bWall(B, 'x', N, iN, L, R, 0, FLOOR, holes(winBack, 0.9, 2.2), bmWall);
-      bWall(B, 'x', iS, S, L, R, 0, FLOOR, [...holes(winBack, 0.9, 2.2), { a: -1, b: 1, sill: 0, head: 2.4 }], bmWall);
+      bWall(B, 'z', L, iL, N, S, G, FLOOR, holes(winSide, gy + 0.9, gy + 2.2), bmWall, parent);
+      bWall(B, 'z', iR, R, N, S, G, FLOOR, holes(winSide, gy + 0.9, gy + 2.2), bmWall, parent);
+      bWall(B, 'x', N, iN, L, R, G, FLOOR, holes(winBack, gy + 0.9, gy + 2.2), bmWall, parent);
+      bWall(B, 'x', iS, S, L, R, G, FLOOR, [...holes(winBack, gy + 0.9, gy + 2.2), { a: -1, b: 1, sill: gy, head: gy + 2.4 }], bmWall, parent);
 
-      bWall(B, 'z', L, iL, N, S, FLOOR, ROOF, holes(winSide, 4.1, 5.5), bmWall);
-      bWall(B, 'z', iR, R, N, S, FLOOR, ROOF, holes(winSide, 4.1, 5.5), bmWall);
-      bWall(B, 'x', N, iN, L, R, FLOOR, ROOF, holes(winBack, 4.1, 5.5), bmWall);
-      bWall(B, 'x', iS, S, L, R, FLOOR, ROOF, holes(winBack, 4.1, 5.5), bmWall);
+      bWall(B, 'z', L, iL, N, S, FLOOR, ROOF, holes(winSide, gy + 4.1, gy + 5.5), bmWall, parent);
+      bWall(B, 'z', iR, R, N, S, FLOOR, ROOF, holes(winSide, gy + 4.1, gy + 5.5), bmWall, parent);
+      bWall(B, 'x', N, iN, L, R, FLOOR, ROOF, holes(winBack, gy + 4.1, gy + 5.5), bmWall, parent);
+      bWall(B, 'x', iS, S, L, R, FLOOR, ROOF, holes(winBack, gy + 4.1, gy + 5.5), bmWall, parent);
 
       const STEPS = 10;
       const RISE = 0.32;
       const RUN = 0.3;
       const zs = iS - 0.8;
       for (let i = 0; i < STEPS; i++) {
-        bBox(B, 'z', iL + 0.4, iL + 1.6, zs - (i + 1) * RUN, zs - i * RUN, 0, (i + 1) * RISE, bmStair);
+        bBox(B, 'z', iL + 0.4, iL + 1.6, zs - (i + 1) * RUN, zs - i * RUN, gy, gy + (i + 1) * RISE, bmStair, parent);
       }
 
       const edgeZ = zs - STEPS * RUN;
-      bBox(B, 'x', iN, edgeZ, iL, iR, FLOOR - 0.4, FLOOR, bmSlab);
-      bBox(B, 'x', edgeZ, iS, iL + 2.2, iR, FLOOR - 0.4, FLOOR, bmSlab);
-      bBox(B, 'x', N, S, L, R, ROOF, ROOF + 0.3, bmRoof);
+      bBox(B, 'x', iN, edgeZ, iL, iR, FLOOR - 0.4, FLOOR, bmSlab, parent);
+      bBox(B, 'x', edgeZ, iS, iL + 2.2, iR, FLOOR - 0.4, FLOOR, bmSlab, parent);
+      bBox(B, 'x', N, S, L, R, ROOF, ROOF + 0.3, bmRoof, parent);
       return { u: 0, v: S, nu: 0, nv: 1 };
     }
 
-    function buildCottage(B: any) {
+    function buildCottage(B: any, gy = 0, parent?: THREE.Object3D) {
       const hx = 4.5;
       const hz = 3.5;
       const T = 0.3;
-      const H = 3.0;
+      const H = gy + 3.0;
       const SLAB = 0.2;
       const OVER = 0.4;
       const PEAK = 2.2;
+      const G = gy;
       const L = -hx;
       const R = hx;
       const N = -hz;
@@ -4427,26 +5116,27 @@ export default function BattleRoyaleGame() {
       const winBack = [[-3.0, -1.6], [1.6, 3.0]];
       const winFront = [[-3.0, -1.6], [1.6, 3.0]];
 
-      bWall(B, 'z', L, iL, N, S, 0, H, holes(winSide, 0.9, 2.1), bmCream);
-      bWall(B, 'z', iR, R, N, S, 0, H, holes(winSide, 0.9, 2.1), bmCream);
-      bWall(B, 'x', N, iN, L, R, 0, H, holes(winBack, 0.9, 2.1), bmCream);
-      bWall(B, 'x', iS, S, L, R, 0, H, [...holes(winFront, 0.9, 2.1), { a: -0.6, b: 0.6, sill: 0, head: 2.1 }], bmCream);
+      bWall(B, 'z', L, iL, N, S, G, H, holes(winSide, gy + 0.9, gy + 2.1), bmCream, parent);
+      bWall(B, 'z', iR, R, N, S, G, H, holes(winSide, gy + 0.9, gy + 2.1), bmCream, parent);
+      bWall(B, 'x', N, iN, L, R, G, H, holes(winBack, gy + 0.9, gy + 2.1), bmCream, parent);
+      bWall(B, 'x', iS, S, L, R, G, H, [...holes(winFront, gy + 0.9, gy + 2.1), { a: -0.6, b: 0.6, sill: gy, head: gy + 2.1 }], bmCream, parent);
 
-      bBox(B, 'x', N, S, L, R, H, H + SLAB, bmSlab);
-      bGable(B, L - OVER, R + OVER, N - OVER, S + OVER, H + SLAB, H + SLAB + PEAK, bmTile);
+      bBox(B, 'x', N, S, L, R, H, H + SLAB, bmSlab, parent);
+      bGable(B, L - OVER, R + OVER, N - OVER, S + OVER, H + SLAB, H + SLAB + PEAK, bmTile, parent);
 
-      bBox(B, 'x', -3.0, -2.0, -3.8, -1.8, 0, 0.5, bmWood);
-      bBox(B, 'x', 0.6, 1.4, 1.2, 2.2, 0, 0.8, bmWood);
+      bBox(B, 'x', -3.0, -2.0, -3.8, -1.8, gy, gy + 0.5, bmWood, parent);
+      bBox(B, 'x', 0.6, 1.4, 1.2, 2.2, gy, gy + 0.8, bmWood, parent);
       return { u: 0, v: S, nu: 0, nv: 1 };
     }
 
-    function buildBunker(B: any) {
+    function buildBunker(B: any, gy = 0, parent?: THREE.Object3D) {
       const hx = 5;
       const hz = 3.5;
       const T = 0.6;
-      const H = 2.6;
+      const H = gy + 2.6;
       const SLAB = 0.4;
       const OVER = 0.4;
+      const G = gy;
       const L = -hx;
       const R = hx;
       const N = -hz;
@@ -4455,25 +5145,26 @@ export default function BattleRoyaleGame() {
       const iR = R - T;
       const iN = N + T;
       const iS = S - T;
-      const slits = (cs: number[]) => cs.map((c) => ({ a: c - 0.3, b: c + 0.3, sill: 1.4, head: 1.7, glass: false }));
+      const slits = (cs: number[]) => cs.map((c) => ({ a: c - 0.3, b: c + 0.3, sill: gy + 1.4, head: gy + 1.7, glass: false }));
 
-      bWall(B, 'z', L, iL, N, S, 0, H, slits([-2.2, 0, 2.2]), bmConcrete);
-      bWall(B, 'z', iR, R, N, S, 0, H, slits([-2.2, 0, 2.2]), bmConcrete);
-      bWall(B, 'x', N, iN, L, R, 0, H, [], bmConcrete);
-      bWall(B, 'x', iS, S, L, R, 0, H, [...slits([-3.0, 3.0]), { a: -0.7, b: 0.7, sill: 0, head: 2.1 }], bmConcrete);
-      bBox(B, 'x', N - OVER, S + OVER, L - OVER, R + OVER, H, H + SLAB, bmConcreteDark);
+      bWall(B, 'z', L, iL, N, S, G, H, slits([-2.2, 0, 2.2]), bmConcrete, parent);
+      bWall(B, 'z', iR, R, N, S, G, H, slits([-2.2, 0, 2.2]), bmConcrete, parent);
+      bWall(B, 'x', N, iN, L, R, G, H, [], bmConcrete, parent);
+      bWall(B, 'x', iS, S, L, R, G, H, [...slits([-3.0, 3.0]), { a: -0.7, b: 0.7, sill: gy, head: gy + 2.1 }], bmConcrete, parent);
+      bBox(B, 'x', N - OVER, S + OVER, L - OVER, R + OVER, H, H + SLAB, bmConcreteDark, parent);
 
-      bBox(B, 'x', iN, iN + 0.6, -3.0, 3.0, 0, 0.5, bmWood);
-      bBox(B, 'x', 0.4, 1.4, 1.5, 2.6, 0, 0.9, bmCrate);
+      bBox(B, 'x', iN, iN + 0.6, -3.0, 3.0, gy, gy + 0.5, bmWood, parent);
+      bBox(B, 'x', 0.4, 1.4, 1.5, 2.6, gy, gy + 0.9, bmCrate, parent);
       return { u: 0, v: S, nu: 0, nv: 1 };
     }
 
-    function buildWarehouse(B: any) {
+    function buildWarehouse(B: any, gy = 0, parent?: THREE.Object3D) {
       const hx = 7;
       const hz = 5;
       const T = 0.4;
-      const H = 5.0;
+      const H = gy + 5.0;
       const OVER = 0.5;
+      const G = gy;
       const L = -hx;
       const R = hx;
       const N = -hz;
@@ -4483,17 +5174,387 @@ export default function BattleRoyaleGame() {
       const iN = N + T;
       const high = [[-3.6, -2.0], [-0.8, 0.8], [2.0, 3.6]];
 
-      bWall(B, 'z', L, iL, N, S, 0, H, holes(high, 3.2, 4.2), bmSteel);
-      bWall(B, 'z', iR, R, N, S, 0, H, holes(high, 3.2, 4.2), bmSteel);
-      bWall(B, 'x', N, iN, L, R, 0, H, [{ a: -1.4, b: 1.4, sill: 0, head: 3.4 }], bmSteel);
+      bWall(B, 'z', L, iL, N, S, G, H, holes(high, gy + 3.2, gy + 4.2), bmSteel, parent);
+      bWall(B, 'z', iR, R, N, S, G, H, holes(high, gy + 3.2, gy + 4.2), bmSteel, parent);
+      bWall(B, 'x', N, iN, L, R, G, H, [{ a: -1.4, b: 1.4, sill: gy, head: gy + 3.4 }], bmSteel, parent);
 
-      bBox(B, 'x', S - 0.9, S - 0.3, L + T + 0.2, L + T + 0.8, 0, H, bmSteelDark);
-      bBox(B, 'x', S - 0.9, S - 0.3, R - T - 0.8, R - T - 0.2, 0, H, bmSteelDark);
-      bBox(B, 'x', N - OVER, S + OVER, L - OVER, R + OVER, H, H + 0.3, bmSteelDark);
+      bBox(B, 'x', S - 0.9, S - 0.3, L + T + 0.2, L + T + 0.8, G, H, bmSteelDark, parent);
+      bBox(B, 'x', S - 0.9, S - 0.3, R - T - 0.8, R - T - 0.2, G, H, bmSteelDark, parent);
+      bBox(B, 'x', N - OVER, S + OVER, L - OVER, R + OVER, H, H + 0.3, bmSteelDark, parent);
 
-      bBox(B, 'x', -2.6, -0.6, -5.0, -3.4, 0, 1.4, bmCrate);
-      bBox(B, 'x', 1.0, 2.8, 2.0, 3.4, 0, 1.4, bmCrate);
+      bBox(B, 'x', -2.6, -0.6, -5.0, -3.4, gy, gy + 1.4, bmCrate, parent);
+      bBox(B, 'x', 1.0, 2.8, 2.0, 3.4, gy, gy + 1.4, bmCrate, parent);
       return { u: 0, v: S, nu: 0, nv: 1 };
+    }
+
+    // ----------------------------------------------------
+    // POI structure palette + builders. Every piece registers
+    // through bBox/bWall so the whole POI is voxel-destructible
+    // and blast-occluding, exactly like the range buildings.
+    // Builders take (B, gy, parent): local u/v around B, ground
+    // level gy, and the POI group they live in.
+    // ----------------------------------------------------
+    const bmBarn = new THREE.MeshLambertMaterial({ color: 0x9a4433 });
+    const bmHay = new THREE.MeshLambertMaterial({ color: 0xc9a84e });
+    const bmCanvasTan = new THREE.MeshLambertMaterial({ color: 0xb59a6a });
+    const bmCanvasGreen = new THREE.MeshLambertMaterial({ color: 0x5e7a4a });
+    const bmRock = new THREE.MeshLambertMaterial({ color: 0x767b7e });
+    const bmWhite = new THREE.MeshLambertMaterial({ color: 0xe4e4dc });
+    const bmBandRed = new THREE.MeshLambertMaterial({ color: 0xb03a30 });
+    const bmSilo = new THREE.MeshLambertMaterial({ color: 0xb8bcc2 });
+    const bmRust = new THREE.MeshLambertMaterial({ color: 0x9a6248 });
+    const bmWarnOrange = new THREE.MeshLambertMaterial({ color: 0xd99021 });
+    const bmGravel = new THREE.MeshLambertMaterial({ color: 0x8d8578 });
+    const bmLamp = new THREE.MeshLambertMaterial({ color: 0xffe9a0, emissive: 0xffc94d });
+    const bmBeaconRed = new THREE.MeshLambertMaterial({ color: 0xff6b5e, emissive: 0xb03a30 });
+    voxHpMap.set(bmBarn, 110);
+    voxHpMap.set(bmHay, 60);
+    voxHpMap.set(bmCanvasTan, 55);
+    voxHpMap.set(bmCanvasGreen, 55);
+    voxHpMap.set(bmRock, 210);
+    voxHpMap.set(bmWhite, 110);
+    voxHpMap.set(bmBandRed, 110);
+    voxHpMap.set(bmSilo, 170);
+    voxHpMap.set(bmRust, 130);
+    voxHpMap.set(bmWarnOrange, 90);
+    voxHpMap.set(bmGravel, 100);
+
+    function buildShed(B: any, gy = 0, parent?: THREE.Object3D) {
+      const hx = 1.6;
+      const hz = 2.4;
+      const T = 0.25;
+      const H = gy + 2.3;
+      const G = gy;
+      const L = -hx;
+      const R = hx;
+      const N = -hz;
+      const S = hz;
+      const iL = L + T;
+      const iR = R - T;
+      const iN = N + T;
+      const iS = S - T;
+      bWall(B, 'z', L, iL, N, S, G, H, holes([[-1.2, -0.4]], gy + 0.7, gy + 1.6), bmWood, parent);
+      bWall(B, 'z', iR, R, N, S, G, H, [], bmWood, parent);
+      bWall(B, 'x', N, iN, L, R, G, H, [], bmWood, parent);
+      bWall(B, 'x', iS, S, L, R, G, H, [{ a: -0.5, b: 0.5, sill: gy, head: gy + 1.9, glass: false }], bmWood, parent);
+      bBox(B, 'x', N - 0.25, S + 0.25, L - 0.25, R + 0.25, H, H + 0.18, bmRoof, parent);
+      bBox(B, 'x', -0.7, 0.1, -1.4, -0.6, gy, gy + 0.7, bmCrate, parent);
+      return { u: 0, v: S, nu: 0, nv: 1 };
+    }
+
+    function buildBarn(B: any, gy = 0, parent?: THREE.Object3D) {
+      const hx = 5;
+      const hz = 3.6;
+      const T = 0.35;
+      const H = gy + 4.4;
+      const OVER = 0.45;
+      const PEAK = 2.4;
+      const G = gy;
+      const L = -hx;
+      const R = hx;
+      const N = -hz;
+      const S = hz;
+      const iL = L + T;
+      const iR = R - T;
+      const iN = N + T;
+      const iS = S - T;
+      const loft = [[-3.4, -2.2], [2.2, 3.4]];
+      bWall(B, 'z', L, iL, N, S, G, H, holes(loft, gy + 2.4, gy + 3.5), bmBarn, parent);
+      bWall(B, 'z', iR, R, N, S, G, H, holes(loft, gy + 2.4, gy + 3.5), bmBarn, parent);
+      bWall(B, 'x', N, iN, L, R, G, H, [{ a: -1.2, b: 1.2, sill: gy + 2.6, head: gy + 3.9 }], bmBarn, parent);
+      bWall(B, 'x', iS - 1.6, iS, L, R, G, H, holes([[-3.6, -2.8]], gy + 1.0, gy + 2.2), bmBarn, parent);
+      bBox(B, 'x', iS - 1.6, iS, L, R, gy + 3.9, H, bmBarn, parent); // header over the big door
+      bBox(B, 'x', iS, S, L, R, H, H + 0.2, bmBarn, parent);
+      bGable(B, L - OVER, R + OVER, N - OVER, S + OVER, H + 0.2, H + 0.2 + PEAK, bmBarn, parent);
+      bBox(B, 'x', -3.2, -2.0, -2.2, -1.0, gy, gy + 1.1, bmHay, parent);
+      bBox(B, 'x', 1.4, 2.6, 0.2, 1.4, gy, gy + 1.6, bmHay, parent);
+      bBox(B, 'x', -0.6, 0.6, -2.0, -0.8, gy, gy + 0.7, bmHay, parent);
+      return { u: 0, v: S, nu: 0, nv: 1 };
+    }
+
+    function buildSilo(B: any, gy = 0, parent?: THREE.Object3D) {
+      bBox(B, 'z', -1.5, 1.5, -1.5, 1.5, gy - 0.4, gy + 11, bmSilo, parent);
+      bBox(B, 'z', -1.05, 1.05, -1.05, 1.05, gy + 11, gy + 12.2, bmSilo, parent);
+      bBox(B, 'z', -0.45, 0.45, -0.45, 0.45, gy + 12.2, gy + 12.7, bmWarnOrange, parent);
+    }
+
+    function buildWaterTower(B: any, gy = 0, parent?: THREE.Object3D) {
+      for (const sx of [-1.4, 1.4]) {
+        for (const sz of [-1.4, 1.4]) {
+          bBox(B, 'z', sx - 0.18, sx + 0.18, sz - 0.18, sz + 0.18, gy, gy + 7.2, bmRust, parent);
+        }
+      }
+      for (const yy of [2.4, 4.8]) {
+        bBox(B, 'x', -1.55, 1.55, -0.09, 0.09, gy + yy, gy + yy + 0.2, bmRust, parent);
+        bBox(B, 'z', -0.09, 0.09, -1.55, 1.55, gy + yy, gy + yy + 0.2, bmRust, parent);
+      }
+      bBox(B, 'z', -2.1, 2.1, -2.1, 2.1, gy + 7.2, gy + 10.1, bmWhite, parent);
+      bBox(B, 'z', -1.6, 1.6, -1.6, 1.6, gy + 10.1, gy + 10.9, bmBandRed, parent);
+      bBox(B, 'z', -0.75, 0.75, -0.75, 0.75, gy + 10.9, gy + 11.4, bmBandRed, parent);
+      bBox(B, 'z', -0.16, 0.16, -0.16, 0.16, gy, gy + 7.4, bmRust, parent); // riser pipe
+      bBox(B, 'x', 1.5, 2.7, 1.5, 2.4, gy, gy + 0.9, bmCrate, parent); // starter crate
+    }
+
+    function buildGuardTower(B: any, gy = 0, parent?: THREE.Object3D) {
+      const PL = 4.6;
+      for (const sx of [-1.5, 1.5]) {
+        for (const sz of [-1.5, 1.5]) {
+          bBox(B, 'z', sx - 0.2, sx + 0.2, sz - 0.2, sz + 0.2, gy, gy + PL, bmWood, parent);
+        }
+      }
+      bBox(B, 'x', -1.95, 1.95, -0.12, 0.12, gy + 2.1, gy + 2.3, bmWood, parent);
+      bBox(B, 'z', -0.12, 0.12, -1.95, 1.95, gy + 2.1, gy + 2.3, bmWood, parent);
+      bBox(B, 'z', -1.95, 1.95, -1.95, 1.95, gy + PL, gy + PL + 0.35, bmPlank, parent);
+      // railing with viewing slits on all four sides
+      bBox(B, 'z', -1.95, 1.95, 1.8, 1.95, gy + PL + 0.35, gy + PL + 1.25, bmWood, parent);
+      bBox(B, 'z', -1.95, 1.95, -1.95, -1.8, gy + PL + 0.35, gy + PL + 1.25, bmWood, parent);
+      bBox(B, 'x', -1.95, 1.95, 1.8, 1.95, gy + PL + 0.35, gy + PL + 1.25, bmWood, parent);
+      bBox(B, 'x', -1.95, 1.95, -1.95, -1.8, gy + PL + 0.35, gy + PL + 1.25, bmWood, parent);
+      for (const sx of [-1.7, 1.7]) {
+        for (const sz of [-1.7, 1.7]) {
+          bBox(B, 'z', sx - 0.12, sx + 0.12, sz - 0.12, sz + 0.12, gy + PL + 1.25, gy + PL + 1.95, bmWood, parent);
+        }
+      }
+      bBox(B, 'z', -2.3, 2.3, -2.3, 2.3, gy + PL + 1.95, gy + PL + 2.25, bmRoof, parent);
+      // zig-zag ladder up the south face: 0.42 m steps (<= step-up) so
+      // you can simply walk to the top — no build pieces needed.
+      const steps = Math.ceil((PL + 0.35 - 0.42) / 0.42);
+      for (let i = 0; i < steps; i++) {
+        const off = i % 2 === 0 ? -0.35 : 0.35;
+        bBox(B, 'x', off - 0.36, off + 0.36, 1.62, 2.06, gy + (i + 1) * 0.42 - 0.42, gy + (i + 1) * 0.42, bmPlankDark, parent);
+      }
+      bBox(B, 'x', 2.1, 2.9, -2.4, -1.4, gy, gy + 0.85, bmCrate, parent);
+    }
+
+    function buildRadioMast(B: any, gy = 0, parent?: THREE.Object3D) {
+      const legs: Array<[number, number]> = [
+        [0, 1.25],
+        [-1.08, -0.62],
+        [1.08, -0.62],
+      ];
+      for (const [lx, lz] of legs) {
+        bBox(B, 'z', lx - 0.13, lx + 0.13, lz - 0.13, lz + 0.13, gy, gy + 20, bmRust, parent);
+      }
+      for (let lvl = 0; lvl < 6; lvl++) {
+        const yy = gy + 2.4 + lvl * 3.1;
+        bBox(B, 'x', -1.2, 1.2, -0.1, 0.1, yy, yy + 0.18, bmRust, parent);
+        bBox(B, 'x', -0.1, 0.1, -1.25, 1.25, yy, yy + 0.18, bmRust, parent);
+        bBox(B, 'z', -1.2, 1.2, -0.75, -0.55, yy, yy + 0.18, bmRust, parent);
+      }
+      bBox(B, 'z', -0.16, 0.16, -0.16, 0.16, gy + 20, gy + 24, bmSteelDark, parent);
+      bBox(B, 'z', -0.3, 0.3, -0.3, 0.3, gy + 24, gy + 24.6, bmBeaconRed, parent);
+      bBox(B, 'x', 0, 0.24, -0.12, 0.12, gy + 21.6, gy + 22.8, bmRust, parent); // dish post
+      bBox(B, 'z', -0.06, 0.06, -0.85, 0.85, gy + 22.8, gy + 24.0, bmWhite, parent); // dish face
+      bBox(B, 'x', 1.6, 2.3, 0.9, 1.6, gy, gy + 0.5, bmSteelDark, parent); // equipment box
+    }
+
+    function buildRuin(B: any, gy = 0, parent?: THREE.Object3D) {
+      const jags = (a0: number, a1: number) => [
+        { a: a0, b: a0 + 1.1, h: 2.4 },
+        { a: a0 + 1.1, b: a0 + 2.2, h: 1.15 },
+        { a: a0 + 2.2, b: a1, h: 1.9 },
+      ];
+      for (const s of jags(-3, 3)) bBox(B, 'z', -3, -2.7, s.a, s.b, gy, gy + s.h, bmWall, parent);
+      for (const s of jags(-3, 3)) bBox(B, 'x', 2.7, 3, s.a, s.b, gy, gy + s.h + 0.3, bmWall, parent);
+      bBox(B, 'x', -3, 3, -0.9, -0.45, gy, gy + 1.3, bmWall, parent); // south fragment + door gap
+      bBox(B, 'x', -3, 3, 0.45, 0.9, gy, gy + 1.6, bmWall, parent);
+      bBox(B, 'x', -3, 3, -0.9, 0.9, gy + 2.4, gy + 2.6, bmWall, parent); // fallen lintel
+      bBox(B, 'z', 1.2, 2.6, -2.4, -1.0, gy, gy + 0.35, bmSlab, parent); // collapsed roof
+      bBox(B, 'z', -0.2, 1.2, -2.4, -1.0, gy, gy + 0.22, bmSlab, parent);
+      bBox(B, 'x', -2.2, -1.2, 1.2, 2.2, gy, gy + 0.6, bmCrate, parent);
+      bBox(B, 'x', 0.4, 1.3, -2.0, -1.1, gy, gy + 0.45, bmGravel, parent);
+    }
+
+    function buildTent(B: any, gy = 0, parent?: THREE.Object3D, mat = bmCanvasTan) {
+      const W = 1.3;
+      bBox(B, 'z', -W, W, -1.5, -1.35, gy, gy + 1.6, mat, parent); // back
+      bBox(B, 'z', -W, -W + 0.12, -1.35, 1.1, gy, gy + 1.15, mat, parent); // sides
+      bBox(B, 'z', W - 0.12, W, -1.35, 1.1, gy, gy + 1.15, mat, parent);
+      bBox(B, 'x', 0.65, 1.1, -W, W, gy, gy + 1.15, mat, parent);
+      bBox(B, 'x', 1.1, 1.35, -W, W, gy, gy + 1.9, mat, parent); // front header
+      bBox(B, 'x', -1.62, 1.62, -1.78, 1.5, gy + 1.9, gy + 2.05, mat, parent); // roof
+    }
+
+    function buildTank(B: any, gy = 0, parent?: THREE.Object3D) {
+      // containment berm — knee-high cover ring around the tank
+      bBox(B, 'x', -4.3, 4.3, -4.3, -3.9, gy, gy + 1.1, bmConcrete, parent);
+      bBox(B, 'x', -4.3, 4.3, 3.9, 4.3, gy, gy + 1.1, bmConcrete, parent);
+      bBox(B, 'z', -4.3, -3.9, -3.9, 3.9, gy, gy + 1.1, bmConcrete, parent);
+      bBox(B, 'z', 3.9, 4.3, -3.9, 3.9, gy, gy + 1.1, bmConcrete, parent);
+      bBox(B, 'z', -2.8, 2.8, -2.8, 2.8, gy, gy + 0.9, bmConcrete, parent); // plinth
+      bBox(B, 'z', -2.6, 2.6, -2.6, 2.6, gy + 0.9, gy + 5.4, bmWhite, parent); // drum
+      bBox(B, 'z', -2.2, 2.2, -2.2, 2.2, gy + 5.4, gy + 6.6, bmWhite, parent); // dome
+      bBox(B, 'z', -0.7, 0.7, -0.7, 0.7, gy + 6.6, gy + 7.2, bmBandRed, parent); // vent
+      bBox(B, 'x', 2.6, 3.4, -0.1, 0.1, gy + 0.9, gy + 3.6, bmSteelDark, parent); // pipe run
+      bBox(B, 'x', 3.2, 3.6, -0.1, 0.1, gy, gy + 0.9, bmSteelDark, parent);
+    }
+
+    function buildGreenhouse(B: any, gy = 0, parent?: THREE.Object3D) {
+      const hx = 2.6;
+      const hz = 4.2;
+      const T = 0.22;
+      const H = gy + 2.6;
+      const G = gy;
+      const L = -hx;
+      const R = hx;
+      const N = -hz;
+      const S = hz;
+      const iL = L + T;
+      const iR = R - T;
+      const iN = N + T;
+      const iS = S - T;
+      const big = [[-3.4, -0.8], [0.8, 3.4]];
+      bWall(B, 'z', L, iL, N, S, G, H, holes(big, gy + 0.4, gy + 2.2), bmWhite, parent);
+      bWall(B, 'z', iR, R, N, S, G, H, holes(big, gy + 0.4, gy + 2.2), bmWhite, parent);
+      bWall(B, 'x', N, iN, L, R, G, H, holes([[-1.8, -0.6], [0.6, 1.8]], gy + 0.4, gy + 2.2), bmWhite, parent);
+      bWall(B, 'x', iS, S, L, R, G, H, holes([[-1.8, -0.6], [0.6, 1.8]], gy + 0.4, gy + 2.2), bmWhite, parent);
+      bBox(B, 'x', N - 0.2, S + 0.2, L - 0.2, R + 0.2, H, H + 0.16, bmWhite, parent);
+      bBox(B, 'x', -1.8, -1.0, -3.2, -2.2, gy, gy + 0.55, bmHay, parent); // planters
+      bBox(B, 'x', 0.6, 1.4, 1.4, 2.4, gy, gy + 0.55, bmHay, parent);
+      bBox(B, 'x', -0.6, 0.6, -0.8, 0.4, gy, gy + 0.45, bmHay, parent);
+    }
+
+    function buildOffice(B: any, gy = 0, parent?: THREE.Object3D) {
+      const hx = 5;
+      const hz = 3.5;
+      const T = 0.35;
+      const F1 = gy + 3.1;
+      const SLAB = 0.4;
+      const F2 = F1 + SLAB;
+      const TOP = F2 + 2.7;
+      const G = gy;
+      const L = -hx;
+      const R = hx;
+      const N = -hz;
+      const S = hz;
+      const iL = L + T;
+      const iR = R - T;
+      const iN = N + T;
+      const iS = S - T;
+      const win = [[-3.8, -2.4], [-1.2, 1.2], [2.4, 3.8]];
+      const winSide = [[-2.4, -1.0], [1.0, 2.4]];
+
+      bWall(B, 'z', L, iL, N, S, G, F1, holes(winSide, gy + 0.9, gy + 2.3), bmCream, parent);
+      bWall(B, 'z', iR, R, N, S, G, F1, holes(winSide, gy + 0.9, gy + 2.3), bmCream, parent);
+      bWall(B, 'x', N, iN, L, R, G, F1, holes(win, gy + 0.9, gy + 2.3), bmCream, parent);
+      bWall(B, 'x', iS, S, L, R, G, F1, [...holes(win.slice(0, 2), gy + 0.9, gy + 2.3), { a: -0.9, b: 0.9, sill: gy, head: gy + 2.3 }], bmCream, parent);
+
+      bWall(B, 'z', L, iL, N, S, F2, TOP, holes(winSide, F2 + 0.9, F2 + 2.1), bmCream, parent);
+      bWall(B, 'z', iR, R, N, S, F2, TOP, holes(winSide, F2 + 0.9, F2 + 2.1), bmCream, parent);
+      bWall(B, 'x', N, iN, L, R, F2, TOP, holes(win, F2 + 0.9, F2 + 2.1), bmCream, parent);
+      bWall(B, 'x', iS, S, L, R, F2, TOP, holes(win, F2 + 0.9, F2 + 2.1), bmCream, parent);
+
+      bBox(B, 'x', N, -0.4, iL, iR, F1, F1 + SLAB, bmSlab, parent); // second-floor slab (north half)
+      bBox(B, 'x', -0.4, iS, iL + 2.4, iR, F1, F1 + SLAB, bmSlab, parent); // landing
+      const STEPS = 9;
+      const RISE = 0.32;
+      const RUN = 0.32;
+      for (let i = 0; i < STEPS; i++) {
+        bBox(B, 'z', iR - 0.9, iR - 0.1, iS - (i + 1) * RUN - 2.2, iS - i * RUN - 2.2, gy, gy + (i + 1) * RISE, bmStair, parent);
+      }
+      bBox(B, 'x', N, S, L, R, TOP, TOP + 0.28, bmRoof, parent); // roof deck
+      // parapet ring — rooftop cover with the sea view
+      bBox(B, 'x', N - 0.2, S + 0.2, L - 0.2, L + 0.15, TOP + 0.28, TOP + 1.05, bmCream, parent);
+      bBox(B, 'x', N - 0.2, S + 0.2, R - 0.15, R + 0.2, TOP + 0.28, TOP + 1.05, bmCream, parent);
+      bBox(B, 'z', L - 0.2, L + 0.15, L + 0.15, R - 0.15, TOP + 0.28, TOP + 1.05, bmCream, parent);
+      bBox(B, 'z', R - 0.15, R + 0.2, L + 0.15, R - 0.15, TOP + 0.28, TOP + 1.05, bmCream, parent);
+      bBox(B, 'x', -1.0, 1.0, 2.0, 2.9, gy, gy + 0.85, bmCrate, parent); // stacked import crates
+      bBox(B, 'x', -2.1, -1.2, 2.2, 2.9, gy, gy + 0.6, bmCrate, parent);
+    }
+
+    function buildTowerCrane(B: any, gy = 0, parent?: THREE.Object3D) {
+      const MAST = 18;
+      bBox(B, 'z', -0.75, -0.45, -0.15, 0.15, gy, gy + MAST, bmWarnOrange, parent);
+      bBox(B, 'z', 0.45, 0.75, -0.15, 0.15, gy, gy + MAST, bmWarnOrange, parent);
+      for (let lvl = 0; lvl < 8; lvl++) {
+        const yy = gy + 1.4 + lvl * 2.2;
+        bBox(B, 'x', -0.75, 0.75, -0.09, 0.09, yy, yy + 0.2, bmWarnOrange, parent);
+      }
+      bBox(B, 'z', -0.9, 0.9, -0.8, 0.8, gy + MAST, gy + MAST + 1.4, bmSteelDark, parent); // cab
+      bBox(B, 'x', -11.5, 11.5, -0.12, 0.12, gy + MAST + 1.4, gy + MAST + 2.1, bmWarnOrange, parent); // jib
+      bBox(B, 'x', -4.6, -1.4, -0.14, 0.14, gy + MAST + 2.1, gy + MAST + 2.5, bmWarnOrange, parent); // counter-jib
+      bBox(B, 'x', -4.3, -1.7, -0.75, 0.75, gy + MAST + 1.5, gy + MAST + 2.6, bmConcrete, parent); // counterweight
+      bBox(B, 'x', 7.4, 7.6, -0.05, 0.05, gy + MAST - 3.4, gy + MAST + 2.0, bmSteelDark, parent); // hoist cable
+      bBox(B, 'x', 6.6, 8.4, -0.9, 0.9, gy + MAST - 4.6, gy + MAST - 3.4, bmConcrete, parent); // hanging slab
+      bBox(B, 'z', -0.26, 0.26, -0.26, 0.26, gy + MAST + 2.1, gy + MAST + 2.6, bmBeaconRed, parent); // beacon
+    }
+
+    function buildCabinBox(B: any, gy = 0, parent?: THREE.Object3D) {
+      const hx = 2.1;
+      const hz = 1.6;
+      const T = 0.2;
+      const H = gy + 2.6;
+      const G = gy;
+      const L = -hx;
+      const R = hx;
+      const N = -hz;
+      const S = hz;
+      const iL = L + T;
+      const iR = R - T;
+      const iN = N + T;
+      const iS = S - T;
+      bWall(B, 'z', L, iL, N, S, G, H, holes([[-0.7, 0.7]], gy + 1.0, gy + 2.0), bmWhite, parent);
+      bWall(B, 'z', iR, R, N, S, G, H, holes([[-0.7, 0.7]], gy + 1.0, gy + 2.0), bmWhite, parent);
+      bWall(B, 'x', N, iN, L, R, G, H, [], bmWhite, parent);
+      bWall(B, 'x', iS, S, L, R, G, H, [{ a: -0.7, b: 0.7, sill: gy, head: gy + 1.9, glass: false }], bmWhite, parent);
+      bBox(B, 'x', N - 0.2, S + 0.2, L - 0.2, R + 0.2, H, H + 0.16, bmRoof, parent);
+      bBox(B, 'x', 0.3, 1.3, N + 0.1, N + 1.0, H + 0.16, H + 0.6, bmSteelDark, parent); // AC unit
+    }
+
+    function buildLighthouse(B: any, gy = 0, parent?: THREE.Object3D) {
+      const segs = [
+        { w: 1.55, h: 2.1, mat: bmWhite },
+        { w: 1.35, h: 2.1, mat: bmBandRed },
+        { w: 1.15, h: 2.1, mat: bmWhite },
+        { w: 0.98, h: 2.0, mat: bmBandRed },
+      ];
+      let y = gy;
+      for (const s of segs) {
+        bBox(B, 'z', -s.w, s.w, -s.w, s.w, y - 0.12, y + s.h, s.mat, parent);
+        y += s.h;
+      }
+      const GAL = y;
+      bBox(B, 'z', -1.72, 1.72, -1.72, 1.72, GAL, GAL + 0.3, bmSteelDark, parent); // gallery deck
+      bBox(B, 'z', -1.72, 1.72, 1.55, 1.72, GAL + 0.3, GAL + 1.15, bmSteelDark, parent); // gallery rail
+      bBox(B, 'z', -1.72, 1.72, -1.72, -1.55, GAL + 0.3, GAL + 1.15, bmSteelDark, parent);
+      bBox(B, 'x', -1.72, 1.72, 1.55, 1.72, GAL + 0.3, GAL + 1.15, bmSteelDark, parent);
+      bBox(B, 'x', -1.72, 1.72, -1.72, -1.55, GAL + 0.3, GAL + 1.15, bmSteelDark, parent);
+      bBox(B, 'z', -0.55, 0.55, -0.55, 0.55, GAL + 0.3, GAL + 1.85, bmLamp, parent); // the light
+      bBox(B, 'z', -0.95, 0.95, -0.95, 0.95, GAL + 1.85, GAL + 2.2, bmBandRed, parent); // lamp roof
+      bBox(B, 'z', -0.45, 0.45, -0.45, 0.45, GAL + 2.2, GAL + 2.7, bmBandRed, parent); // finial
+      // zig-zag stair winding up the south face — 0.42 m rise per step
+      // (under the 0.45 step-up) so the gallery is simply walkable.
+      const rise = 0.42;
+      const steps = Math.ceil((GAL - rise) / rise);
+      for (let i = 0; i < steps; i++) {
+        const side = i % 2 === 0 ? -1 : 1;
+        bBox(B, 'x', side * 0.85 - 0.34, side * 0.85 + 0.34, 1.55, 1.99, gy + i * rise, gy + (i + 1) * rise, bmPlankDark, parent);
+      }
+    }
+
+    // Half-built ship for the dry dock: keel, stepped hull sides,
+    // deck plate, cabin and funnel — chunky cover you can fight on.
+    function buildShip(cx: number, floorTop: number, cz: number, parent?: THREE.Object3D) {
+      bBox({ x: cx, z: cz, rot: 0 }, 'x', -7.5, 7.5, -0.65, 0.65, floorTop + 0.15, floorTop + 1.25, bmRust, parent); // keel
+      for (const s of [-1, 1]) {
+        bBox({ x: cx, z: cz, rot: 0 }, 'x', -7.2, 7.2, s * 1.2 - 0.55, s * 1.2 + 0.55, floorTop + 1.25, floorTop + 2.6, bmRust, parent);
+        bBox({ x: cx, z: cz, rot: 0 }, 'x', -7.2, 7.2, s * 2.75 - 0.55, s * 2.75 + 0.55, floorTop + 0.6, floorTop + 1.9, bmRust, parent);
+      }
+      bBox({ x: cx, z: cz, rot: 0 }, 'x', -7.4, 7.4, -3.1, 3.1, floorTop + 2.6, floorTop + 2.95, bmSteelDark, parent); // deck
+      bBox({ x: cx, z: cz, rot: 0 }, 'x', 6.0, 8.6, -2.1, 2.1, floorTop + 2.95, floorTop + 3.3, bmRust, parent); // bow
+      bBox({ x: cx, z: cz, rot: 0 }, 'x', 7.8, 9.6, -1.2, 1.2, floorTop + 2.6, floorTop + 2.95, bmRust, parent); // bow tip
+      bBox({ x: cx - 4.4, z: cz, rot: 0 }, 'z', -1.6, 1.6, -1.3, 1.3, floorTop + 2.95, floorTop + 5.25, bmWhite, parent); // cabin
+      bBox({ x: cx - 4.4, z: cz, rot: 0 }, 'z', -0.5, 0.5, -0.5, 0.5, floorTop + 5.25, floorTop + 7.1, bmWarnOrange, parent); // funnel
+      bBox({ x: cx + 1.5, z: cz, rot: 0 }, 'z', -1.1, 1.1, -1.1, 1.1, floorTop + 2.95, floorTop + 4.0, bmCrate, parent); // deck cargo
+    }
+
+    // Small moored boat beside the pier head — a swim-out platform.
+    function buildBoat(bx: number, bz: number, parent?: THREE.Object3D) {
+      bBox({ x: bx, z: bz, rot: 0 }, 'x', -2.8, 2.8, -1.0, 1.0, WATER_Y - 0.95, WATER_Y + 0.55, bmRust, parent); // hull
+      bBox({ x: bx + 2.8, z: bz, rot: 0 }, 'x', 0, 1.7, -0.75, 0.75, WATER_Y - 0.55, WATER_Y + 0.55, bmRust, parent); // bow
+      bBox({ x: bx + 4.5, z: bz, rot: 0 }, 'x', 0, 0.9, -0.45, 0.45, WATER_Y - 0.3, WATER_Y + 0.55, bmRust, parent); // bow tip
+      bBox({ x: bx - 1.9, z: bz, rot: 0 }, 'z', -0.95, 0.95, -0.85, 0.85, WATER_Y + 0.55, WATER_Y + 2.05, bmWhite, parent); // wheelhouse
+      bBox({ x: bx - 0.6, z: bz, rot: 0 }, 'x', -0.5, 0.5, -0.9, 0.9, WATER_Y + 0.55, WATER_Y + 0.95, bmCrate, parent); // deck cargo
     }
 
     const DESIGNS = [
@@ -4502,6 +5563,7 @@ export default function BattleRoyaleGame() {
       { kind: 'bunker', hx: 5, hz: 3.5, build: buildBunker },
       { kind: 'warehouse', hx: 7, hz: 5, build: buildWarehouse },
     ];
+
     const BUILDINGS: any[] = [];
     for (const d of DESIGNS) {
       const R = Math.max(d.hx, d.hz) + 3;
@@ -6460,6 +7522,7 @@ export default function BattleRoyaleGame() {
     // ----------------------------------------------------
     function update(dt: number) {
       streamTerrain();
+      streamPois();
       updateGrenadePress(dt);
       updateShield(dt);
       if (playerDown) {
@@ -6506,7 +7569,18 @@ export default function BattleRoyaleGame() {
 
     function frame() {
       const dt = Math.min(clock.getDelta(), 0.05);
-      if (running()) update(dt);
+      if (running()) {
+        try {
+          update(dt);
+        } catch (err) {
+          // Record and survive: a fault in one frame must not take the
+          // whole game down. __poiBuildErr logs the finer-grained cause.
+          console.error('frame error:', err);
+          const w = window as any;
+          w.__frameErr = w.__frameErr || [];
+          w.__frameErr.push(String((err as any)?.stack || err));
+        }
+      }
       applyView();
       updateCompass();
       updateTracker();
@@ -6862,8 +7936,13 @@ export default function BattleRoyaleGame() {
             <li>Cover fails eventually: blasts chew voxel holes through walls and crates, and bullets chip chunks off</li>
             <li>Structures have health: damage numbers pop, health bars show, and a gutted building collapses</li>
             <li>
-              Top compass points you around the map. In Harbor the <b>PIER</b>, <b>YARD</b>, <b>CRANE</b> and{' '}
-              <b>WHSE</b> chips show live distance — a chip pinned at the strip edge means turn that way
+              Top compass points you around the map. In Harbor the nearest landmarks ride the strip as chips with live distance — a chip pinned at the strip edge means turn that way
+            </li>
+            <li>
+              <b>Harbor is a procedural map.</b> The port owns the coast — pier, container yard, warehouses, gantry cranes, customs office, fuel tanks, a dry dock with a half-built ship, and a breakwater crowned by a climbable lighthouse. Every structure is destructible and the port holds the best loot
+            </li>
+            <li>
+              The rest of the map fills with POIs — <b>VILL</b>age, <b>FARM</b>, <b>FUEL</b> depot, construction <b>SITE</b> (tower crane!), <b>CAMP</b>, radio <b>MAST</b>, <b>RUIN</b>s, <b>OUTP</b>ost and <b>WATER</b> tower — each with loot and a compass chip. Guard towers and lighthouses have walkable stairs to the top
             </li>
             <li>
               <kbd>V</kbd> opens build mode with four pieces — <b>Wall</b>, <b>Door Wall</b>, <b>Floor</b> and{' '}
@@ -6894,7 +7973,7 @@ export default function BattleRoyaleGame() {
             <li>Tap GRENADE to arm, tap AIM to throw. Hold GRENADE and slide up to pick kind</li>
             <li>Tap WALL to arm build mode, then tap AIM to place. Double-tap WALL to cycle Wall, Door, Floor, Ramp</li>
             <li>Wade into the sea: you slow down, then swim. Hold crouch to dive, tap jump to stroke up</li>
-            <li>The top compass tracks PIER, YARD, CRANE and WHSE — edge-pinned chips show which way to turn</li>
+            <li>The top compass shows the nearest landmarks with distances — edge-pinned chips show which way to turn. Follow the port chips (PIER, YARD, DOCK, LIGHT) for the best loot</li>
             <li>Tap INVENTORY to purchase weapons, ammo and customize dummies</li>
           </ul>
           <button className="btn" id="btn" type="button">

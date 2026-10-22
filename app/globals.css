@@ -1573,6 +1573,28 @@ body:not(.touch) .touch-build { display: none; }
 .compass-mark.c-crane b { color: #9db8d6; }
 .compass-mark.c-whse { border-color: rgba(103, 232, 249, 0.55); }
 .compass-mark.c-whse b { color: #67e8f9; }
+.compass-mark.c-dock { border-color: rgba(163, 177, 138, 0.6); }
+.compass-mark.c-dock b { color: #a3b18a; }
+.compass-mark.c-light { border-color: rgba(252, 211, 77, 0.6); }
+.compass-mark.c-light b { color: #fcd34d; }
+.compass-mark.c-vill { border-color: rgba(224, 176, 137, 0.6); }
+.compass-mark.c-vill b { color: #e0b089; }
+.compass-mark.c-farm { border-color: rgba(200, 180, 94, 0.6); }
+.compass-mark.c-farm b { color: #c8b45e; }
+.compass-mark.c-fuel { border-color: rgba(224, 94, 94, 0.6); }
+.compass-mark.c-fuel b { color: #e05e5e; }
+.compass-mark.c-site { border-color: rgba(245, 162, 93, 0.6); }
+.compass-mark.c-site b { color: #f5a25d; }
+.compass-mark.c-camp { border-color: rgba(127, 196, 127, 0.6); }
+.compass-mark.c-camp b { color: #7fc47f; }
+.compass-mark.c-mast { border-color: rgba(180, 140, 224, 0.6); }
+.compass-mark.c-mast b { color: #b48ce0; }
+.compass-mark.c-ruin { border-color: rgba(168, 159, 148, 0.6); }
+.compass-mark.c-ruin b { color: #a89f94; }
+.compass-mark.c-outp { border-color: rgba(127, 178, 217, 0.6); }
+.compass-mark.c-outp b { color: #7fb2d9; }
+.compass-mark.c-tow { border-color: rgba(94, 207, 201, 0.6); }
+.compass-mark.c-tow b { color: #5ecfc9; }
 
 /* Off-screen landmarks go compact: label only, no distance row */
 .compass-mark.pinned {
