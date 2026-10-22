@@ -3882,9 +3882,28 @@ export default function BattleRoyaleGame() {
     }
 
     // Main menu & Character Pick
+    let character = 'bulwark';
     const modeBtns = Array.from(document.querySelectorAll('.mode')) as HTMLButtonElement[];
     const charBtns = Array.from(document.querySelectorAll('.char')) as HTMLButtonElement[];
+    const lobbyEnvBg = $('lobbyEnvBg');
+    const lobbyCharStage = $('lobbyCharStage');
+    const lobbyCharTag = $('lobbyCharTag');
     let selectedMode = 'range';
+
+    function updateLobbyScene(mode: string, char: string) {
+      if (lobbyEnvBg) {
+        lobbyEnvBg.setAttribute('data-mode', mode);
+        lobbyEnvBg.className = `lobby-env-bg mode-${mode}`;
+      }
+      if (lobbyCharStage) {
+        lobbyCharStage.setAttribute('data-char', char);
+      }
+      if (lobbyCharTag) {
+        const modeLabel = mode === 'harbor' ? 'HARBOR SHORE' : mode === 'quarry' ? 'QUARRY PITS' : 'FIRING RANGE';
+        const charLabel = char === 'barrage' ? 'BARRAGE' : 'BULWARK';
+        lobbyCharTag.textContent = `OPERATOR // ${charLabel} - FACING ${modeLabel}`;
+      }
+    }
 
     function pickOne(buttons: HTMLButtonElement[], chosen: HTMLButtonElement) {
       for (const b of buttons) b.setAttribute('aria-checked', String(b === chosen));
@@ -3895,6 +3914,7 @@ export default function BattleRoyaleGame() {
         if (b.disabled) return;
         selectedMode = b.dataset.mode || 'range';
         pickOne(modeBtns, b);
+        updateLobbyScene(selectedMode, character);
       })
     );
 
@@ -3903,8 +3923,11 @@ export default function BattleRoyaleGame() {
         pickOne(charBtns, b);
         character = b.dataset.char || 'bulwark';
         applyCharacter();
+        updateLobbyScene(selectedMode, character);
       })
     );
+
+    updateLobbyScene(selectedMode, character);
 
     function startGame() {
       if (selectedMode === 'harbor') enterHarbor();
@@ -4298,7 +4321,7 @@ export default function BattleRoyaleGame() {
     let shieldFlash = 0;
     let playerDown = false;
     let respawnT = 0;
-    let character = 'bulwark';
+    character = 'bulwark';
     const shieldMax = () => SHIELD_LEVELS[shieldLevel - 1];
 
     const raycaster = new THREE.Raycaster();
@@ -7846,17 +7869,314 @@ export default function BattleRoyaleGame() {
         <span className="tracker-tag" id="trackerTag" />
       </div>
 
-      {/* Main Menu */}
+      {/* Main Menu Lobby */}
       <div className="menu" id="menu" role="dialog" aria-modal="true" aria-labelledby="menuTitle">
+        {/* Dynamic Mode Environment Backdrop & Character Stage */}
+        <div className="lobby-viewport" id="lobbyViewport" aria-hidden="true">
+          <div className="lobby-env-bg mode-range" id="lobbyEnvBg" data-mode="range">
+            {/* Mode Shape 1: Test Range firing grid, bunker silhouette, and ballistic target lanes */}
+            <svg className="mode-shape mode-shape-range" viewBox="0 0 1200 800" preserveAspectRatio="xMidYMid slice">
+              <defs>
+                <linearGradient id="rangeSky" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor="#111827" />
+                  <stop offset="45%" stopColor="#1f293d" />
+                  <stop offset="70%" stopColor="#3d2d24" />
+                  <stop offset="100%" stopColor="#131720" />
+                </linearGradient>
+                <linearGradient id="rangeFloor" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor="#252b36" />
+                  <stop offset="50%" stopColor="#141922" />
+                  <stop offset="100%" stopColor="#0a0d13" />
+                </linearGradient>
+                <linearGradient id="targetGlow" x1="0" y1="0" x2="1" y2="1">
+                  <stop offset="0%" stopColor="#f59e0b" stopOpacity="0.8" />
+                  <stop offset="100%" stopColor="#ef4444" stopOpacity="0.2" />
+                </linearGradient>
+              </defs>
+              <rect width="1200" height="800" fill="url(#rangeSky)" />
+
+              {/* Distant mountain silhouette */}
+              <polygon points="0,520 180,440 340,490 520,410 740,470 960,390 1200,480 1200,800 0,800" fill="#141a24" />
+              <polygon points="0,540 220,480 460,530 680,460 910,510 1200,460 1200,800 0,800" fill="#192230" opacity="0.8" />
+
+              {/* Proving Ground Floor with Perspective Grid */}
+              <polygon points="120,530 1080,530 1200,800 0,800" fill="url(#rangeFloor)" />
+              {/* Ballistic firing lane guidelines */}
+              <line x1="600" y1="530" x2="600" y2="800" stroke="#f2a516" strokeWidth="2" strokeDasharray="12 8" opacity="0.6" />
+              <line x1="420" y1="530" x2="180" y2="800" stroke="#67e8f9" strokeWidth="1.5" strokeDasharray="10 8" opacity="0.4" />
+              <line x1="780" y1="530" x2="1020" y2="800" stroke="#67e8f9" strokeWidth="1.5" strokeDasharray="10 8" opacity="0.4" />
+              <line x1="280" y1="530" x2="-80" y2="800" stroke="rgba(255,255,255,0.15)" strokeWidth="1" />
+              <line x1="920" y1="530" x2="1280" y2="800" stroke="rgba(255,255,255,0.15)" strokeWidth="1" />
+
+              {/* Range Distance Markers & Silhouette Bunkers */}
+              {/* 200M line */}
+              <line x1="260" y1="560" x2="940" y2="560" stroke="#475569" strokeWidth="1.5" strokeDasharray="6 6" />
+              <text x="600" y="555" fill="#94a3b8" fontSize="13" fontWeight="800" textAnchor="middle" letterSpacing="3">--- 200M TARGET LINE ---</text>
+              {/* Distant targets */}
+              <rect x="470" y="525" width="22" height="32" rx="3" fill="#334155" />
+              <circle cx="481" cy="535" r="5" fill="#ef4444" opacity="0.8" />
+              <rect x="710" y="525" width="22" height="32" rx="3" fill="#334155" />
+              <circle cx="721" cy="535" r="5" fill="#ef4444" opacity="0.8" />
+
+              {/* 100M line with Voxel Wall Block */}
+              <line x1="190" y1="620" x2="1010" y2="620" stroke="#f2a516" strokeWidth="2" opacity="0.5" strokeDasharray="8 6" />
+              <text x="600" y="612" fill="#f2a516" fontSize="15" fontWeight="800" textAnchor="middle" letterSpacing="4">[ 100M DESTRUCTIBLE VOXEL WALL ]</text>
+              {/* Destructible Voxel Wall Silhouette */}
+              <g transform="translate(510, 565)">
+                <rect x="0" y="0" width="180" height="48" rx="4" fill="#384353" stroke="#526075" strokeWidth="2" />
+                {/* Voxel grid pattern representing the tessellated blocks */}
+                <line x1="36" y1="0" x2="36" y2="48" stroke="#252d38" strokeWidth="1.5" />
+                <line x1="72" y1="0" x2="72" y2="48" stroke="#252d38" strokeWidth="1.5" />
+                <line x1="108" y1="0" x2="108" y2="48" stroke="#252d38" strokeWidth="1.5" />
+                <line x1="144" y1="0" x2="144" y2="48" stroke="#252d38" strokeWidth="1.5" />
+                <line x1="0" y1="24" x2="180" y2="24" stroke="#252d38" strokeWidth="1.5" />
+                <rect x="55" y="10" width="70" height="28" rx="2" fill="rgba(242, 165, 22, 0.2)" stroke="#f2a516" strokeWidth="1" strokeDasharray="3 3" />
+                <text x="90" y="28" fill="#f2a516" fontSize="10" fontWeight="bold" textAnchor="middle">TEST TARGET</text>
+              </g>
+
+              {/* Tactical Range Reticles & Neon HUD Lines */}
+              <circle cx="600" cy="530" r="120" fill="none" stroke="#67e8f9" strokeWidth="1" opacity="0.25" strokeDasharray="4 8" />
+              <circle cx="600" cy="530" r="60" fill="none" stroke="#f2a516" strokeWidth="1.5" opacity="0.35" />
+              <line x1="600" y1="380" x2="600" y2="490" stroke="#f2a516" strokeWidth="1.5" opacity="0.4" />
+              <line x1="450" y1="530" x2="560" y2="530" stroke="#f2a516" strokeWidth="1.5" opacity="0.4" />
+              <line x1="640" y1="530" x2="750" y2="530" stroke="#f2a516" strokeWidth="1.5" opacity="0.4" />
+            </svg>
+
+            {/* Mode Shape 2: Harbor coastal bay, container gantry crane, pier, and lighthouse */}
+            <svg className="mode-shape mode-shape-harbor" viewBox="0 0 1200 800" preserveAspectRatio="xMidYMid slice">
+              <defs>
+                <linearGradient id="harborSky" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor="#08101e" />
+                  <stop offset="50%" stopColor="#12233b" />
+                  <stop offset="75%" stopColor="#223a59" />
+                  <stop offset="100%" stopColor="#0c1827" />
+                </linearGradient>
+                <linearGradient id="harborSea" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor="#0f263e" />
+                  <stop offset="60%" stopColor="#071728" />
+                  <stop offset="100%" stopColor="#030b14" />
+                </linearGradient>
+                <linearGradient id="lightBeam" x1="0" y1="0" x2="1" y2="0.6">
+                  <stop offset="0%" stopColor="#fef08a" stopOpacity="0.85" />
+                  <stop offset="60%" stopColor="#38bdf8" stopOpacity="0.25" />
+                  <stop offset="100%" stopColor="#38bdf8" stopOpacity="0" />
+                </linearGradient>
+              </defs>
+              <rect width="1200" height="800" fill="url(#harborSky)" />
+
+              {/* Sea Ocean Surface */}
+              <polygon points="0,480 1200,480 1200,800 0,800" fill="url(#harborSea)" />
+
+              {/* Animated wave lines */}
+              <g opacity="0.4" style={{ animation: 'wave-glide 6s ease-in-out infinite' }}>
+                <line x1="-50" y1="520" x2="1250" y2="520" stroke="#38bdf8" strokeWidth="2" strokeDasharray="35 25" />
+                <line x1="-30" y1="560" x2="1250" y2="560" stroke="#0ea5e9" strokeWidth="2" strokeDasharray="50 30" />
+                <line x1="-80" y1="610" x2="1250" y2="610" stroke="#67e8f9" strokeWidth="1.5" strokeDasharray="60 40" />
+                <line x1="-20" y1="680" x2="1250" y2="680" stroke="#38bdf8" strokeWidth="2" strokeDasharray="70 50" />
+              </g>
+
+              {/* Breakwater Rock Jetty and Lighthouse (Right Side) */}
+              <polygon points="860,510 1020,470 1200,475 1200,560 840,550" fill="#15202e" />
+              {/* Lighthouse tower */}
+              <polygon points="1060,470 1090,470 1084,330 1066,330" fill="#e2e8f0" stroke="#334155" strokeWidth="2" />
+              {/* Red bands on lighthouse */}
+              <polygon points="1064,360 1086,360 1083,390 1067,390" fill="#e11d2e" />
+              <polygon points="1062,420 1088,420 1087,445 1061,445" fill="#e11d2e" />
+              {/* Lighthouse Lantern Top */}
+              <rect x="1065" y="315" width="20" height="15" rx="3" fill="#fef08a" />
+              <polygon points="1060,315 1090,315 1075,295" fill="#1e293b" />
+              {/* Sweeping Lighthouse Light Beam */}
+              <polygon points="1075,322 0,220 0,440" fill="url(#lightBeam)" style={{ transformOrigin: '1075px 322px', animation: 'lighthouse-sweep 7s ease-in-out infinite' }} />
+
+              {/* Massive Container Gantry Crane Silhouette (Left Side) */}
+              <g transform="translate(140, 240)">
+                {/* Legs */}
+                <polygon points="20,290 35,290 70,50 55,50" fill="#e11d2e" opacity="0.9" />
+                <polygon points="180,290 165,290 130,50 145,50" fill="#e11d2e" opacity="0.9" />
+                {/* Cross beams & truss */}
+                <line x1="30" y1="210" x2="170" y2="210" stroke="#e11d2e" strokeWidth="6" />
+                <line x1="45" y1="130" x2="155" y2="130" stroke="#e11d2e" strokeWidth="6" />
+                <line x1="30" y1="210" x2="155" y2="130" stroke="#cbd5e1" strokeWidth="2.5" />
+                <line x1="170" y1="210" x2="45" y2="130" stroke="#cbd5e1" strokeWidth="2.5" />
+                {/* Overhead boom cantilever */}
+                <rect x="-40" y="38" width="310" height="18" fill="#e11d2e" />
+                <polygon points="50,38 100,-25 150,38" fill="none" stroke="#e11d2e" strokeWidth="5" />
+                <line x1="100" y1="-25" x2="-35" y2="38" stroke="#94a3b8" strokeWidth="2" />
+                <line x1="100" y1="-25" x2="265" y2="38" stroke="#94a3b8" strokeWidth="2" />
+                {/* Trolley and hoisting cables */}
+                <rect x="180" y="56" width="26" height="14" fill="#0f172a" />
+                <line x1="188" y1="70" x2="188" y2="130" stroke="#f2a516" strokeWidth="1.5" />
+                <line x1="198" y1="70" x2="198" y2="130" stroke="#f2a516" strokeWidth="1.5" />
+                {/* Suspended Shipping Container */}
+                <rect x="175" y="130" width="56" height="26" rx="2" fill="#0284c7" stroke="#38bdf8" strokeWidth="1.5" />
+              </g>
+
+              {/* The Pier Deck Extending Out to Sea (Center) */}
+              <polygon points="520,500 680,500 780,800 420,800" fill="#2d3748" />
+              {/* Pier timber planks */}
+              <line x1="510" y1="520" x2="690" y2="520" stroke="#1a202c" strokeWidth="3" />
+              <line x1="495" y1="550" x2="705" y2="550" stroke="#1a202c" strokeWidth="3" />
+              <line x1="480" y1="585" x2="720" y2="585" stroke="#1a202c" strokeWidth="3.5" />
+              <line x1="460" y1="630" x2="740" y2="630" stroke="#1a202c" strokeWidth="4" />
+              <line x1="440" y1="685" x2="760" y2="685" stroke="#1a202c" strokeWidth="4.5" />
+
+              {/* Shipping Container Stacks along Quay */}
+              <g transform="translate(340, 480)">
+                <rect x="0" y="0" width="60" height="26" rx="2" fill="#ea580c" stroke="#fb923c" strokeWidth="1.5" />
+                <rect x="6" y="-26" width="60" height="26" rx="2" fill="#2563eb" stroke="#60a5fa" strokeWidth="1.5" />
+              </g>
+              <g transform="translate(690, 485)">
+                <rect x="0" y="0" width="60" height="26" rx="2" fill="#16a34a" stroke="#4ade80" strokeWidth="1.5" />
+                <rect x="5" y="-26" width="60" height="26" rx="2" fill="#dc2626" stroke="#f87171" strokeWidth="1.5" />
+              </g>
+
+              {/* Cargo Vessel on Horizon */}
+              <g transform="translate(490, 455)" opacity="0.85">
+                <polygon points="0,25 30,5 170,5 190,25" fill="#0f172a" />
+                <rect x="135" y="-15" width="25" height="20" fill="#334155" />
+                <rect x="145" y="-24" width="6" height="10" fill="#e11d2e" />
+                <rect x="35" y="-4" width="90" height="10" fill="#d97706" />
+              </g>
+            </svg>
+          </div>
+
+          {/* Chosen Character Shown Facing The Background (Back turned to player, looking ahead into arena) */}
+          <div className="lobby-character-stage" id="lobbyCharStage" data-char="bulwark">
+            {/* The character figure SVG */}
+            <svg className="lobby-character-figure" viewBox="0 0 200 320" aria-label="Character facing the arena">
+              {/* ================= BULWARK (Rear View Facing Ahead) ================= */}
+              <g className="char-back-view char-back-bulwark">
+                {/* Heavy Combat Boots & Greaves */}
+                <path d="M 62 270 L 82 270 L 86 312 L 56 312 Z" fill="#1e293b" stroke="#334155" strokeWidth="2" />
+                <path d="M 118 270 L 138 270 L 144 312 L 114 312 Z" fill="#1e293b" stroke="#334155" strokeWidth="2" />
+                {/* Armored Legs */}
+                <path d="M 68 200 L 92 200 L 88 272 L 64 272 Z" fill="#334155" stroke="#1e293b" strokeWidth="2" />
+                <path d="M 108 200 L 132 200 L 136 272 L 112 272 Z" fill="#334155" stroke="#1e293b" strokeWidth="2" />
+                {/* Utility Pouches & Holsters */}
+                <rect x="52" y="210" width="14" height="22" rx="3" fill="#1e293b" stroke="#475569" strokeWidth="1.5" />
+                <rect x="134" y="212" width="14" height="24" rx="3" fill="#1e293b" stroke="#475569" strokeWidth="1.5" />
+
+                {/* Tactical Belt */}
+                <rect x="62" y="185" width="76" height="16" rx="4" fill="#0f172a" stroke="#475569" strokeWidth="2" />
+                <rect x="94" y="187" width="12" height="12" rx="2" fill="#67e8f9" opacity="0.8" />
+
+                {/* Armored Torso Plate (Viewed From Behind) */}
+                <path d="M 54 90 L 146 90 L 136 186 L 64 186 Z" fill="#1e293b" stroke="#334155" strokeWidth="2.5" />
+                {/* Spine Reinforcement Ridge */}
+                <rect x="95" y="98" width="10" height="78" rx="4" fill="#0f172a" stroke="#67e8f9" strokeWidth="1.5" />
+                <circle cx="100" cy="110" r="2.5" fill="#67e8f9" className="pulse-cyan" />
+                <circle cx="100" cy="130" r="2.5" fill="#67e8f9" className="pulse-cyan" />
+                <circle cx="100" cy="150" r="2.5" fill="#67e8f9" className="pulse-cyan" />
+
+                {/* Shoulders & Pauldrons */}
+                <path d="M 38 92 L 64 88 L 60 140 L 36 130 Z" fill="#334155" stroke="#1e293b" strokeWidth="2" />
+                <path d="M 162 92 L 136 88 L 140 140 L 164 130 Z" fill="#334155" stroke="#1e293b" strokeWidth="2" />
+
+                {/* Bulwark's Backpack Minigun Turret Unit (Folded on Right Shoulder) */}
+                <g transform="translate(125, 52)">
+                  {/* Turret Mounting Swivel & Arm */}
+                  <rect x="0" y="30" width="22" height="20" rx="4" fill="#0f172a" stroke="#475569" strokeWidth="2" />
+                  {/* Rotary Barrels Pointing Forward into Horizon */}
+                  <rect x="8" y="-12" width="6" height="44" rx="2" fill="#475569" stroke="#64748b" strokeWidth="1" />
+                  <rect x="18" y="-10" width="6" height="42" rx="2" fill="#475569" stroke="#64748b" strokeWidth="1" />
+                  <ellipse cx="16" cy="-12" rx="10" ry="4" fill="#0f172a" stroke="#67e8f9" strokeWidth="1.5" />
+                  {/* Energy Conduit with Cyan Glow */}
+                  <path d="M 4 45 Q -10 60 -25 55" fill="none" stroke="#67e8f9" strokeWidth="3" className="pulse-cyan" />
+                </g>
+
+                {/* Left Shoulder Shield Emitter Pylon */}
+                <g transform="translate(48, 65)">
+                  <polygon points="0,20 16,0 24,10 8,30" fill="#0f172a" stroke="#67e8f9" strokeWidth="2" />
+                  <circle cx="12" cy="15" r="4" fill="#67e8f9" className="pulse-cyan" />
+                </g>
+
+                {/* Combat Helmet (Seen From Behind, Facing Forward into Horizon) */}
+                <ellipse cx="100" cy="62" rx="24" ry="26" fill="#1e293b" stroke="#334155" strokeWidth="2.5" />
+                {/* Helmet Spine & Neck Shield */}
+                <path d="M 88 78 L 112 78 L 108 92 L 92 92 Z" fill="#0f172a" stroke="#334155" strokeWidth="1.5" />
+                <rect x="97" y="44" width="6" height="28" rx="2" fill="#475569" />
+                {/* Comms Antenna */}
+                <line x1="82" y1="60" x2="76" y2="35" stroke="#94a3b8" strokeWidth="2" />
+                <circle cx="76" cy="35" r="2" fill="#67e8f9" className="pulse-cyan" />
+                {/* Forward Visor Glow Reflection Casting Light Forward */}
+                <ellipse cx="100" cy="40" rx="18" ry="6" fill="#67e8f9" opacity="0.35" className="pulse-cyan" />
+              </g>
+
+              {/* ================= BARRAGE (Rear View Facing Ahead) ================= */}
+              <g className="char-back-view char-back-barrage">
+                {/* Heavy Demolition Combat Boots */}
+                <path d="M 62 270 L 82 270 L 86 312 L 56 312 Z" fill="#1c1917" stroke="#44403c" strokeWidth="2" />
+                <path d="M 118 270 L 138 270 L 144 312 L 114 312 Z" fill="#1c1917" stroke="#44403c" strokeWidth="2" />
+                {/* Armored Blast Legs */}
+                <path d="M 68 200 L 92 200 L 88 272 L 64 272 Z" fill="#292524" stroke="#44403c" strokeWidth="2" />
+                <path d="M 108 200 L 132 200 L 136 272 L 112 272 Z" fill="#292524" stroke="#44403c" strokeWidth="2" />
+
+                {/* Demolition Utility Belt with Grenade Canisters */}
+                <rect x="58" y="185" width="84" height="18" rx="4" fill="#0c0a09" stroke="#f59e0b" strokeWidth="2" />
+                <rect x="65" y="187" width="10" height="14" rx="2" fill="#f59e0b" />
+                <rect x="80" y="187" width="10" height="14" rx="2" fill="#f59e0b" />
+                <rect x="110" y="187" width="10" height="14" rx="2" fill="#f59e0b" />
+                <rect x="125" y="187" width="10" height="14" rx="2" fill="#f59e0b" />
+
+                {/* Heavy Blast Carrier Vest */}
+                <path d="M 52 90 L 148 90 L 138 186 L 62 186 Z" fill="#292524" stroke="#44403c" strokeWidth="2.5" />
+                {/* Yellow Hazard Stripes Across Back */}
+                <path d="M 68 115 L 132 115 L 128 135 L 72 135 Z" fill="#f59e0b" />
+                <polygon points="76,115 88,115 78,135 66,135" fill="#1c1917" />
+                <polygon points="96,115 108,115 98,135 86,135" fill="#1c1917" />
+                <polygon points="116,115 128,115 118,135 106,135" fill="#1c1917" />
+
+                {/* Slung Twin Heavy Mortar Tubes Cross-Mounted on Back */}
+                <g transform="translate(62, 50) rotate(-28)">
+                  <rect x="0" y="-15" width="18" height="110" rx="5" fill="#1c1917" stroke="#78716c" strokeWidth="2" />
+                  <ellipse cx="9" cy="-15" rx="9" ry="4" fill="#f59e0b" />
+                  <line x1="0" y1="20" x2="18" y2="20" stroke="#f59e0b" strokeWidth="2" />
+                  <line x1="0" y1="50" x2="18" y2="50" stroke="#f59e0b" strokeWidth="2" />
+                </g>
+                <g transform="translate(138, 50) rotate(28)">
+                  <rect x="-18" y="-15" width="18" height="110" rx="5" fill="#1c1917" stroke="#78716c" strokeWidth="2" />
+                  <ellipse cx="-9" cy="-15" rx="9" ry="4" fill="#f59e0b" />
+                  <line x1="-18" y1="20" x2="0" y2="20" stroke="#f59e0b" strokeWidth="2" />
+                  <line x1="-18" y1="50" x2="0" y2="50" stroke="#f59e0b" strokeWidth="2" />
+                </g>
+
+                {/* Thermal Exhaust Vent (Glowing Amber Pulse) */}
+                <circle cx="100" cy="160" r="8" fill="#f59e0b" className="pulse-amber" />
+                <circle cx="100" cy="160" r="4" fill="#fff" />
+
+                {/* Shoulders */}
+                <path d="M 36 94 L 62 90 L 58 140 L 34 130 Z" fill="#44403c" stroke="#1c1917" strokeWidth="2" />
+                <path d="M 164 94 L 138 90 L 142 140 L 166 130 Z" fill="#44403c" stroke="#1c1917" strokeWidth="2" />
+
+                {/* Blast Helmet (Rear View, Looking Forward Ahead) */}
+                <ellipse cx="100" cy="62" rx="25" ry="26" fill="#292524" stroke="#f59e0b" strokeWidth="2" />
+                <path d="M 86 78 L 114 78 L 110 94 L 90 94 Z" fill="#1c1917" stroke="#44403c" strokeWidth="1.5" />
+                {/* Amber Visor Forward Projection */}
+                <ellipse cx="100" cy="40" rx="18" ry="6" fill="#f59e0b" opacity="0.4" className="pulse-amber" />
+              </g>
+            </svg>
+
+            {/* Glowing Deployment Pedestal */}
+            <div className="lobby-pedestal">
+              <div className="lobby-pedestal-ring" />
+              <div className="lobby-char-facing-tag" id="lobbyCharTag">
+                OPERATOR // BULWARK - FACING FIRING RANGE
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* Floating Glassmorphic HUD & Menu Cards */}
         <div className="menu-card">
           <div className="menu-head">
-            <div className="eyebrow">Main menu</div>
+            <div className="eyebrow">Tactical Deployment</div>
             <h1 id="menuTitle">Battle Royale FPS</h1>
           </div>
           <div className="menu-body">
+            {/* Character Selection (Glass Buttons) */}
             <section className="menu-side" aria-labelledby="charLabel">
               <h2 className="menu-label" id="charLabel">
-                Character
+                Operator Selection
               </h2>
               <div className="chars" role="radiogroup" aria-labelledby="charLabel">
                 <button className="char" type="button" role="radio" aria-checked="true" data-char="bulwark">
@@ -7867,8 +8187,10 @@ export default function BattleRoyaleGame() {
                     <rect className="ic-barrel" x="58" y="45" width="30" height="9" rx="3" />
                     <circle className="ic-glow" cx="40" cy="55" r="3.5" />
                   </svg>
-                  <span className="char-name">Bulwark</span>
-                  <span className="char-role">Turret specialist</span>
+                  <div className="char-info">
+                    <span className="char-name">Bulwark</span>
+                    <span className="char-role">Deployable Turret Rig</span>
+                  </div>
                 </button>
                 <button className="char" type="button" role="radio" aria-checked="false" data-char="barrage">
                   <svg className="char-art" viewBox="0 0 96 96" aria-hidden="true">
@@ -7879,31 +8201,35 @@ export default function BattleRoyaleGame() {
                     <circle className="ic-ring-warn" cx="74" cy="28" r="11" />
                     <circle className="ic-warn" cx="74" cy="28" r="4.5" />
                   </svg>
-                  <span className="char-name">Barrage</span>
-                  <span className="char-role">Bombardment, no grenade limit</span>
+                  <div className="char-info">
+                    <span className="char-name">Barrage</span>
+                    <span className="char-role">Artillery Bombardment</span>
+                  </div>
                 </button>
               </div>
             </section>
+
+            {/* Mode Selection (Glass Buttons) & Big Glass Play CTA */}
             <section className="menu-main" aria-labelledby="modeLabel">
               <h2 className="menu-label" id="modeLabel">
-                Mode
+                Environment / Map
               </h2>
               <div className="modes" role="radiogroup" aria-labelledby="modeLabel">
                 <button className="mode" type="button" role="radio" aria-checked="true" data-mode="range">
                   <span className="mode-name">Test range</span>
-                  <span className="mode-tag">Ready</span>
+                  <span className="mode-tag">Proving Ground</span>
                 </button>
                 <button className="mode" type="button" role="radio" aria-checked="false" data-mode="harbor">
                   <span className="mode-name">Harbor</span>
-                  <span className="mode-tag">Ready</span>
+                  <span className="mode-tag">Naval Basin</span>
                 </button>
                 <button className="mode" type="button" role="radio" aria-checked="false" data-mode="quarry" disabled>
                   <span className="mode-name">Quarry</span>
-                  <span className="mode-tag">Coming soon</span>
+                  <span className="mode-tag">Locked</span>
                 </button>
               </div>
               <button className="btn play" id="play" type="button">
-                Play
+                Deploy
               </button>
             </section>
           </div>
