@@ -11,6 +11,7 @@ import {
   calculateStructureDamage,
   calculateVoxelImpulse,
   isCoverBlocked,
+  segmentIntersectsBox,
   LEVEL_COST,
   MAX_LEVEL,
 } from '@/lib/game-math';
@@ -263,11 +264,15 @@ export default function BattleRoyaleGame() {
     }
 
     function fbm(x: number, z: number, s: number) {
+      return fbmOct(x, z, s, 4);
+    }
+
+    function fbmOct(x: number, z: number, s: number, oct: number) {
       let sum = 0;
       let amp = 1;
       let norm = 0;
       let fq = 1;
-      for (let o = 0; o < 4; o++) {
+      for (let o = 0; o < oct; o++) {
         sum += amp * gradNoise(x * fq, z * fq, s + o * 31);
         norm += amp;
         amp *= 0.5;
@@ -276,7 +281,46 @@ export default function BattleRoyaleGame() {
       return sum / norm;
     }
 
-    const TERRAIN_HEIGHT = 24;
+    // ----------------------------------------------------
+    // Biomes. Two slow noise fields partition the map into
+    // five biomes: bf ("biome field") decides the big land
+    // bands — ridged mountain ranges where it bulges, lake
+    // basins where it dips — and mf (moisture) splits the
+    // remaining land: wet lowlands become jungle, moderate
+    // bands become forest, dry bands stay open grassland.
+    // The five weights always sum to 1 so height, tile
+    // coloring and vegetation placement all agree.
+    // ----------------------------------------------------
+    interface BiomeW {
+      mw: number; // mountain
+      lw: number; // lake
+      jw: number; // jungle
+      fw: number; // forest
+      gw: number; // grassland
+    }
+    const BIO_SPAN = 430;
+    const MOIST_SPAN = 310;
+    function biomeWeights(x: number, z: number, out: BiomeW) {
+      const bf = fbmOct(x / BIO_SPAN, z / BIO_SPAN, terrainSeed + 900, 3);
+      const mf = fbmOct(x / MOIST_SPAN, z / MOIST_SPAN, terrainSeed + 1300, 2);
+      // fbm stays within roughly +/-0.4, so the windows sit inside that
+      // range: mountains own ~14% of the map, lake basins ~10%.
+      const mw = THREE.MathUtils.smoothstep(bf, 0.12, 0.26);
+      const lw = THREE.MathUtils.smoothstep(-bf, 0.12, 0.24);
+      const rest = Math.max(0, 1 - mw - lw);
+      const wet = THREE.MathUtils.smoothstep(mf, 0.1, 0.3); // jungle
+      const forested = THREE.MathUtils.smoothstep(mf, -0.06, 0.14); // forest
+      out.mw = mw;
+      out.lw = lw;
+      out.jw = rest * wet;
+      out.fw = rest * (1 - wet) * forested;
+      out.gw = rest * (1 - wet) * (1 - forested);
+    }
+    const BW: BiomeW = { mw: 0, lw: 0, jw: 0, fw: 0, gw: 0 }; // terrainHeight scratch
+    const CW: BiomeW = { mw: 0, lw: 0, jw: 0, fw: 0, gw: 0 }; // tile color scratch
+    const VW: BiomeW = { mw: 0, lw: 0, jw: 0, fw: 0, gw: 0 }; // vegetation scratch
+
+    const TERRAIN_HEIGHT = 30;
     const TERRAIN_SPAN = 130;
     const TERRAIN_LIFT = 11;
     const TILE = 125;
@@ -315,9 +359,29 @@ export default function BattleRoyaleGame() {
       return base + SEA_WARP * fbm(x / SEA_SPAN, z / SEA_SPAN, terrainSeed + 500);
     }
 
+    const MOUNT_LIFT = 26; // pedestal the ridges stand on
+    const MOUNT_PEAK = 62; // crest height above the pedestal
+    const LAKE_DEPTH = 6.2; // lake beds sink this far below WATER_Y
+
     function terrainHeight(x: number, z: number) {
       const keep = THREE.MathUtils.smoothstep(Math.hypot(x - HARBOR_SPAWN.x, z - HARBOR_SPAWN.z), 8, 60);
-      let land = keep * Math.max(0.3, TERRAIN_LIFT + TERRAIN_HEIGHT * fbm(x / TERRAIN_SPAN, z / TERRAIN_SPAN, terrainSeed));
+      biomeWeights(x, z, BW);
+      // Base rolling land — rougher than before, plus a fine detail
+      // octave so the ground reads craggy up close.
+      let raw =
+        TERRAIN_LIFT +
+        TERRAIN_HEIGHT * fbm(x / TERRAIN_SPAN, z / TERRAIN_SPAN, terrainSeed) +
+        1.9 * gradNoise(x / 27, z / 27, terrainSeed + 55);
+      raw *= 1 - 0.32 * BW.jw; // jungle basins settle into flat lowland
+      if (BW.mw > 0.002) {
+        // Ridged ranges: crests follow the noise's zero-crossings,
+        // squared so the peaks stand out sharply from the valleys.
+        const ridge = Math.max(0, 1 - 1.45 * Math.abs(fbm(x / 92, z / 92, terrainSeed + 77)));
+        raw += BW.mw * (MOUNT_LIFT + MOUNT_PEAK * ridge * ridge);
+      }
+      let land = keep * Math.max(0.3, raw);
+      const lwe = BW.lw * keep; // lakes never swallow the spawn pad
+      if (lwe > 0.002) land += (WATER_Y - LAKE_DEPTH * (1 + 0.5 * BW.jw) - land) * lwe;
       // POI pads: blend the raw landscape toward each registered base
       // height so structures sit level without floating or burying.
       for (const f of flatZones) {
@@ -393,11 +457,17 @@ export default function BattleRoyaleGame() {
     }
 
     const terrainMat = new THREE.MeshLambertMaterial({ vertexColors: true });
-    const TILE_LOW = new THREE.Color(0x557d42);
-    const TILE_HIGH = new THREE.Color(0x9a9a86);
+    // Biome palette for the terrain tiles — mixed per-vertex by the
+    // biome weights, then overridden by rock/snow/sand rules.
+    const TILE_GRASS = new THREE.Color(0x7fa050);
+    const TILE_FOREST = new THREE.Color(0x47743a);
+    const TILE_JUNGLE = new THREE.Color(0x2f7d3a);
+    const TILE_ROCK = new THREE.Color(0x8d8a80);
+    const TILE_LAKEBED = new THREE.Color(0xc9b47e);
+    const TILE_SNOW = new THREE.Color(0xeef3f6);
     const TILE_SAND = new THREE.Color(0xd8c48f);
     const TILE_DEEP = new THREE.Color(0x2f5d70);
-    const tiles = new Map<string, { mesh: THREE.Mesh; cx: number; cz: number }>();
+    const tiles = new Map<string, { mesh: THREE.Mesh; cx: number; cz: number; veg?: THREE.Mesh | null; vegSolids?: SolidBox[] }>();
 
     const seaMesh = new THREE.Mesh(
       new THREE.PlaneGeometry(2 * (HARBOR_HALF + TERRAIN_MARGIN), 2 * (HARBOR_HALF + TERRAIN_MARGIN)),
@@ -433,9 +503,33 @@ export default function BattleRoyaleGame() {
           const len = Math.hypot(dx, 1, dz);
           pos.set([x0 + i * TILE_STEP, h, z0 + j * TILE_STEP], k * 3);
           nor.set([-dx / len, 1 / len, -dz / len], k * 3);
-          c.copy(TILE_LOW).lerp(TILE_HIGH, THREE.MathUtils.clamp((h + 6) / 22, 0, 1));
-          const coast = 1 - THREE.MathUtils.smoothstep(Math.abs(seaDist(x0 + i * TILE_STEP, z0 + j * TILE_STEP)), 12, 60);
+          const vx = x0 + i * TILE_STEP;
+          const vz = z0 + j * TILE_STEP;
+          biomeWeights(vx, vz, CW);
+          // Convex biome mix (the five weights sum to 1)
+          let cr = CW.gw * TILE_GRASS.r + CW.fw * TILE_FOREST.r + CW.jw * TILE_JUNGLE.r + CW.mw * TILE_ROCK.r + CW.lw * TILE_LAKEBED.r;
+          let cg = CW.gw * TILE_GRASS.g + CW.fw * TILE_FOREST.g + CW.jw * TILE_JUNGLE.g + CW.mw * TILE_ROCK.g + CW.lw * TILE_LAKEBED.g;
+          let cb = CW.gw * TILE_GRASS.b + CW.fw * TILE_FOREST.b + CW.jw * TILE_JUNGLE.b + CW.mw * TILE_ROCK.b + CW.lw * TILE_LAKEBED.b;
+          // Stony above the treeline and on steep faces (cliffs stay rock
+          // even inside forest / jungle)
+          const stony = Math.max(
+            THREE.MathUtils.smoothstep(h, 30, 52),
+            THREE.MathUtils.smoothstep(Math.hypot(dx, dz), 1.05, 1.8)
+          );
+          cr += (TILE_ROCK.r - cr) * stony;
+          cg += (TILE_ROCK.g - cg) * stony;
+          cb += (TILE_ROCK.b - cb) * stony;
+          // Snowcaps on the high peaks
+          const snow = THREE.MathUtils.smoothstep(h, 60, 72);
+          cr += (TILE_SNOW.r - cr) * snow;
+          cg += (TILE_SNOW.g - cg) * snow;
+          cb += (TILE_SNOW.b - cb) * snow;
+          c.setRGB(cr, cg, cb);
+          const coast = 1 - THREE.MathUtils.smoothstep(Math.abs(seaDist(vx, vz)), 12, 60);
           c.lerp(TILE_SAND, coast);
+          // Sandy ring around lake shorelines, just above the waterline
+          const lshore = CW.lw * THREE.MathUtils.smoothstep(h - WATER_Y, 0.35, 1.7);
+          if (lshore > 0.01) c.lerp(TILE_SAND, Math.min(0.85, lshore));
           c.lerp(TILE_DEEP, THREE.MathUtils.clamp((WATER_Y - h) / 3, 0, 1));
           col.set([c.r, c.g, c.b], k * 3);
         }
@@ -464,7 +558,33 @@ export default function BattleRoyaleGame() {
     function addTile(tx: number, tz: number) {
       const mesh = buildTile(tx, tz);
       scene.add(mesh);
-      tiles.set(tx + ',' + tz, { mesh, cx: (tx + 0.5) * TILE, cz: (tz + 0.5) * TILE });
+      // Tile-local vegetation: one merged, vertex-colored mesh plus the
+      // trunk/boulder collision boxes, seeded per tile so a revisited
+      // tile regrows the exact same stand.
+      const veg = terrainOn ? buildVegTile(tx, tz) : null;
+      if (veg?.mesh) scene.add(veg.mesh);
+      tiles.set(tx + ',' + tz, {
+        mesh,
+        cx: (tx + 0.5) * TILE,
+        cz: (tz + 0.5) * TILE,
+        veg: veg?.mesh ?? null,
+        vegSolids: veg?.solidRefs ?? [],
+      });
+    }
+
+    function disposeTile(t: { mesh: THREE.Mesh; veg?: THREE.Mesh | null; vegSolids?: SolidBox[] }) {
+      scene.remove(t.mesh);
+      t.mesh.geometry.dispose();
+      if (t.veg) {
+        scene.remove(t.veg);
+        t.veg.geometry.dispose();
+      }
+      for (const s of t.vegSolids ?? []) {
+        let i = solids.indexOf(s);
+        if (i >= 0) solids.splice(i, 1);
+        i = vegSolids.indexOf(s);
+        if (i >= 0) vegSolids.splice(i, 1);
+      }
     }
 
     function streamTerrain(all = false) {
@@ -490,11 +610,424 @@ export default function BattleRoyaleGame() {
       for (let i = 0; i < count; i++) addTile(want[i].tx, want[i].tz);
       for (const [key, t] of tiles) {
         if (Math.hypot(t.cx - px, t.cz - pz) > LOAD_R + TILE) {
-          scene.remove(t.mesh);
-          t.mesh.geometry.dispose();
+          disposeTile(t);
           tiles.delete(key);
         }
       }
+    }
+
+    // ----------------------------------------------------
+    // Procedural vegetation placer (Harbor mode).
+    // Every streamed terrain tile scatters biome-appropriate
+    // plants, merged into ONE vertex-colored mesh per tile:
+    // pine stands in the forest, kapoks + palms + ferns in the
+    // jungle, acacias + dry tufts in the grassland, boulders +
+    // spruces + snowline rocks in the mountains, reeds + dead
+    // trees around the lakes. Tree trunks and big boulders
+    // register real AABB collision — they block movement, soak
+    // bullets (with a wood thunk) and intercept grenade blasts,
+    // so forests play like forests: hard to shoot through, good
+    // to hide in. Bushes, ferns, tufts and reeds are pure
+    // scenery. Placement is seeded per tile, so a revisited
+    // tile regrows the exact same stand.
+    // ----------------------------------------------------
+    interface VegDef {
+      pos: Float32Array;
+      nor: Float32Array;
+      col: Float32Array;
+    }
+    let vegLib: Record<string, VegDef> | null = null;
+    const vegSolids: SolidBox[] = [];
+    const vegMat = new THREE.MeshLambertMaterial({ vertexColors: true });
+
+    function vegMat4(x: number, y: number, z: number, rx = 0, ry = 0, sx = 1, sy = 1, sz = 1) {
+      return new THREE.Matrix4().compose(
+        new THREE.Vector3(x, y, z),
+        new THREE.Quaternion().setFromEuler(new THREE.Euler(rx, ry, 0)),
+        new THREE.Vector3(sx, sy, sz)
+      );
+    }
+
+    // Merge primitive parts (already transformed, each with a flat
+    // color) into one baked definition the stamping loop copies from.
+    function vegMerge(parts: Array<{ geo: THREE.BufferGeometry; mat: THREE.Matrix4; color: number }>): VegDef {
+      let count = 0;
+      const prepped = parts.map((p) => {
+        const g = p.geo.index ? p.geo.toNonIndexed() : p.geo;
+        count += (g.getAttribute('position') as THREE.BufferAttribute).count;
+        return { g, mat: p.mat, color: p.color };
+      });
+      const pos = new Float32Array(count * 3);
+      const nor = new Float32Array(count * 3);
+      const col = new Float32Array(count * 3);
+      const v = new THREE.Vector3();
+      const nm = new THREE.Matrix3();
+      const c = new THREE.Color();
+      let o = 0;
+      for (const p of prepped) {
+        const pa = p.g.getAttribute('position') as THREE.BufferAttribute;
+        const na = p.g.getAttribute('normal') as THREE.BufferAttribute;
+        nm.getNormalMatrix(p.mat);
+        c.setHex(p.color);
+        for (let i = 0; i < pa.count; i++, o++) {
+          v.fromBufferAttribute(pa, i).applyMatrix4(p.mat);
+          pos[o * 3] = v.x;
+          pos[o * 3 + 1] = v.y;
+          pos[o * 3 + 2] = v.z;
+          v.fromBufferAttribute(na, i).applyMatrix3(nm).normalize();
+          nor[o * 3] = v.x;
+          nor[o * 3 + 1] = v.y;
+          nor[o * 3 + 2] = v.z;
+          col[o * 3] = c.r;
+          col[o * 3 + 1] = c.g;
+          col[o * 3 + 2] = c.b;
+        }
+      }
+      for (let i = 0; i < parts.length; i++) {
+        parts[i].geo.dispose();
+        if (prepped[i].g !== parts[i].geo) prepped[i].g.dispose();
+      }
+      return { pos, nor, col };
+    }
+
+    function buildVegLib() {
+      if (vegLib) return;
+      const lib: Record<string, VegDef> = {};
+      const P = (
+        geo: THREE.BufferGeometry,
+        x: number,
+        y: number,
+        z: number,
+        color: number,
+        rx = 0,
+        ry = 0,
+        sx = 1,
+        sy = 1,
+        sz = 1
+      ) => ({ geo, mat: vegMat4(x, y, z, rx, ry, sx, sy, sz), color });
+
+      // Forest pine: trunk + three stacked canopy cones
+      lib.pine = vegMerge([
+        P(new THREE.CylinderGeometry(0.14, 0.2, 2.1, 6), 0, 1.05, 0, 0x6b4a2f),
+        P(new THREE.ConeGeometry(1.35, 2.4, 7), 0, 2.7, 0, 0x2f6b35),
+        P(new THREE.ConeGeometry(1.0, 2.0, 7), 0, 3.9, 0, 0x35743c),
+        P(new THREE.ConeGeometry(0.62, 1.7, 7), 0, 5.1, 0, 0x3d7d43),
+      ]);
+      // Mountain spruce: narrower, darker, one extra tier
+      lib.spruce = vegMerge([
+        P(new THREE.CylinderGeometry(0.12, 0.18, 1.5, 6), 0, 0.75, 0, 0x5d4030),
+        P(new THREE.ConeGeometry(1.15, 2.1, 7), 0, 2.2, 0, 0x2a5f3a),
+        P(new THREE.ConeGeometry(0.85, 1.9, 7), 0, 3.4, 0, 0x2f6a40),
+        P(new THREE.ConeGeometry(0.55, 1.7, 7), 0, 4.5, 0, 0x356f45),
+        P(new THREE.ConeGeometry(0.3, 1.3, 7), 0, 5.5, 0, 0x3b744a),
+      ]);
+      // Broadleaf: forest standard + grassland stray
+      lib.broadleaf = vegMerge([
+        P(new THREE.CylinderGeometry(0.16, 0.26, 2.2, 6), 0, 1.1, 0, 0x7a5638),
+        P(new THREE.SphereGeometry(1.5, 6, 5), 0, 3.3, 0, 0x4f8a3d, 0, 0, 1.25, 0.95, 1.25),
+        P(new THREE.SphereGeometry(1.0, 6, 5), 0.9, 2.7, 0.5, 0x457f38),
+        P(new THREE.SphereGeometry(0.9, 6, 5), -0.8, 2.9, -0.6, 0x558f41),
+      ]);
+      // Jungle kapok: tall trunk, wide flat crown
+      lib.kapok = vegMerge([
+        P(new THREE.CylinderGeometry(0.22, 0.4, 4.4, 6), 0, 2.2, 0, 0x8a6242),
+        P(new THREE.SphereGeometry(2.3, 6, 5), 0, 5.3, 0, 0x2f7d33, 0, 0, 1.3, 0.8, 1.3),
+        P(new THREE.SphereGeometry(1.3, 6, 5), 1.5, 4.7, 0.8, 0x357f38),
+        P(new THREE.SphereGeometry(1.2, 6, 5), -1.4, 4.9, -0.9, 0x2a7230),
+      ]);
+      // Jungle palm: leaning trunk + drooping fronds + coconuts
+      {
+        const parts: Array<{ geo: THREE.BufferGeometry; mat: THREE.Matrix4; color: number }> = [
+          P(new THREE.CylinderGeometry(0.13, 0.2, 4.6, 6), 0, 2.3, 0, 0x8a6a45, 0.16),
+        ];
+        for (let k = 0; k < 6; k++) {
+          const a = (k / 6) * Math.PI * 2;
+          const fr = new THREE.ConeGeometry(0.42, 3.0, 4);
+          fr.translate(0, 1.5, 0); // pivot at frond base
+          fr.rotateZ(-1.75); // droop outward
+          fr.rotateY(a); // fan around the trunk top
+          parts.push({ geo: fr, mat: vegMat4(0, 4.4, 0.72), color: k % 2 ? 0x3f8f3f : 0x35833a });
+        }
+        parts.push(P(new THREE.SphereGeometry(0.18, 5, 4), 0.2, 4.35, 0.8, 0x5d4a2f));
+        parts.push(P(new THREE.SphereGeometry(0.16, 5, 4), -0.15, 4.3, 0.6, 0x6b5433));
+        lib.palm = vegMerge(parts);
+      }
+      // Grassland acacia: short lean trunk + flat wide crown
+      lib.acacia = vegMerge([
+        P(new THREE.CylinderGeometry(0.14, 0.24, 2.0, 6), 0, 1.0, 0, 0x7a5a3a, 0.12),
+        P(new THREE.ConeGeometry(2.5, 1.2, 8), 0.2, 3.0, 0, 0x7d8f4a, 0, 0, 1.15, 1, 1.15),
+        P(new THREE.SphereGeometry(1.5, 6, 5), 0.2, 2.55, 0, 0x74873f, 0, 0, 1.2, 0.5, 1.2),
+      ]);
+      // Dead tree: lake shores
+      lib.deadtree = vegMerge([
+        P(new THREE.CylinderGeometry(0.12, 0.22, 2.6, 5), 0, 1.3, 0, 0x8a7a66, 0.06),
+        P(new THREE.CylinderGeometry(0.05, 0.09, 1.4, 4), 0.32, 2.5, 0, 0x8a7a66, 0, 0.9),
+        P(new THREE.CylinderGeometry(0.05, 0.09, 1.2, 4), -0.28, 2.35, 0.2, 0x84745f, 0.85, 0.4),
+        P(new THREE.CylinderGeometry(0.04, 0.08, 1.0, 4), 0.05, 2.9, -0.25, 0x84745f, 0.4, 0),
+      ]);
+      // Bushes: lush jungle/forest vs dry savanna
+      const bushShape = (a: number, b: number, c: number) =>
+        vegMerge([
+          P(new THREE.SphereGeometry(0.62, 6, 4), 0, 0.55, 0, a, 0, 0, 1.15, 0.9, 1.15),
+          P(new THREE.SphereGeometry(0.45, 5, 4), 0.45, 0.75, 0.2, b),
+          P(new THREE.SphereGeometry(0.4, 5, 4), -0.4, 0.7, -0.15, c),
+        ]);
+      lib.bush = bushShape(0x51804a, 0x4a7a42, 0x578549);
+      lib.bushDry = bushShape(0x9a8f4e, 0x8f8446, 0xa3955a);
+      // Jungle fern: small fronds fanning out of the ground
+      {
+        const parts: Array<{ geo: THREE.BufferGeometry; mat: THREE.Matrix4; color: number }> = [];
+        for (let k = 0; k < 5; k++) {
+          const a = (k / 5) * Math.PI * 2;
+          const fr = new THREE.ConeGeometry(0.26, 1.35, 4);
+          fr.translate(0, 0.675, 0);
+          fr.rotateZ(-1.15); // mostly horizontal, slight droop
+          fr.rotateY(a);
+          parts.push({ geo: fr, mat: vegMat4(0, 0.12, 0), color: k % 2 ? 0x3f8f3f : 0x357f38 });
+        }
+        lib.fern = vegMerge(parts);
+      }
+      // Grass tuft: thin yellow-green spikes
+      lib.tuft = vegMerge([
+        P(new THREE.ConeGeometry(0.055, 0.6, 4), 0, 0.3, 0, 0x93a352, 0.06),
+        P(new THREE.ConeGeometry(0.05, 0.75, 4), 0.09, 0.37, 0.05, 0x8d9c4c, -0.12, 0.4),
+        P(new THREE.ConeGeometry(0.05, 0.55, 4), -0.1, 0.28, -0.06, 0x9aa857, 0.1, 0.9),
+        P(new THREE.ConeGeometry(0.045, 0.66, 4), 0.04, 0.33, -0.1, 0x88994a, -0.08, 1.7),
+        P(new THREE.ConeGeometry(0.05, 0.5, 4), -0.05, 0.25, 0.08, 0x9fae5b, 0.14, 2.4),
+      ]);
+      // Reed cluster: tall stalks + seed heads, feet in the water
+      lib.reed = vegMerge([
+        P(new THREE.CylinderGeometry(0.028, 0.04, 1.8, 4), 0, 0.9, 0, 0x7f9a4f, 0.05),
+        P(new THREE.CylinderGeometry(0.028, 0.04, 1.6, 4), 0.08, 0.8, 0.05, 0x86a155, -0.08, 0.5),
+        P(new THREE.CylinderGeometry(0.028, 0.04, 2.0, 4), -0.07, 1.0, -0.04, 0x79934a, 0.06, 1.2),
+        P(new THREE.CylinderGeometry(0.026, 0.038, 1.5, 4), 0.03, 0.75, -0.08, 0x8ba75c, -0.1, 1.9),
+        P(new THREE.ConeGeometry(0.07, 0.32, 4), 0, 2.0, 0, 0x6b5a35),
+        P(new THREE.ConeGeometry(0.06, 0.3, 4), -0.07, 2.14, -0.04, 0x71623a),
+      ]);
+      // Rocks: scree boulder and mountain block
+      lib.rock = vegMerge([
+        P(new THREE.DodecahedronGeometry(0.8, 0), 0, 0.35, 0, 0x8d8a80, 0, 0.3, 1.3, 0.85, 1.05),
+        P(new THREE.DodecahedronGeometry(0.45, 0), 0.8, 0.2, 0.4, 0x99968c, 0, 1.1, 1.2, 0.8),
+      ]);
+      lib.rockBig = vegMerge([
+        P(new THREE.DodecahedronGeometry(1.7, 0), 0, 0.6, 0, 0x87857c, 0, 0.2, 1.35, 1.0, 1.15),
+        P(new THREE.DodecahedronGeometry(1.0, 0), 1.6, 0.4, -0.9, 0x918e85, 0, 0.8, 1.2, 0.9, 1.1),
+        P(new THREE.DodecahedronGeometry(0.7, 0), -1.5, 0.25, 1.0, 0x807d75),
+      ]);
+      vegLib = lib;
+    }
+
+    function stampVeg(
+      def: VegDef,
+      x: number,
+      y: number,
+      z: number,
+      yaw: number,
+      s: number,
+      tint: number,
+      P: number[],
+      N: number[],
+      C: number[]
+    ) {
+      const cs = Math.cos(yaw);
+      const sn = Math.sin(yaw);
+      const p = def.pos;
+      const n = def.nor;
+      const cl = def.col;
+      for (let i = 0; i < p.length; i += 3) {
+        const px = p[i] * s;
+        const py = p[i + 1] * s;
+        const pz = p[i + 2] * s;
+        P.push(px * cs - pz * sn + x, py + y, px * sn + pz * cs + z);
+        const nx = n[i];
+        const nz = n[i + 2];
+        N.push(nx * cs - nz * sn, n[i + 1], nx * sn + nz * cs);
+        C.push(cl[i] * tint, cl[i + 1] * tint, cl[i + 2] * tint);
+      }
+    }
+
+    const VEG_MAX_INST = 66; // instance cap per tile
+    const VEG_MAX_VERTS = 22000; // vertex budget per tile
+
+    function buildVegTile(tx: number, tz: number): { mesh: THREE.Mesh | null; solidRefs: SolidBox[] } {
+      const solidRefs: SolidBox[] = [];
+      if (!vegLib) buildVegLib();
+      const lib = vegLib!;
+      const x0 = tx * TILE;
+      const z0 = tz * TILE;
+      const rnd = mulberry32((terrainSeed ^ (tx * 73856093) ^ (tz * 19349663)) >>> 0);
+      const P: number[] = [];
+      const N: number[] = [];
+      const C: number[] = [];
+      let inst = 0;
+      let verts = 0;
+      for (let a = 0; a < 150 && inst < VEG_MAX_INST && verts < VEG_MAX_VERTS; a++) {
+        const vx = x0 + rnd() * TILE;
+        const vz = z0 + rnd() * TILE;
+        // Keep the spawn pad, the port complex, the beach and every
+        // POI pad clear — plants grow everywhere else.
+        if (Math.hypot(vx - HARBOR_SPAWN.x, vz - HARBOR_SPAWN.z) < 34) continue;
+        if (harborAnchor && Math.hypot(vx - harborAnchor.x, vz - harborAnchor.z) < 330) continue;
+        if (seaDist(vx, vz) > -14) continue;
+        let pad = false;
+        for (const f of flatZones) {
+          if (Math.hypot(vx - f.x, vz - f.z) < f.r + 8) {
+            pad = true;
+            break;
+          }
+        }
+        if (pad) continue;
+        const h = terrainHeight(vx, vz);
+        biomeWeights(vx, vz, VW);
+        const pick = rnd();
+        let def: VegDef | null = null;
+        let s = 1;
+        let trunkR = 0; // > 0 registers trunk collision
+        let trunkTop = 0;
+        let boulder = false;
+        if (VW.mw >= 0.04 && VW.mw >= VW.lw && VW.mw >= VW.jw && VW.mw >= VW.fw && VW.mw >= VW.gw) {
+          // Mountain: boulders all the way up, spruces only below the
+          // treeline on gentler ground.
+          if (h < WATER_Y + 0.32) continue;
+          if (h > 54) {
+            if (pick < 0.5) {
+              def = lib.rockBig;
+              boulder = true;
+            } else if (pick < 0.8) def = lib.rock;
+            else continue;
+            s = 0.7 + rnd() * 0.7;
+          } else {
+            const sl = Math.max(Math.abs(terrainHeight(vx + 3, vz) - h), Math.abs(terrainHeight(vx, vz + 3) - h)) / 3;
+            if (sl < 1.5) {
+              if (pick < 0.4) {
+                def = lib.spruce;
+                trunkR = 0.3;
+                trunkTop = 1.7;
+              } else if (pick < 0.62) def = lib.rock;
+              else if (pick < 0.74) {
+                def = lib.rockBig;
+                boulder = true;
+              } else if (pick < 0.88) def = lib.bush;
+              else def = lib.tuft;
+              s = 0.85 + rnd() * 0.5;
+            } else if (pick < 0.55) def = lib.rock;
+            else if (pick < 0.8) {
+              def = lib.rockBig;
+              boulder = true;
+              s = 0.8 + rnd() * 0.6;
+            } else continue;
+          }
+        } else if (VW.lw >= 0.04 && VW.lw >= VW.jw && VW.lw >= VW.fw && VW.lw >= VW.gw) {
+          // Lake: reeds hug the waterline, deadwood + bushes on the bank.
+          if (h < WATER_Y - 0.1) continue; // open water
+          if (h < WATER_Y + 0.5) {
+            if (pick < 0.85) def = lib.reed;
+            else continue;
+            s = 0.8 + rnd() * 0.6;
+          } else {
+            if (pick < 0.3) {
+              def = lib.deadtree;
+              trunkR = 0.3;
+              trunkTop = 2.2;
+            } else if (pick < 0.62) def = lib.bush;
+            else if (pick < 0.9) def = lib.tuft;
+            else continue;
+            s = 0.9 + rnd() * 0.4;
+          }
+        } else if (VW.jw >= 0.02 && VW.jw >= VW.fw && VW.jw >= VW.gw) {
+          // Jungle: wall-to-wall green.
+          if (h < WATER_Y + 0.32) continue;
+          if (pick < 0.24) {
+            def = lib.kapok;
+            trunkR = 0.5;
+            trunkTop = 3.4;
+          } else if (pick < 0.5) {
+            def = lib.palm;
+            trunkR = 0.38;
+            trunkTop = 2.6;
+          } else if (pick < 0.74) def = lib.fern;
+          else if (pick < 0.92) def = lib.bush;
+          else def = lib.tuft;
+          s = 0.9 + rnd() * 0.5;
+        } else if (VW.fw >= 0.02 && VW.fw >= VW.gw) {
+          // Forest: pine stands with broadleaf breaks.
+          if (h < WATER_Y + 0.32) continue;
+          if (pick < 0.56) {
+            def = lib.pine;
+            trunkR = 0.34;
+            trunkTop = 1.9;
+          } else if (pick < 0.76) {
+            def = lib.broadleaf;
+            trunkR = 0.42;
+            trunkTop = 2.1;
+          } else if (pick < 0.92) def = lib.bush;
+          else def = lib.tuft;
+          s = 0.85 + rnd() * 0.55;
+        } else {
+          // Grassland: open tuftland with lone acacias.
+          if (h < WATER_Y + 0.32) continue;
+          if (pick < 0.4) def = lib.tuft;
+          else if (pick < 0.58) def = lib.bushDry;
+          else if (pick < 0.68) {
+            def = lib.acacia;
+            trunkR = 0.36;
+            trunkTop = 1.9;
+          } else if (pick < 0.74) def = lib.rock;
+          else continue;
+          s = 0.9 + rnd() * 0.5;
+        }
+        if (!def) continue;
+        const yaw = rnd() * Math.PI * 2;
+        const tint = 0.86 + rnd() * 0.26;
+        stampVeg(def, vx, h - 0.06, vz, yaw, s, tint, P, N, C);
+        verts += def.pos.length / 3;
+        inst++;
+        if (trunkR) {
+          const sb: SolidBox = { x: vx, z: vz, hx: trunkR * s, hz: trunkR * s, bottom: h - 1.2, top: h + trunkTop * s };
+          solids.push(sb);
+          vegSolids.push(sb);
+          solidRefs.push(sb);
+        }
+        if (boulder) {
+          const sb: SolidBox = { x: vx, z: vz, hx: 1.75 * s, hz: 1.5 * s, bottom: h - 1.5, top: h + 1.15 * s };
+          solids.push(sb);
+          vegSolids.push(sb);
+          solidRefs.push(sb);
+        }
+      }
+      if (!inst) return { mesh: null, solidRefs };
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(P), 3));
+      geo.setAttribute('normal', new THREE.BufferAttribute(new Float32Array(N), 3));
+      geo.setAttribute('color', new THREE.BufferAttribute(new Float32Array(C), 3));
+      const mesh = new THREE.Mesh(geo, vegMat);
+      mesh.castShadow = true;
+      mesh.receiveShadow = false;
+      return { mesh, solidRefs };
+    }
+
+    // Vegetation blocks bullets: nearest trunk / boulder along a shot
+    // segment. Trees aren't destructible, but they soak rounds (wood
+    // thunk) and — because they live in `solids` — grenade LOS, so a
+    // fat tree is real cover.
+    function vegCut(o: THREE.Vector3, dir: THREE.Vector3, maxDist: number): number {
+      let best = Infinity;
+      const ex = o.x + dir.x * maxDist;
+      const ey = o.y + dir.y * maxDist;
+      const ez = o.z + dir.z * maxDist;
+      const end = { x: ex, y: ey, z: ez };
+      const reachSq = (maxDist + 4) * (maxDist + 4);
+      for (const b of vegSolids) {
+        const dx = b.x - o.x;
+        const dz = b.z - o.z;
+        if (dx * dx + dz * dz > reachSq) continue;
+        const t = segmentIntersectsBox(o, end, b);
+        if (t !== null) {
+          const d = t * maxDist;
+          if (d < best) best = d;
+        }
+      }
+      return best;
     }
 
     // ----------------------------------------------------
@@ -3300,7 +3833,7 @@ export default function BattleRoyaleGame() {
         const def = POI_KINDS[kind];
         for (let i = 0; i < def.n; i++) {
           let best: { x: number; z: number; score: number } | null = null;
-          for (let t = 0; t < 90; t++) {
+          for (let t = 0; t < 160; t++) {
             const x = (rnd() * 2 - 1) * (HARBOR_HALF - 330);
             const z = (rnd() * 2 - 1) * (HARBOR_HALF - 330);
             if (seaDist(x, z) > -160) continue; // dry land, well inland
@@ -3319,7 +3852,7 @@ export default function BattleRoyaleGame() {
             ]) {
               spread = Math.max(spread, Math.abs(terrainHeight(x + off[0], z + off[1]) - h0));
             }
-            if (spread > 8) continue; // too steep to flatten gently
+            if (spread > 10) continue; // too steep to flatten gently
             const score = spread + rnd() * 2;
             if (!best || score < best.score) best = { x, z, score };
           }
@@ -3683,11 +4216,9 @@ export default function BattleRoyaleGame() {
       pickups.length = 0;
       BUILDINGS.length = 0;
       terrainSeed = 1 + Math.floor(Math.random() * 1000000);
-      for (const t of tiles.values()) {
-        scene.remove(t.mesh);
-        t.mesh.geometry.dispose();
-      }
+      for (const t of tiles.values()) disposeTile(t);
       tiles.clear();
+      vegSolids.length = 0;
       mapHalf = HARBOR_HALF;
       terrainOn = true;
       seaMesh.visible = true;
@@ -3989,6 +4520,40 @@ export default function BattleRoyaleGame() {
               return { floor: +s.floor.toFixed(2), wet: s.wet, swimming: s.swimming, depth: +(WATER_Y - s.floor).toFixed(2), underFx };
             },
             harborInfo: () => harborAnchor,
+            biome: (bx: number, bz: number) => {
+              biomeWeights(bx, bz, VW);
+              return {
+                mw: +VW.mw.toFixed(3),
+                lw: +VW.lw.toFixed(3),
+                jw: +VW.jw.toFixed(3),
+                fw: +VW.fw.toFixed(3),
+                gw: +VW.gw.toFixed(3),
+                sum: +(VW.mw + VW.lw + VW.jw + VW.fw + VW.gw).toFixed(3),
+                h: +terrainHeight(bx, bz).toFixed(2),
+              };
+            },
+            vegInfo: () => {
+              let withVeg = 0;
+              let vegSolidCount = 0;
+              for (const t of tiles.values()) {
+                if (t.veg) {
+                  withVeg++;
+                  vegSolidCount += (t.vegSolids ?? []).length;
+                }
+              }
+              return {
+                tiles: tiles.size,
+                withVeg,
+                vegSolids: vegSolids.length,
+                vegSolidRefs: vegSolidCount,
+                solids: solids.length,
+                sample: vegSolids.slice(0, 4).map((s) => ({ x: +s.x.toFixed(1), z: +s.z.toFixed(1), b: +(s.bottom ?? 0).toFixed(1), t: +s.top.toFixed(1) })),
+              };
+            },
+            vegRay: (ox: number, oy: number, oz: number, dx: number, dy: number, dz: number, max = 60) => {
+              const d = vegCut(new THREE.Vector3(ox, oy, oz), new THREE.Vector3(dx, dy, dz).normalize(), max);
+              return d === Infinity ? null : +d.toFixed(2);
+            },
             port: () => portPlan,
             pickupsInfo: () =>
               pickups.map((p) => ({
@@ -4762,6 +5327,15 @@ export default function BattleRoyaleGame() {
       if (gc < reach) {
         reach = gc;
         hit = null as any;
+      }
+      // Vegetation soaks bullets too: tree trunks and boulders end
+      // the tracer with a wooden thunk. (They also block grenade
+      // blasts via `solids`, so forests are real cover.)
+      const vc = vegCut(raycaster.ray.origin, raycaster.ray.direction, reach);
+      if (vc < reach) {
+        reach = vc;
+        hit = null as any;
+        playSfx('wood_hit');
       }
       const sd = smokeDist(raycaster.ray.origin, raycaster.ray.direction, reach);
       const to =
