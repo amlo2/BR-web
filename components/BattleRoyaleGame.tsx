@@ -46,6 +46,29 @@ export default function BattleRoyaleGame() {
     const magEl = $('mag');
     const reserveEl = $('reserve');
     const scopeEl = $('scope');
+    const fireModeAutoEl = $('fireModeAuto');
+    const fireModeManualEl = $('fireModeManual');
+    let fireMode: 'auto' | 'manual' = 'auto';
+
+    function setFireMode(mode: 'auto' | 'manual') {
+      fireMode = mode;
+      fireModeAutoEl?.classList.toggle('active', mode === 'auto');
+      fireModeManualEl?.classList.toggle('active', mode === 'manual');
+      if (mode === 'manual') {
+        showMessage('Manual: Fire with AIM button (even without enemy)', 2.0);
+      } else {
+        showMessage('Auto: Weapon fires when enemy in front', 2.0);
+      }
+    }
+
+    fireModeAutoEl?.addEventListener('click', (e) => {
+      e.stopPropagation();
+      setFireMode('auto');
+    });
+    fireModeManualEl?.addEventListener('click', (e) => {
+      e.stopPropagation();
+      setFireMode('manual');
+    });
     const sliderEl = $('slider');
     const sliderKnobEl = $('sliderKnob');
     const pickBtn = $('pick');
@@ -585,7 +608,7 @@ export default function BattleRoyaleGame() {
       inst.receiveShadow = true;
       inst.userData.vox = v;
       voxTmpQ.identity();
-      voxTmpS.set(v.sx * 0.96, v.sy * 0.96, v.sz * 0.96);
+      voxTmpS.set(v.sx * 1.0, v.sy * 1.0, v.sz * 1.0);
       for (let s = 0; s < v.aliveCount; s++) {
         voxCenter(v, v.order[s], voxTmpP);
         voxTmpM.compose(voxTmpP, voxTmpQ, voxTmpS);
@@ -696,7 +719,7 @@ export default function BattleRoyaleGame() {
         let runSpans: number[] | null = null;
         for (let i = 0; i <= nx; i++) {
           const spans = i < nx ? spansAt(i, k) : null;
-          const prev = runSpans;
+          const prev: number[] | null = runSpans;
           const same = !!(spans && prev && spans.length === prev.length && spans.every((s, q) => s === prev[q]));
           if (!same) {
             if (runSpans) {
@@ -1459,10 +1482,26 @@ export default function BattleRoyaleGame() {
       if (touchBuildEl) touchBuildEl.classList.toggle('active', buildMode);
 
       if (buildMode) {
-        showMessage('🧱 Build Mode: [LEFT CLICK / TAP] Place Wall (250 HP) | [V / RIGHT CLICK] Cancel', 3.0);
+        // When putting up a wall, the character CANNOT have a weapon in their hand
+        if (current) {
+          current.gun.visible = false;
+          current.flare.visible = false;
+        }
+        if (aimBtn) {
+          aimBtn.textContent = 'BUILD';
+          aimBtn.classList.add('build-active');
+        }
+        showMessage('🧱 Build Mode: Tap [AIM] to place wall (250 HP) | [V] Cancel', 3.5);
         playSfx('build');
       } else {
         setStatus('');
+        if (aimBtn) {
+          aimBtn.textContent = 'AIM';
+          aimBtn.classList.remove('build-active');
+        }
+        if (current) {
+          current.gun.visible = !scopeEl?.classList.contains('on');
+        }
       }
     }
 
@@ -1601,6 +1640,10 @@ export default function BattleRoyaleGame() {
       if (buildBtnEl) buildBtnEl.classList.remove('active');
       const touchBuildEl = $('touchBuildBtn');
       if (touchBuildEl) touchBuildEl.classList.remove('active');
+      if (aimBtn) {
+        aimBtn.textContent = 'AIM';
+        aimBtn.classList.remove('build-active');
+      }
     }
 
     interface DummyObject {
@@ -2094,10 +2137,14 @@ export default function BattleRoyaleGame() {
       camera.position.y = feet + eyeH;
     }
 
-    const crouchHeld = () => keys.has('KeyC') || sliderTouch?.down === true;
+    let crouched = false;
+    const crouchHeld = () => keys.has('KeyC') || crouched || sliderTouch?.down === true;
 
     function updateStance(dt: number, swimming: boolean) {
-      const wanted = slide ? SLIDE_EYE : crouchHeld() && !swimming && !climb ? CROUCH_EYE : EYE;
+      if (sprinting) crouched = false;
+      const isCrouching = crouchHeld() && !swimming && !climb;
+      if (sliderEl) sliderEl.classList.toggle('crouched', isCrouching);
+      const wanted = slide ? SLIDE_EYE : isCrouching ? CROUCH_EYE : EYE;
       const feet = camera.position.y - eyeH;
       const target = Math.min(wanted, headLimit(camera.position.x, camera.position.z, feet));
       setEye(eyeH + (target - eyeH) * Math.min(1, 12 * dt));
@@ -2325,6 +2372,7 @@ export default function BattleRoyaleGame() {
           vy = JUMP;
           grounded = false;
           slide = null;
+          crouched = false;
         }
         const before = camera.position.y - eyeH;
         const eyeFrom = camera.position.y;
@@ -2402,6 +2450,10 @@ export default function BattleRoyaleGame() {
       if (bp) bp.classList.remove('active');
       const tb = $('touchBuildBtn');
       if (tb) tb.classList.remove('active');
+      if (aimBtn) {
+        aimBtn.textContent = 'AIM';
+        aimBtn.classList.remove('build-active');
+      }
       document.exitPointerLock?.();
     }
 
@@ -2429,12 +2481,26 @@ export default function BattleRoyaleGame() {
       if (!running()) return;
       if (e.code === 'Space') e.preventDefault();
       keys.add(e.code);
-      if (e.code === 'KeyC' && !e.repeat) slideReq = true;
+      if (e.code === 'KeyC' && !e.repeat) {
+        if (moving && grounded) {
+          slideReq = true;
+          crouched = true;
+        } else {
+          crouched = !crouched;
+        }
+      }
       if (e.code === 'KeyZ' && !e.repeat) rollReq = -1;
       if (e.code === 'KeyX' && !e.repeat) rollReq = 1;
       if (e.code === 'KeyR') startReload();
       if (e.code === 'KeyF') forcePick();
       if (e.code === 'KeyV' && !e.repeat) toggleBuildWall();
+      if ((e.code === 'Digit3' || e.code === 'KeyH') && !e.repeat) {
+        if (buildMode) toggleBuildWall(false);
+        putAway();
+        refreshHud();
+        refreshSlots();
+        showMessage('Holstered weapon (Unarmed)', 1.5);
+      }
       if (e.code === 'Digit1' && !e.repeat) {
         if (buildMode) toggleBuildWall(false);
         pressSlot(0);
@@ -2478,15 +2544,19 @@ export default function BattleRoyaleGame() {
           inRect($('buildWallBtn'), e.clientX, e.clientY, 8) ||
           inRect($('touchBuildBtn'), e.clientX, e.clientY, 12);
         if (!onPlate) {
-          if (e.button === 0) {
+          if (e.button === 0 || e.button === 2) {
             placeWall();
             return;
           }
-          if (e.button === 2) {
-            toggleBuildWall(false);
-            return;
-          }
         }
+      }
+      if (inRect($('fireModeAuto'), e.clientX, e.clientY, 4)) {
+        setFireMode('auto');
+        return;
+      }
+      if (inRect($('fireModeManual'), e.clientX, e.clientY, 4)) {
+        setFireMode('manual');
+        return;
       }
       if (inRect(sliderEl, e.clientX, e.clientY, 6)) {
         sliderTouch = { id: -1, x0: e.clientX, y0: e.clientY, committed: false, down: false };
@@ -2510,7 +2580,6 @@ export default function BattleRoyaleGame() {
 
     const onContextMenu = (e: MouseEvent) => {
       if (running()) e.preventDefault();
-      if (running() && buildMode) toggleBuildWall(false);
     };
 
     const onWheel = (e: WheelEvent) => {
@@ -2532,7 +2601,12 @@ export default function BattleRoyaleGame() {
           } else if (dy >= SLIDER_GESTURE && dy > Math.abs(dx)) {
             sliderTouch.committed = true;
             sliderTouch.down = true;
-            if (moving) slideReq = true;
+            if (moving && grounded) {
+              slideReq = true;
+              crouched = true;
+            } else {
+              crouched = !crouched;
+            }
           }
         }
         const kx = THREE.MathUtils.clamp(dx, -SLIDER_KNOB_R, SLIDER_KNOB_R);
@@ -2769,6 +2843,8 @@ export default function BattleRoyaleGame() {
         const r = el.getBoundingClientRect();
         return Math.hypot(x - (r.left + r.width / 2), y - (r.top + r.height / 2)) <= (r.width / 2) * k;
       };
+      if (inRect($('fireModeAuto'), x, y, 6)) return 'fireModeAuto';
+      if (inRect($('fireModeManual'), x, y, 6)) return 'fireModeManual';
       if (near(stickBase, 1.5)) return 'stick';
       if (near(aimBtn, 1.2)) return 'aim';
       if (near(turretEl, 1)) return 'turret';
@@ -2804,7 +2880,12 @@ export default function BattleRoyaleGame() {
         } else if (dy >= SLIDER_GESTURE && dy > Math.abs(dx)) {
           s.committed = true;
           s.down = true;
-          if (moving) slideReq = true;
+          if (moving && grounded) {
+            slideReq = true;
+            crouched = true;
+          } else {
+            crouched = !crouched;
+          }
         }
       }
       const kx = THREE.MathUtils.clamp(dx, -SLIDER_KNOB_R, SLIDER_KNOB_R);
@@ -2817,7 +2898,10 @@ export default function BattleRoyaleGame() {
       sliderTouch = null;
       sliderEl?.classList.remove('is-pressed');
       if (sliderKnobEl) sliderKnobEl.style.transform = '';
-      if (s && !s.committed) jumpTap = true;
+      if (s && !s.committed) {
+        jumpTap = true;
+        crouched = false;
+      }
     }
 
     const onTouchStart = (e: TouchEvent) => {
@@ -2825,6 +2909,14 @@ export default function BattleRoyaleGame() {
       e.preventDefault();
       for (const t of Array.from(e.changedTouches)) {
         let role = roleAt(t.clientX, t.clientY);
+        if (role === 'fireModeAuto') {
+          setFireMode('auto');
+          continue;
+        }
+        if (role === 'fireModeManual') {
+          setFireMode('manual');
+          continue;
+        }
         if (role === 'stick' && stickId !== null) role = 'look';
         if (role === 'aim' && aimId !== null) role = 'look';
         if (role === 'slider' && sliderTouch !== null) role = 'look';
@@ -2863,10 +2955,6 @@ export default function BattleRoyaleGame() {
           toggleBuildWall();
           touchBuildBtnEl?.classList.add('is-pressed');
           setTimeout(() => touchBuildBtnEl?.classList.remove('is-pressed'), 120);
-        }
-        if (role === 'look' && buildMode) {
-          // Tap anywhere (outside controls) to place the wall
-          placeWall();
         }
         if (role === 'inventory') openInventory();
       }
@@ -3251,23 +3339,28 @@ export default function BattleRoyaleGame() {
 
     function pressSlot(i: number) {
       const w = slots[i];
-      if (!w) return;
+      if (!w) {
+        if (current) {
+          putAway();
+          refreshHud();
+          refreshSlots();
+          showMessage('Unarmed (no weapon in hand)', 1.5);
+        }
+        return;
+      }
       if (w !== current) {
         equip(w);
         return;
       }
-      slotHold = { i, t: 0, held: false };
+      // Clicking the already equipped weapon holsters it so character has no weapon in hand
+      putAway();
+      refreshHud();
+      refreshSlots();
+      showMessage('Holstered weapon (Unarmed)', 1.5);
     }
 
     function releaseSlot(i: number) {
-      if (!slotHold || slotHold.i !== i) return;
-      const held = slotHold.held;
       slotHold = null;
-      if (!held && current && slots[i] === current) {
-        putAway();
-        refreshHud();
-        refreshSlots();
-      }
     }
 
     function cycleWeapon() {
@@ -3354,7 +3447,7 @@ export default function BattleRoyaleGame() {
 
     function shoot() {
       const w = current;
-      if (!w || cooldown > 0 || reloadT > 0 || roll) return;
+      if (!w || cooldown > 0 || reloadT > 0 || roll || buildMode || gArmed || bombArmed) return;
       if (w.loaded === 0) {
         startReload();
         return;
@@ -3441,9 +3534,9 @@ export default function BattleRoyaleGame() {
       }
       msgT = Math.max(0, msgT - dt);
       const reloading = reloadT > 0;
-      const aimed = aiming() && !!w;
+      const aimed = aiming() && !!w && !buildMode;
       const prompt = pickOffer && !touchDevice ? `F to pick up ${WEAPONS[pickOffer.kind]?.name || ''}` : '';
-      setStatus(msgT > 0 ? msgText : reloading ? 'Reloading' : prompt || (aimed ? 'Aiming' : w ? '' : 'Unarmed'));
+      setStatus(msgT > 0 ? msgText : reloading ? 'Reloading' : prompt || (buildMode ? 'Build Mode' : aimed ? 'Aiming' : w ? '' : 'Unarmed'));
 
       aimT = THREE.MathUtils.lerp(aimT, aimed && !reloading ? 1 : 0, 1 - Math.exp(-14 * dt));
       scopeT = THREE.MathUtils.lerp(scopeT, aimed && !reloading && w?.scope ? 1 : 0, 1 - Math.exp(-10 * dt));
@@ -3456,13 +3549,15 @@ export default function BattleRoyaleGame() {
       document.body.classList.toggle('aiming', aimT > 0.5);
       const scoped = scopeT > 0.5;
       scopeEl?.classList.toggle('on', scoped);
-      if (w) w.gun.visible = !scoped;
+
+      const weaponInHand = !!w && !buildMode && !gArmed && !bombArmed;
+      if (w) w.gun.visible = weaponInHand && !scoped;
 
       bobAmp = THREE.MathUtils.lerp(bobAmp, moving && !slide && !roll ? 1 : 0, 1 - Math.exp(-8 * dt));
       if (moving) bobT += dt * (sprinting ? 14 : 9);
       const calm = (1 - 0.8 * aimT) * bobAmp;
       tuck = THREE.MathUtils.lerp(tuck, slide ? 1 : 0, 1 - Math.exp(-10 * dt));
-      if (w) {
+      if (weaponInHand) {
         const dip = reloading ? Math.sin((1 - reloadT / w.reload) * Math.PI) : 0;
         wristTarget.lerpVectors(w.hip, w.ads, aimT).add(w.grip);
         wristTarget.x += Math.cos(bobT * 0.5) * 0.008 * calm;
@@ -3473,7 +3568,7 @@ export default function BattleRoyaleGame() {
         gunHold.rotation.set(0, 0, 0);
       }
       bodyRig.visible = armRig.visible = !scoped;
-      updateBody(w, dt);
+      updateBody(weaponInHand ? w : null, dt);
     }
 
     // ----------------------------------------------------
@@ -4985,7 +5080,20 @@ export default function BattleRoyaleGame() {
       canvas?.requestPointerLock?.()?.catch?.(() => {});
     }
 
+    const inventoryReturnMenuEl = $('inventoryReturnMenu');
+    function returnToMenu() {
+      if (inventoryEl) inventoryEl.hidden = true;
+      if (overlay) overlay.hidden = true;
+      if (menuEl) menuEl.hidden = false;
+      if (buildMode) toggleBuildWall(false);
+      document.exitPointerLock?.();
+      keys.clear();
+      mouseHeld = aimMouse = false;
+      releaseTouch();
+    }
+
     inventoryCloseEl?.addEventListener('click', closeInventory);
+    inventoryReturnMenuEl?.addEventListener('click', returnToMenu);
     inventoryBtnEl?.addEventListener('click', openInventory);
 
     // Fortnite Wall Build plates (desktop plate + touch button)
@@ -5068,8 +5176,26 @@ export default function BattleRoyaleGame() {
     }
 
     function aimPressed() {
-      if (gArmed) throwArmedGrenade();
-      if (bombArmed) callBombardment();
+      if (buildMode) {
+        placeWall();
+        return;
+      }
+      if (gArmed) {
+        throwArmedGrenade();
+        return;
+      }
+      if (bombArmed) {
+        callBombardment();
+        return;
+      }
+      if (!current) {
+        toggleBuildWall(true);
+        return;
+      }
+      if (fireMode === 'manual') {
+        shoot();
+        return;
+      }
     }
 
     function applyCharacter() {
@@ -5754,7 +5880,13 @@ export default function BattleRoyaleGame() {
       updatePickups(dt);
       updateWeapon(dt);
       if (mouseHeld) shoot();
-      autoShoot();
+      if (fireMode === 'manual') {
+        if (aiming() && !buildMode && !gArmed && !bombArmed) {
+          shoot();
+        }
+      } else {
+        autoShoot();
+      }
       for (const d of dummies) {
         updateDummy(d, dt);
         updateAI(d, dt);
@@ -5954,8 +6086,28 @@ export default function BattleRoyaleGame() {
 
       {/* Ammo Plate */}
       <div className="hud ammo">
-        <div className="weapon" id="weapon">
-          SK
+        <div className="weapon-header">
+          <div className="weapon" id="weapon">
+            SK
+          </div>
+          <div className="fire-mode-seg" role="group" aria-label="Firing Mode">
+            <button
+              type="button"
+              className="fire-mode-btn active"
+              id="fireModeAuto"
+              title="Auto: fires automatically when an enemy is in front"
+            >
+              auto
+            </button>
+            <button
+              type="button"
+              className="fire-mode-btn"
+              id="fireModeManual"
+              title="Manual: fires with the AIM button even without enemy"
+            >
+              manual
+            </button>
+          </div>
         </div>
         <div className="status" id="status" />
         <div className="count">
@@ -6121,7 +6273,7 @@ export default function BattleRoyaleGame() {
             <li>Hold AIM to aim and turn the view</li>
             <li>Tap slider to jump. Slide left/right to roll, down to crouch/slide</li>
             <li>Tap GRENADE to arm, tap AIM to throw. Hold GRENADE and slide up to pick kind</li>
-            <li>Tap WALL to arm build mode, then tap anywhere to place a 250 HP wooden wall</li>
+            <li>Tap WALL to arm build mode, then tap AIM to make a 250 HP wooden wall appear</li>
             <li>Tap INVENTORY to purchase weapons, ammo and customize dummies</li>
           </ul>
           <button className="btn" id="btn" type="button">
@@ -6166,9 +6318,14 @@ export default function BattleRoyaleGame() {
               </div>
             </section>
           </div>
-          <button className="btn" id="inventoryClose" type="button">
-            Close inventory
-          </button>
+          <div className="inventory-actions">
+            <button className="btn" id="inventoryClose" type="button">
+              Close inventory
+            </button>
+            <button className="btn btn-menu" id="inventoryReturnMenu" type="button">
+              Return to Menu
+            </button>
+          </div>
         </div>
       </div>
     </div>

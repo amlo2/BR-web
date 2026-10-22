@@ -22,24 +22,31 @@ export const BLAST = {
   /** Radius (m) in which the blast can damage anything. */
   radius: 12,
   /** Distance (m) inside which the blast deals its full damage. */
-  fullRadius: 3,
+  fullRadius: 4,
 } as const;
 
 /** Damage share of a Blast grenade at `dist` metres from the epicentre.
- * Full damage inside the inner radius, then linear falloff to zero. */
+ * Stepped bands: 100% inside 4m, 66.7% inside 8m, 33.3% inside 12m, 0 beyond. */
 export function blastShare(dist: number): number {
-  if (dist <= BLAST.fullRadius) return 1;
-  if (dist >= BLAST.radius) return 0;
-  return 1 - (dist - BLAST.fullRadius) / (BLAST.radius - BLAST.fullRadius);
+  if (dist <= 4) return 1.0;
+  if (dist <= 8) return 2 / 3;
+  if (dist <= 12) return 1 / 3;
+  return 0;
 }
 
-/** Remaining bullet power (0..1) at `dist` metres for weapon `w`. */
-export function powerAt(w: WeaponLike, dist: number): number {
+/** Remaining bullet power (0..1) at `dist` metres for weapon `w`.
+ * Stepped three-bracket falloff: 100% close, 60% mid-range, 30% far (20% for shotguns). */
+export function powerAt(w: { falloff: Falloff; shotgun?: boolean }, dist: number): number {
   const [start, end] = w.falloff;
-  if (dist <= start) return 1;
-  if (dist >= end) return 0;
-  return 1 - (dist - start) / (end - start);
+  if (dist < start) return 1.0;
+  if (dist < end) return 0.6;
+  return w.shotgun ? 0.2 : 0.3;
 }
+
+/** BETGUN constant config */
+export const BETGUN = {
+  damage: 150,
+} as const;
 
 /** Close range (m) inside which shotgun pellets pierce shields. */
 const SHOTGUN_PEN_RANGE = 10;
@@ -62,11 +69,35 @@ export function shotDamage(w: WeaponLike, dist: number): ShotResult {
   return { dmg, pen };
 }
 
+/** Slide mechanics with exponential decay and slope momentum */
+export function calculateSlideVelocity(
+  t: number,
+  initialSpeed = 16.5,
+  decayRate = 1.15,
+  slopeBonus = 0
+): number {
+  return initialSpeed * Math.exp(-decayRate * t) + slopeBonus;
+}
+
+/** Souls roll invulnerability frames */
+export const SOULS_ROLL_IFRAMES = 0.35;
+
+export function isRollInvulnerable(t: number): boolean {
+  return t >= 0 && t < SOULS_ROLL_IFRAMES;
+}
+
+/** Souls roll camera eye height profile */
+export function soulsRollEyeHeight(progress: number, standingEye = 1.7): number {
+  const p = Math.max(0, Math.min(1, progress));
+  const drop = Math.sin(p * Math.PI) * (standingEye - 0.45);
+  return standingEye - drop;
+}
+
 /** Highest reachable level (levels 3 & 5 upgrade turret / bombardment). */
 export const MAX_LEVEL = 5;
 
 /** XP required to advance from level `n` to `n + 1` (index 0 = level 1 -> 2). */
-export const LEVEL_COST: readonly number[] = [100, 250, 500, 1000];
+export const LEVEL_COST: readonly number[] = [100, 300, 500, 1000];
 
 export interface XpResult {
   newLevel: number;
