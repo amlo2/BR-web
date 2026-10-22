@@ -200,7 +200,7 @@ export default function BattleRoyaleGame() {
 
       const water = new THREE.Mesh(
         new THREE.PlaneGeometry(POOL_END - x0, z1 - z0),
-        new THREE.MeshLambertMaterial({ color: 0x1d6e9c, transparent: true, opacity: 0.55, depthWrite: false })
+        new THREE.MeshLambertMaterial({ color: 0x1d6e9c, transparent: true, opacity: 0.55, depthWrite: false, side: THREE.DoubleSide })
       );
       water.rotation.x = -Math.PI / 2;
       water.position.set((x0 + POOL_END) / 2, WATER_Y, (z0 + z1) / 2);
@@ -375,7 +375,7 @@ export default function BattleRoyaleGame() {
 
     const seaMesh = new THREE.Mesh(
       new THREE.PlaneGeometry(2 * (HARBOR_HALF + TERRAIN_MARGIN), 2 * (HARBOR_HALF + TERRAIN_MARGIN)),
-      new THREE.MeshLambertMaterial({ color: 0x2f79a8, transparent: true, opacity: 0.7, depthWrite: false })
+      new THREE.MeshLambertMaterial({ color: 0x2f79a8, transparent: true, opacity: 0.7, depthWrite: false, side: THREE.DoubleSide })
     );
     seaMesh.rotation.x = -Math.PI / 2;
     seaMesh.position.y = WATER_Y;
@@ -484,6 +484,7 @@ export default function BattleRoyaleGame() {
       hz: number;
       top: number;
       bottom?: number;
+      group?: THREE.Object3D;
     }
     const solids: SolidBox[] = [];
     const shootable: THREE.Object3D[] = [];
@@ -507,6 +508,7 @@ export default function BattleRoyaleGame() {
 
     interface VoxelBox {
       mesh: THREE.Mesh;
+      group: THREE.Object3D;
       color: THREE.Color;
       nx: number;
       ny: number;
@@ -554,6 +556,7 @@ export default function BattleRoyaleGame() {
       }
       const v: VoxelBox = {
         mesh,
+        group: b.group ?? world,
         color: (mat as THREE.MeshLambertMaterial).color.clone(),
         nx,
         ny,
@@ -617,7 +620,7 @@ export default function BattleRoyaleGame() {
       }
       inst.count = v.aliveCount;
       inst.instanceMatrix.needsUpdate = true;
-      world.add(inst);
+      v.group.add(inst);
       shootable.push(inst);
       v.mesh.visible = false;
       const si = shootable.indexOf(v.mesh);
@@ -652,7 +655,7 @@ export default function BattleRoyaleGame() {
       spawnDebris(voxTmpP.x, voxTmpP.y, voxTmpP.z, v.color, chips);
       if (v.aliveCount === 0) {
         v.gone = true;
-        world.remove(inst);
+        v.group.remove(inst);
         const si = shootable.indexOf(inst);
         if (si >= 0) shootable.splice(si, 1);
         inst.geometry.dispose();
@@ -944,9 +947,16 @@ export default function BattleRoyaleGame() {
 
     function resetVox() {
       resetBuildables();
+      // Player-built voxel pieces (floors / ramps / door panels) live in the
+      // scene rather than the world group, so clear their meshes here too.
+      for (const m of playerBuiltVox) {
+        m.parent?.remove(m);
+        m.geometry.dispose();
+      }
+      playerBuiltVox.length = 0;
       for (const v of voxBoxes) {
         if (v.inst) {
-          world.remove(v.inst);
+          v.group.remove(v.inst);
           const si = shootable.indexOf(v.inst);
           if (si >= 0) shootable.splice(si, 1);
           v.inst.geometry.dispose();
@@ -1126,8 +1136,14 @@ export default function BattleRoyaleGame() {
       sprite.position.y += 0.6 + Math.random() * 0.3;
       sprite.position.x += (Math.random() - 0.5) * 0.4;
       sprite.position.z += (Math.random() - 0.5) * 0.4;
-      world.add(sprite);
+      scene.add(sprite);
       damagePopups.push({ sprite, texture, mat, t: 0, life: 1.1, vy: 1.6 });
+    }
+
+    function disposeDamagePopup(p: DamagePopup) {
+      p.sprite.parent?.remove(p.sprite);
+      p.mat.dispose();
+      p.texture.dispose();
     }
 
     // World-space structure health bar shared by voxel boxes and built walls
@@ -1315,12 +1331,12 @@ export default function BattleRoyaleGame() {
       if (sIdx !== -1) solids.splice(sIdx, 1);
       solidToWall.delete(dest.solid);
 
-      // 2. Remove mesh from shootables and world
+      // 2. Remove mesh from shootables and its parent (world or scene)
       dest.mesh.traverse((obj) => {
         const shIdx = shootable.indexOf(obj);
         if (shIdx !== -1) shootable.splice(shIdx, 1);
       });
-      world.remove(dest.mesh);
+      dest.mesh.parent?.remove(dest.mesh);
       wallDests.delete(dest.mesh);
 
       // Clean up health bar
@@ -1423,7 +1439,7 @@ export default function BattleRoyaleGame() {
 
       g.position.set(x, y, z);
       g.rotation.y = angleY;
-      world.add(g);
+      scene.add(g);
 
       // Calculate AABB for solid collision
       const cosA = Math.abs(Math.cos(angleY));
@@ -1470,7 +1486,7 @@ export default function BattleRoyaleGame() {
     });
     const previewMesh = new THREE.Mesh(new THREE.BoxGeometry(3.2, 2.6, 0.35), blueprintMat);
     previewMesh.visible = false;
-    world.add(previewMesh);
+    scene.add(previewMesh);
 
     function toggleBuildWall(forceState?: boolean) {
       if (!running() || playerDown) return;
@@ -1491,7 +1507,8 @@ export default function BattleRoyaleGame() {
           aimBtn.textContent = 'BUILD';
           aimBtn.classList.add('build-active');
         }
-        showMessage('🧱 Build Mode: Tap [AIM] to place wall (250 HP) | [V] Cancel', 3.5);
+        const p = BUILD_PIECES[buildPieceIdx];
+        showMessage(p.icon + ' ' + p.label + ': [LEFT CLICK / TAP AIM] place (' + p.hp + ' HP) · [Wheel / T / double-tap WALL] cycle piece · [V / RIGHT CLICK] cancel', 3.2);
         playSfx('build');
       } else {
         setStatus('');
@@ -1505,6 +1522,103 @@ export default function BattleRoyaleGame() {
       }
     }
 
+    // ----------------------------------------------------
+    // Fortnite Build Pieces — Wall, Door Wall, Floor, Ramp.
+    // V cycles build mode, mouse wheel or T cycles the piece.
+    // Wall / Door are whole-object built walls; Floor / Ramp are
+    // voxel-chippable planks so grenades can blow holes in them.
+    // ----------------------------------------------------
+    const BUILD_PIECES = [
+      { kind: 'wall', icon: '🧱', label: 'Wall Cover', hp: 250 },
+      { kind: 'door', icon: '🚪', label: 'Door Wall', hp: 250 },
+      { kind: 'floor', icon: '🟫', label: 'Floor', hp: 300 },
+      { kind: 'ramp', icon: '📐', label: 'Ramp', hp: 300 },
+    ];
+    let buildPieceIdx = 0;
+    const PIECE_PREVIEW: Record<string, [number, number, number]> = {
+      wall: [3.2, 2.6, 0.35],
+      door: [3.2, 2.6, 0.35],
+      floor: [3, 0.3, 3],
+      ramp: [3, 1.05, 2.7],
+    };
+
+    function updateBuildHud() {
+      const p = BUILD_PIECES[buildPieceIdx];
+      const nameEl = $('buildWallName');
+      if (nameEl) nameEl.textContent = p.icon + ' ' + p.label;
+      const stateEl = $('buildWallState');
+      if (stateEl) stateEl.textContent = p.hp + ' HP · wheel / T cycles piece';
+      const tIcon = $('buildPieceIcon');
+      if (tIcon) tIcon.textContent = p.icon;
+      const tLabel = $('buildPieceLabel');
+      if (tLabel) tLabel.textContent = p.label.split(' ')[0];
+    }
+
+    function cycleBuildPiece(dir = 1) {
+      buildPieceIdx = (buildPieceIdx + dir + BUILD_PIECES.length) % BUILD_PIECES.length;
+      const p = BUILD_PIECES[buildPieceIdx];
+      const g = PIECE_PREVIEW[p.kind];
+      previewMesh.geometry.dispose();
+      previewMesh.geometry = new THREE.BoxGeometry(g[0], g[1], g[2]);
+      updateBuildHud();
+      if (buildMode) showMessage(p.icon + ' ' + p.label + ' selected (' + p.hp + ' HP) — aim & click to place', 1.8);
+    }
+
+    // Player-built voxel piece (floor / ramp / door panel): a plain solid
+    // box mesh with its own AABB, registered into the voxel grid so
+    // bullets chip it and blasts carve chunks out of it.
+    const playerBuiltVox: THREE.Mesh[] = [];
+    function addVoxSolid(x: number, y0: number, y1: number, z: number, w: number, d: number, mat: THREE.Material, angleY = 0) {
+      const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, y1 - y0, d), mat);
+      mesh.position.set(x, (y0 + y1) / 2, z);
+      mesh.rotation.y = angleY;
+      mesh.castShadow = true;
+      mesh.receiveShadow = true;
+      scene.add(mesh);
+      const ca = Math.abs(Math.cos(angleY));
+      const sa = Math.abs(Math.sin(angleY));
+      const sb: SolidBox = {
+        x,
+        z,
+        hx: Math.max(0.12, (w / 2) * ca + (d / 2) * sa),
+        hz: Math.max(0.12, (w / 2) * sa + (d / 2) * ca),
+        top: y1,
+        bottom: y0,
+        group: scene,
+      };
+      solids.push(sb);
+      shootable.push(mesh);
+      registerDestructible(sb, mesh, mat);
+      playerBuiltVox.push(mesh);
+      playSfx('build');
+      return mesh;
+    }
+
+    // Door wall: solid side panels with a passable 1.3 m gap + a header
+    // beam above it. Cover you can shoot and run through.
+    function buildFortniteDoor(x: number, y: number, z: number, angleY: number) {
+      const ca = Math.cos(angleY);
+      const sa = Math.sin(angleY);
+      const off = 1.125;
+      for (const side of [-1, 1]) {
+        addVoxSolid(x + ca * off * side, y, y + 2.45, z - sa * off * side, 0.95, 0.2, bmWood, angleY);
+      }
+      addVoxSolid(x, y + 2.3, y + 2.6, z, 1.3, 0.2, bmWood, angleY);
+    }
+
+    // Ramp: three axis-aligned steps of 0.35 m rise (<= step-up height),
+    // so sprinting up it just works with the stairs logic.
+    function buildFortniteRamp(x: number, z: number, angleY: number, feetY: number) {
+      const dir = Math.abs(Math.sin(angleY)) > Math.abs(Math.cos(angleY))
+        ? { x: Math.sign(Math.sin(angleY)) || 1, z: 0 }
+        : { x: 0, z: Math.sign(Math.cos(angleY)) || 1 };
+      const base = Math.max(feetY, groundAt(x, z) + 0.02);
+      for (let i = 0; i < 3; i++) {
+        const top = base + 0.35 * (i + 1);
+        addVoxSolid(x + dir.x * 0.9 * i, top - 0.4, top, z + dir.z * 0.9 * i, dir.x ? 0.9 : 3, dir.z ? 0.9 : 3, bmPlank);
+      }
+    }
+
     function placeWall() {
       if (!buildMode || !running() || playerDown) return;
       const forward = new THREE.Vector3();
@@ -1514,11 +1628,24 @@ export default function BattleRoyaleGame() {
       const placeDist = 2.8;
       const px = camera.position.x + forward.x * placeDist;
       const pz = camera.position.z + forward.z * placeDist;
-      const py = groundAt(px, pz);
       const angle = Math.atan2(forward.x, forward.z);
+      const feetY = camera.position.y - eyeH;
+      const piece = BUILD_PIECES[buildPieceIdx];
 
-      buildFortniteWall(px, py, pz, angle);
-      showMessage('🧱 Wall deployed! (250 HP) Take cover from gunfire & grenades!', 2.5);
+      if (piece.kind === 'wall') {
+        buildFortniteWall(px, groundAt(px, pz), pz, angle);
+        showMessage('🧱 Wall deployed! (250 HP) Take cover from gunfire & grenades!', 2.5);
+      } else if (piece.kind === 'door') {
+        buildFortniteDoor(px, groundAt(px, pz), pz, angle);
+        showMessage('🚪 Door wall up! Cover with a doorway you control!', 2.5);
+      } else if (piece.kind === 'floor') {
+        const top = Math.max(feetY, groundAt(px, pz) + 0.05) + 0.06;
+        addVoxSolid(px, top - 0.28, top, pz, 3, 3, bmPlank);
+        showMessage('🟫 Floor placed! Bridge water or raise a platform!', 2.5);
+      } else {
+        buildFortniteRamp(px, pz, angle, feetY);
+        showMessage('📐 Ramp placed! Run up onto roofs and containers!', 2.5);
+      }
       toggleBuildWall(false);
     }
 
@@ -1557,9 +1684,7 @@ export default function BattleRoyaleGame() {
           p.mat.opacity = Math.max(0, (p.life - p.t) / 0.35);
         }
         if (p.t >= p.life) {
-          world.remove(p.sprite);
-          p.mat.dispose();
-          p.texture.dispose();
+          disposeDamagePopup(p);
           damagePopups.splice(i, 1);
         }
       }
@@ -1596,8 +1721,19 @@ export default function BattleRoyaleGame() {
         forward.normalize();
         const px = camera.position.x + forward.x * 2.8;
         const pz = camera.position.z + forward.z * 2.8;
-        const py = groundAt(px, pz);
-        previewMesh.position.set(px, py + 1.3, pz);
+        const kind = BUILD_PIECES[buildPieceIdx].kind;
+        if (kind === 'floor') {
+          const feet = camera.position.y - eyeH;
+          const top = Math.max(feet, groundAt(px, pz) + 0.05) + 0.06;
+          previewMesh.position.set(px, top + 0.15, pz);
+        } else if (kind === 'ramp') {
+          const feet = camera.position.y - eyeH;
+          const base = Math.max(feet, groundAt(px, pz) + 0.02);
+          previewMesh.position.set(px, base + 0.55, pz);
+        } else {
+          const py = groundAt(px, pz);
+          previewMesh.position.set(px, py + 1.3, pz);
+        }
         previewMesh.rotation.y = Math.atan2(forward.x, forward.z);
       }
     }
@@ -1606,9 +1742,7 @@ export default function BattleRoyaleGame() {
     // when switching maps / modes.
     function resetBuildables() {
       for (const p of damagePopups) {
-        world.remove(p.sprite);
-        p.mat.dispose();
-        p.texture.dispose();
+        disposeDamagePopup(p);
       }
       damagePopups.length = 0;
 
@@ -1620,7 +1754,7 @@ export default function BattleRoyaleGame() {
           const shIdx = shootable.indexOf(obj);
           if (shIdx !== -1) shootable.splice(shIdx, 1);
         });
-        world.remove(dest.mesh);
+        dest.mesh.parent?.remove(dest.mesh);
         if (dest.barGroup) disposeBar(dest.barGroup);
         wallDests.delete(dest.mesh);
       }
@@ -2093,6 +2227,62 @@ export default function BattleRoyaleGame() {
     const STEP_DOWN = 0.5;
     let climb: any = null;
 
+    // Strict swept horizontal collision.
+    // Re-walks the frame's horizontal motion (preX/preZ -> current) in small
+    // substeps, clamping the player's square (radius RADIUS) against every
+    // solid box face along the way. Per-axis clamping keeps natural wall
+    // sliding; substepping (<= 0.3 m) means even a sprint-slide on a lag
+    // spike frame can never jump a wall's thickness. pushOut above stays as
+    // a safety net for teleports and spawns that land inside geometry.
+    function sweepMove(preX: number, preZ: number) {
+      let dx = camera.position.x - preX;
+      let dz = camera.position.z - preZ;
+      if (!dx && !dz) return;
+      const total = Math.hypot(dx, dz);
+      const steps = Math.max(1, Math.ceil(total / 0.3));
+      dx /= steps;
+      dz /= steps;
+      // Rewind to the frame's start, then re-walk the motion substep by
+      // substep so each wall face is hit and clamped along the way.
+      camera.position.x = preX;
+      camera.position.z = preZ;
+      for (let s = 0; s < steps; s++) {
+        if (dx) sweepAxis(0, dx);
+        if (dz) sweepAxis(1, dz);
+      }
+      // Re-apply the arena bounds that were clamped before the sweep.
+      camera.position.x = THREE.MathUtils.clamp(camera.position.x, -mapHalf, mapHalf);
+      camera.position.z = THREE.MathUtils.clamp(camera.position.z, -mapHalf, mapHalf);
+    }
+
+    function sweepAxis(axis: 0 | 1, d: number) {
+      const p = camera.position;
+      if (axis === 0) p.x += d;
+      else p.z += d;
+      const feet = p.y - eyeH;
+      const head = p.y + 0.2;
+      for (const b of solids) {
+        // Vertical band must overlap the box, same test as pushOut
+        if (b.top <= feet + 0.05 || (b.bottom ?? 0) >= head) continue;
+        // Other axis must overlap (player square vs box square)
+        const other = axis === 0 ? p.z : p.x;
+        const bOther = axis === 0 ? b.z : b.x;
+        const bOtherHalf = axis === 0 ? b.hz : b.hx;
+        if (Math.abs(other - bOther) >= bOtherHalf + RADIUS) continue;
+        // Move axis overlap: clamp to the wall face we came from
+        const move = axis === 0 ? p.x : p.z;
+        const bMove = axis === 0 ? b.x : b.z;
+        const bMoveHalf = axis === 0 ? b.hx : b.hz;
+        const nearFace = bMove - bMoveHalf - RADIUS;
+        const farFace = bMove + bMoveHalf + RADIUS;
+        if (move > nearFace && move < farFace) {
+          const clamped = d > 0 ? nearFace : farFace;
+          if (axis === 0) p.x = clamped;
+          else p.z = clamped;
+        }
+      }
+    }
+
     function supportAt(x: number, z: number, feet: number) {
       let h = groundAt(x, z);
       for (const b of solids) {
@@ -2151,7 +2341,6 @@ export default function BattleRoyaleGame() {
     }
 
     // Water & swimming
-    const WADE_SLOW = 0.6;
     const SWIM_SLOW = 0.5;
     const SWIM_DEPTH = 1.4;
     const SWIM_HEAD = 0.3;
@@ -2162,6 +2351,32 @@ export default function BattleRoyaleGame() {
       const floor = groundAt(camera.position.x, camera.position.z);
       const wet = floor < WATER_Y && camera.position.y - eyeH < WATER_Y + 0.05;
       return { floor, wet, swimming: wet && WATER_Y - floor > SWIM_DEPTH };
+    }
+
+    // Underwater screen tint + murky sea fog. The water itself is never a
+    // collider: wading applies progressive drag (movePlayer) and swimming
+    // floats you at the surface — dive with C, stroke up with Space.
+    const waterFxEl = $('waterFx');
+    const AIR_FOG = { color: 0x9cc7e8, near: 60 * FIELD, far: 220 * FIELD };
+    const SEA_FOG = { color: 0x0f364c, near: 1.5, far: 18 };
+    let underFx = false;
+    function updateWaterFx() {
+      const under = camera.position.y < WATER_Y + 0.03 && groundAt(camera.position.x, camera.position.z) < WATER_Y;
+      if (under === underFx) return;
+      underFx = under;
+      if (waterFxEl) waterFxEl.classList.toggle('on', under);
+      const f = scene.fog as THREE.Fog | null;
+      if (f) {
+        if (under) {
+          f.color.setHex(SEA_FOG.color);
+          f.near = SEA_FOG.near;
+          f.far = SEA_FOG.far;
+        } else {
+          f.color.setHex(AIR_FOG.color);
+          f.near = AIR_FOG.near;
+          f.far = AIR_FOG.far;
+        }
+      }
     }
 
     function swimStep(dt: number) {
@@ -2182,12 +2397,19 @@ export default function BattleRoyaleGame() {
     }
 
     function movePlayer(dt: number) {
+      const preX = camera.position.x;
+      const preZ = camera.position.z;
       const f = axis('KeyW', 'KeyS') - stick.y;
       const s = axis('KeyD', 'KeyA') + stick.x;
       const len = Math.hypot(f, s);
-      const { wet, swimming } = waterState();
+      const { floor, wet, swimming } = waterState();
       moving = len > 0 && !climb;
       sprinting = moving && !wet && (keys.has('ShiftLeft') || keys.has('ShiftRight') || -stick.y >= STICK_RUN);
+      // Water drag: progressive wading slowdown the deeper you go
+      // (75% speed at ankle depth down to 40% at swim depth), then a
+      // full swim once the floor drops out of reach.
+      const depth = wet ? Math.max(0, WATER_Y - floor) : 0;
+      const waterDrag = swimming ? SWIM_SLOW : wet ? THREE.MathUtils.lerp(0.75, 0.4, THREE.MathUtils.clamp(depth / SWIM_DEPTH, 0, 1)) : 1;
 
       const wx = len > 0 ? (-Math.sin(yaw) * f + Math.cos(yaw) * s) / len : 0;
       const wz = len > 0 ? (-Math.cos(yaw) * f - Math.sin(yaw) * s) / len : 0;
@@ -2251,7 +2473,7 @@ export default function BattleRoyaleGame() {
         }
       } else if (moving) {
         const boost = 1 + 0.5 * Math.min(1, runDist / RUN_RAMP);
-        const speed = (sprinting ? SPRINT : WALK) * boost * (current ? 1 : UNARMED_SPEED) * (swimming ? SWIM_SLOW : wet ? WADE_SLOW : 1);
+        const speed = (sprinting ? SPRINT : WALK) * boost * (current ? 1 : UNARMED_SPEED) * waterDrag;
         const step = speed * Math.min(1, len) * dt;
         camera.position.x += wx * step;
         camera.position.z += wz * step;
@@ -2291,6 +2513,11 @@ export default function BattleRoyaleGame() {
         }
       }
 
+      // Strict swept collision: clamp the player back out along the actual
+      // movement path so no wall can ever be tunnelled through, even on
+      // lag-spike frames or while sprint-sliding (see sweepMove below).
+      sweepMove(preX, preZ);
+
       for (const b of solids) {
         if (b.top > camera.position.y - eyeH + 0.05 && (b.bottom ?? 0) < camera.position.y + 0.2) {
           pushOut(b);
@@ -2303,10 +2530,13 @@ export default function BattleRoyaleGame() {
       if (!roll) updateStance(dt, swimming);
 
       const feet = camera.position.y - eyeH;
+      // Climb / vault is DELIBERATE: only an airborne grab (jump toward a
+      // ledge) or Space while grounded triggers it. Merely walking forward
+      // against a wall must hold the player outside — that used to auto-
+      // mantle you over the far side, which read as clipping through walls.
       const wantClimb =
         !climb &&
-        ((!grounded && vy > -12) ||
-          (grounded && (keys.has('Space') || jumpTap || keys.has('KeyW') || -stick.y > 0.35)));
+        ((!grounded && vy > -12) || (grounded && (keys.has('Space') || jumpTap)));
       if (wantClimb) {
         const fx = -Math.sin(yaw);
         const fz = -Math.cos(yaw);
@@ -2494,6 +2724,7 @@ export default function BattleRoyaleGame() {
       if (e.code === 'KeyR') startReload();
       if (e.code === 'KeyF') forcePick();
       if (e.code === 'KeyV' && !e.repeat) toggleBuildWall();
+      if (e.code === 'KeyT' && !e.repeat) cycleBuildPiece(1);
       if ((e.code === 'Digit3' || e.code === 'KeyH') && !e.repeat) {
         if (buildMode) toggleBuildWall(false);
         putAway();
@@ -2586,6 +2817,11 @@ export default function BattleRoyaleGame() {
       if (gPress?.open) {
         e.preventDefault();
         grenadeWheel(-Math.sign(e.deltaY));
+        return;
+      }
+      if (buildMode) {
+        e.preventDefault();
+        cycleBuildPiece(e.deltaY > 0 ? 1 : -1);
       }
     };
 
@@ -2649,6 +2885,179 @@ export default function BattleRoyaleGame() {
     const inventoryModeEl = $('inventoryMode');
     const dummySecEl = $('dummySec');
 
+    // ----------------------------------------------------
+    // Harbor Infrastructure — pier into the sea, container yard,
+    // warehouse and gantry crane. Everything is destructible: all
+    // pieces register as voxel boxes, so grenades chew holes in the
+    // dock planks, containers pit and collapse, and the warehouse
+    // can be blasted open for a firefight inside.
+    // ----------------------------------------------------
+    const harborGroup = new THREE.Group();
+    harborGroup.visible = false;
+    scene.add(harborGroup);
+
+    const bmPlank = new THREE.MeshLambertMaterial({ color: 0x8a6a3f });
+    const bmPlankDark = new THREE.MeshLambertMaterial({ color: 0x6d5230 });
+    const bmContainerRed = new THREE.MeshLambertMaterial({ color: 0x9c3b30 });
+    const bmContainerBlue = new THREE.MeshLambertMaterial({ color: 0x2d5f8a });
+    const bmContainerGreen = new THREE.MeshLambertMaterial({ color: 0x3e7a4a });
+    const bmContainerOrange = new THREE.MeshLambertMaterial({ color: 0xb06a28 });
+    voxHpMap.set(bmPlank, 70);
+    voxHpMap.set(bmPlankDark, 90);
+    voxHpMap.set(bmContainerRed, 230);
+    voxHpMap.set(bmContainerBlue, 230);
+    voxHpMap.set(bmContainerGreen, 230);
+    voxHpMap.set(bmContainerOrange, 230);
+
+    const HARBOR_E = Math.SQRT1_2; // the sea lies toward the +X/+Z diagonal
+    let harborAnchor: { x: number; z: number; t: number } | null = null;
+
+    function clearHarbor() {
+      harborGroup.traverse((o: any) => {
+        if (o.isMesh && o.geometry) o.geometry.dispose();
+      });
+      harborGroup.clear();
+    }
+
+    // March from (x0,z0) toward the sea until the floor drops below the
+    // waterline. Returns distance travelled, or -1 if the sea never starts.
+    function marchWaterFrom(x0: number, z0: number, maxD = 200) {
+      for (let d = 0; d <= maxD; d += 2) {
+        if (terrainHeight(x0 + HARBOR_E * d, z0 + HARBOR_E * d) < WATER_Y - 0.12) return d;
+      }
+      return -1;
+    }
+
+    // Axis-aligned square wall segments chained along the coast diagonal,
+    // so the wooden pier reads as a boardwalk heading out over the water.
+    function buildPier(bx: number, bz: number) {
+      const hBeach = terrainHeight(bx, bz);
+      const deckTop = Math.max(hBeach + 0.42, WATER_Y + 0.6);
+      const deckBot = deckTop - 0.26;
+      const SEG = 2.9;
+      const GAP = 2.5; // centre-to-centre along the diagonal
+      const segs = 12;
+      for (let k = 0; k < segs; k++) {
+        const cx = bx + HARBOR_E * GAP * k;
+        const cz = bz + HARBOR_E * GAP * k;
+        const B = { x: cx, z: cz, rot: 0 };
+        bBox(B, 'z', -SEG / 2, SEG / 2, -SEG / 2, SEG / 2, deckBot, deckTop, k % 2 === 0 ? bmPlank : bmPlankDark, harborGroup);
+        if (k % 2 === 1) {
+          // pilings under alternating segments, seabed to deck
+          const px = cx + 0.95;
+          const pz = cz - 0.95;
+          const bed = terrainHeight(px, pz) - 0.4;
+          if (deckBot - bed > 0.2) bBox(B, 'x', 0.55, 0.85, 0.55, 0.85, bed, deckBot, bmPlankDark, harborGroup);
+          const px2 = cx - 0.95;
+          const pz2 = cz + 0.95;
+          const bed2 = terrainHeight(px2, pz2) - 0.4;
+          if (deckBot - bed2 > 0.2) bBox(B, 'x', -0.85, -0.55, -0.85, -0.55, bed2, deckBot, bmPlankDark, harborGroup);
+        }
+      }
+      // Pier head platform
+      const hx = bx + HARBOR_E * GAP * segs;
+      const hz = bz + HARBOR_E * GAP * segs;
+      bBox({ x: hx, z: hz, rot: 0 }, 'z', -2.8, 2.8, -2.8, 2.8, deckBot, deckTop, bmPlank, harborGroup);
+      // Loading crates + a container on the pier head
+      bBox({ x: hx + 1.2, z: hz + 1.2, rot: 0 }, 'z', -0.55, 0.55, -0.55, 0.55, deckTop, deckTop + 1.0, bmCrate, harborGroup);
+      bBox({ x: hx - 1.3, z: hz - 0.6, rot: 0 }, 'z', -0.45, 0.45, -0.45, 0.45, deckTop, deckTop + 0.9, bmCrate, harborGroup);
+      bBox({ x: hx - 0.6, z: hz + 0.6, rot: 0 }, 'z', -3, 3, -1.3, 1.3, deckTop, deckTop + 2.6, bmContainerRed, harborGroup);
+      // Gangway step if the deck sits too far above the beach to step onto
+      if (deckTop - hBeach > 0.45) {
+        bBox({ x: bx - HARBOR_E * 1.6, z: bz - HARBOR_E * 1.6, rot: 0 }, 'z', -1.45, 1.45, -1.45, 1.45, hBeach - 0.1, hBeach + 0.38, bmPlankDark, harborGroup);
+      }
+      return { hx, hz, deckTop };
+    }
+
+    function buildHarbor() {
+      clearHarbor();
+      const tWater = marchWaterFrom(HARBOR_SPAWN.x, HARBOR_SPAWN.z, 1700);
+      if (tWater < 0) return; // no coastline this seed — bail out safely
+      const wx0 = HARBOR_SPAWN.x + HARBOR_E * tWater;
+      const wz0 = HARBOR_SPAWN.z + HARBOR_E * tWater;
+      harborAnchor = { x: wx0, z: wz0, t: tWater };
+
+      // Choose the flattest sand along the coast (perpendicular offsets)
+      // for the container yard so the structures sit sensibly.
+      let bestK = 0;
+      let bestScore = Infinity;
+      for (let k = -45; k <= 45; k += 9) {
+        const cx = wx0 + HARBOR_E * k;
+        const cz = wz0 - HARBOR_E * k;
+        const yx = cx - HARBOR_E * 26;
+        const yz = cz - HARBOR_E * 26;
+        let maxH = -Infinity;
+        let minH = Infinity;
+        for (let i = -1; i <= 1; i++) {
+          for (let j = -1; j <= 1; j++) {
+            const h = terrainHeight(yx + i * 8, yz + j * 8);
+            if (h > maxH) maxH = h;
+            if (h < minH) minH = h;
+          }
+        }
+        const centerH = terrainHeight(yx, yz);
+        const score = maxH - minH + Math.max(0, centerH - (WATER_Y + 3.2)) * 3 + Math.max(0, WATER_Y + 0.4 - centerH) * 3;
+        if (score < bestScore) {
+          bestScore = score;
+          bestK = k;
+        }
+      }
+      const yx = wx0 + HARBOR_E * bestK - HARBOR_E * 26;
+      const yz = wz0 - HARBOR_E * bestK - HARBOR_E * 26;
+      const hYard = terrainHeight(yx, yz);
+      const padTop = hYard + 0.16;
+
+      // Concrete container-yard pad
+      bBox({ x: yx, z: yz, rot: 0 }, 'z', -8, 8, -8, 8, padTop - 1, padTop, bmConcrete, harborGroup);
+
+      // Warehouse behind the yard (walkable roof, big sea-side door)
+      const wbx = yx - HARBOR_E * 22;
+      const wbz = yz - HARBOR_E * 22;
+      const hWh = terrainHeight(wbx, wbz);
+      const WB = { x: wbx, z: wbz, rot: 0 };
+      const W0 = hWh - 0.6;
+      const W1 = W0 + 5.2;
+      bWall(WB, 'z', -7, -6.6, -5, 5, W0, W1, [], bmSteel, harborGroup); // west wall
+      bWall(WB, 'z', 6.6, 7, -5, 5, W0, W1, [{ a: -2, b: 2, sill: 0, head: 3.4, glass: false }], bmSteel, harborGroup); // east wall + door
+      bWall(WB, 'x', -5, -4.6, -7, 7, W0, W1, [], bmSteel, harborGroup); // north wall
+      bWall(WB, 'x', 4.6, 5, -7, 7, W0, W1, holes([[1, 3], [5, 6.5]], 2.2, 3.6), bmSteel, harborGroup); // south wall + windows
+      bBox(WB, 'x', -5.5, 5.5, -7.5, 7.5, W1, W1 + 0.35, bmSteelDark, harborGroup); // roof
+      bBox(WB, 'z', -2.4, -0.6, -4.2, -2.6, W0, W0 + 1.3, bmCrate, harborGroup); // interior crates
+      bBox(WB, 'z', 1.0, 2.8, 2.0, 3.4, W0, W0 + 1.3, bmCrate, harborGroup);
+
+      // Portal gantry crane straddling the yard: legs, beam, trolley,
+      // cables and a hanging container that makes elevated cover.
+      const legH = padTop + 8.6;
+      const legTop = legH;
+      bBox({ x: yx - 6.5, z: yz, rot: 0 }, 'z', -0.55, 0.55, -0.55, 0.55, padTop - 1, legTop, bmSteelDark, harborGroup);
+      bBox({ x: yx + 6.5, z: yz, rot: 0 }, 'z', -0.55, 0.55, -0.55, 0.55, padTop - 1, legTop, bmSteelDark, harborGroup);
+      bBox({ x: yx, z: yz, rot: 0 }, 'x', -0.6, 0.6, -7.4, 7.4, legTop, legTop + 0.9, bmSteel, harborGroup); // cross beam
+      bBox({ x: yx + 2.2, z: yz, rot: 0 }, 'z', -0.7, 0.7, -0.7, 0.7, legTop - 1.2, legTop, bmSteelDark, harborGroup); // trolley
+      bBox({ x: yx + 2.2, z: yz, rot: 0 }, 'z', -0.08, 0.08, -0.55, -0.35, legTop - 4.6, legTop - 1.2, bmSteelDark, harborGroup); // cables
+      bBox({ x: yx + 2.2, z: yz, rot: 0 }, 'z', -0.08, 0.08, 0.35, 0.55, legTop - 4.6, legTop - 1.2, bmSteelDark, harborGroup);
+      bBox({ x: yx + 2.2, z: yz, rot: 0 }, 'z', -1.8, 1.8, -1.3, 1.3, legTop - 7.2, legTop - 4.6, bmContainerBlue, harborGroup); // hanging box
+
+      // Shipping containers in the yard — singles, a stacked pair, and
+      // one half-sunk at the waterline for cover while swimming.
+      const cont = (cx: number, cz: number, mat: THREE.Material, base: number) =>
+        bBox({ x: cx, z: cz, rot: 0 }, 'z', -3, 3, -1.3, 1.3, base, base + 2.6, mat, harborGroup);
+      cont(yx - 2, yz - 5.2, bmContainerRed, padTop);
+      cont(yx - 2, yz + 4.4, bmContainerGreen, padTop);
+      cont(yx + 3.5, yz + 4.4, bmContainerOrange, padTop);
+      cont(yx + 3.5, yz + 4.4, bmContainerBlue, padTop + 2.6); // stacked
+      const fx = wx0 + HARBOR_E * bestK + HARBOR_E * 7 - HARBOR_E * 3.6;
+      const fz = wz0 - HARBOR_E * bestK + HARBOR_E * 7 + HARBOR_E * 3.6;
+      const fTop = Math.max(WATER_Y + 0.62, terrainHeight(fx, fz) + 0.4);
+      cont(fx, fz, bmContainerOrange, fTop - 2.6); // half-sunk floating cover
+
+      // The pier itself, marching straight out to sea from the yard's
+      // own waterline so the walk from the yard onto the dock is short.
+      const dWater = marchWaterFrom(yx, yz, 140);
+      if (dWater >= 0) {
+        buildPier(yx + HARBOR_E * dWater, yz + HARBOR_E * dWater);
+      }
+    }
+
     function enterHarbor() {
       world.visible = false;
       dummies.length = 0;
@@ -2686,6 +3095,10 @@ export default function BattleRoyaleGame() {
       slideReq = false;
       rollReq = 0;
       streamTerrain(true);
+      // Harbor infrastructure: pier over the sea, container yard,
+      // warehouse and gantry crane — all voxel-destructible.
+      harborGroup.visible = true;
+      buildHarbor();
     }
 
     // Main menu & Character Pick
@@ -2763,6 +3176,22 @@ export default function BattleRoyaleGame() {
               walls: wallDests.size,
               popups: damagePopups.length,
             }),
+            setYaw: (rad: number) => {
+              yaw = rad;
+              pitch = 0;
+            },
+            groundAt: (gx: number, gz: number) => +groundAt(gx, gz).toFixed(3),
+            waterInfo: () => {
+              const s = waterState();
+              return { floor: +s.floor.toFixed(2), wet: s.wet, swimming: s.swimming, depth: +(WATER_Y - s.floor).toFixed(2), underFx };
+            },
+            harborInfo: () => harborAnchor,
+            solidsNear: (nx: number, nz: number, r = 8) =>
+              solids
+                .filter((b) => Math.hypot(b.x - nx, b.z - nz) < r)
+                .map((b) => ({ x: +b.x.toFixed(1), z: +b.z.toFixed(1), hx: +b.hx.toFixed(2), hz: +b.hz.toFixed(2), top: +b.top.toFixed(2), bottom: +(b.bottom ?? 0).toFixed(2) })),
+            buildPiece: () => BUILD_PIECES[buildPieceIdx].kind,
+            cyclePiece: (dir = 1) => cycleBuildPiece(dir),
           };
         }, 300);
       }
@@ -3699,14 +4128,14 @@ export default function BattleRoyaleGame() {
     const spanOf = (axisName: string, f0: number, f1: number, a0: number, a1: number): [number, number, number, number] =>
       axisName === 'x' ? [a0, a1, f0, f1] : [f0, f1, a0, a1];
 
-    function bBox(B: any, axisName: string, f0: number, f1: number, a0: number, a1: number, y0: number, y1: number, mat: THREE.Material) {
+    function bBox(B: any, axisName: string, f0: number, f1: number, a0: number, a1: number, y0: number, y1: number, mat: THREE.Material, parent?: THREE.Object3D) {
       const w = turnBox(B, ...spanOf(axisName, f0, f1, a0, a1));
       const mesh = new THREE.Mesh(new THREE.BoxGeometry(w.hx * 2, y1 - y0, w.hz * 2), mat);
       mesh.position.set(w.x, (y0 + y1) / 2, w.z);
       mesh.castShadow = true;
       mesh.receiveShadow = true;
-      world.add(mesh);
-      const sb: SolidBox = { x: w.x, z: w.z, hx: w.hx, hz: w.hz, top: y1, bottom: y0 };
+      (parent ?? world).add(mesh);
+      const sb: SolidBox = { x: w.x, z: w.z, hx: w.hx, hz: w.hz, top: y1, bottom: y0, group: parent };
       solids.push(sb);
       shootable.push(mesh);
       registerDestructible(sb, mesh, mat);
@@ -3731,17 +4160,18 @@ export default function BattleRoyaleGame() {
       y0: number,
       y1: number,
       openings: any[],
-      mat: THREE.Material
+      mat: THREE.Material,
+      parent?: THREE.Object3D
     ) {
       let at = a0;
       for (const o of openings.slice().sort((p, q) => p.a - q.a)) {
-        if (o.a > at) bBox(B, axisName, f0, f1, at, o.a, y0, y1, mat);
-        if (o.sill > y0) bBox(B, axisName, f0, f1, o.a, o.b, y0, o.sill, mat);
-        if (o.head < y1) bBox(B, axisName, f0, f1, o.a, o.b, o.head, y1, mat);
+        if (o.a > at) bBox(B, axisName, f0, f1, at, o.a, y0, y1, mat, parent);
+        if (o.sill > y0) bBox(B, axisName, f0, f1, o.a, o.b, y0, o.sill, mat, parent);
+        if (o.head < y1) bBox(B, axisName, f0, f1, o.a, o.b, o.head, y1, mat, parent);
         if (o.sill > y0 && o.glass !== false) bPane(B, axisName, f0, f1, o.a, o.b, o.sill, o.head);
         at = o.b;
       }
-      if (at < a1) bBox(B, axisName, f0, f1, at, a1, y0, y1, mat);
+      if (at < a1) bBox(B, axisName, f0, f1, at, a1, y0, y1, mat, parent);
     }
 
     const holes = (pairs: number[][], sill: number, head: number, glass?: boolean) =>
@@ -5097,6 +5527,7 @@ export default function BattleRoyaleGame() {
     inventoryBtnEl?.addEventListener('click', openInventory);
 
     // Fortnite Wall Build plates (desktop plate + touch button)
+    let lastTouchBuildTap = 0;
     $('buildWallBtn')?.addEventListener('click', (e) => {
       e.stopPropagation();
       getAudio();
@@ -5105,8 +5536,17 @@ export default function BattleRoyaleGame() {
     touchBuildBtnEl?.addEventListener('click', (e) => {
       e.stopPropagation();
       getAudio();
+      // Double-tap while armed cycles the build piece; single tap toggles.
+      const now = performance.now();
+      if (buildMode && now - lastTouchBuildTap < 350) {
+        cycleBuildPiece(1);
+        lastTouchBuildTap = 0;
+        return;
+      }
+      lastTouchBuildTap = now;
       toggleBuildWall();
     });
+    updateBuildHud();
 
     if (inventoryWeaponsEl) inventoryWeaponsEl.innerHTML = '';
     if (inventoryAmmoEl) inventoryAmmoEl.innerHTML = '';
@@ -5877,6 +6317,7 @@ export default function BattleRoyaleGame() {
         return;
       }
       movePlayer(dt);
+      updateWaterFx();
       updatePickups(dt);
       updateWeapon(dt);
       if (mouseHeld) shoot();
@@ -5950,6 +6391,7 @@ export default function BattleRoyaleGame() {
       <div className="shield-fx" id="shieldFx" aria-hidden="true" />
       <div className="hurt-fx" id="hurtFx" aria-hidden="true" />
       <div className="smoke-fx" id="smokeFx" aria-hidden="true" />
+      <div className="water-fx" id="waterFx" aria-hidden="true" />
 
       {/* Top HUD: Downs and credits */}
       <div className="hud downs">
@@ -6068,15 +6510,15 @@ export default function BattleRoyaleGame() {
         </div>
       </div>
 
-      {/* Fortnite Wall Build Plate (Desktop) */}
+      {/* Fortnite Build Plate (Desktop) */}
       <button
         type="button"
         className="hud build-plate"
         id="buildWallBtn"
-        aria-label="Build Fortnite Wooden Wall Cover"
+        aria-label="Build Fortnite Cover"
       >
         <div className="t-name">
-          <span>🧱 Wall Cover</span>
+          <span id="buildWallName">🧱 Wall Cover</span>
           <kbd className="t-key">V</kbd>
         </div>
         <div className="t-state" id="buildWallState">
@@ -6143,9 +6585,9 @@ export default function BattleRoyaleGame() {
             0
           </small>
         </div>
-        <div className="touch-build" id="touchBuildBtn" role="button" aria-label="Build Wall">
-          <span className="tb-icon">🧱</span>
-          <span className="tb-label">Wall</span>
+        <div className="touch-build" id="touchBuildBtn" role="button" aria-label="Build">
+          <span className="tb-icon" id="buildPieceIcon">🧱</span>
+          <span className="tb-label" id="buildPieceLabel">Wall</span>
         </div>
       </div>
       <div className="gpick" id="gPick" aria-hidden="true" />
@@ -6243,13 +6685,15 @@ export default function BattleRoyaleGame() {
             <li>Dummies within 15 m are shot automatically. Hold <kbd>Right click</kbd> to aim at range.</li>
             <li>Sniper: hold <kbd>Right click</kbd> to look through its 8x scope</li>
             <li>Betgun: 150 damage within 30 m. Within 10 m, 80 more skips the shield. Less damage beyond 30 m</li>
-            <li>Jump into a crate in front of you to climb onto it</li>
+            <li>Jump into a crate in front of you to climb onto it, or hold <kbd>Space</kbd> at a ledge to vault</li>
+            <li>Water slows you the deeper you wade, then you swim: <kbd>C</kbd> dives, <kbd>Space</kbd> strokes upward</li>
             <li>Take cover: walls and crates block grenade blasts and fire — for you and for the dummies</li>
             <li>Cover fails eventually: blasts chew voxel holes through walls and crates, and bullets chip chunks off</li>
             <li>Structures have health: damage numbers pop, health bars show, and a gutted building collapses</li>
             <li>
-              <kbd>V</kbd> builds a 250 HP wooden wall where you look — deployable cover that blocks gunfire and
-              blasts until it shatters
+              <kbd>V</kbd> opens build mode with four pieces — <b>Wall</b>, <b>Door Wall</b>, <b>Floor</b> and{' '}
+              <b>Ramp</b>. <kbd>T</kbd> or the mouse wheel cycles them, <kbd>Left click</kbd> places. Wall and Door
+              stop gunfire and blasts until they shatter; Floors bridge water; Ramps run you onto roofs
             </li>
             <li>Bullets lose power with range: SMG past 20 m, SK past 60 m, sniper past 200 m</li>
             <li>Shield takes hits first, then life. It recharges after 6 s without damage</li>
@@ -6273,7 +6717,8 @@ export default function BattleRoyaleGame() {
             <li>Hold AIM to aim and turn the view</li>
             <li>Tap slider to jump. Slide left/right to roll, down to crouch/slide</li>
             <li>Tap GRENADE to arm, tap AIM to throw. Hold GRENADE and slide up to pick kind</li>
-            <li>Tap WALL to arm build mode, then tap AIM to make a 250 HP wooden wall appear</li>
+            <li>Tap WALL to arm build mode, then tap AIM to place. Double-tap WALL to cycle Wall, Door, Floor, Ramp</li>
+            <li>Wade into the sea: you slow down, then swim. Hold crouch to dive, tap jump to stroke up</li>
             <li>Tap INVENTORY to purchase weapons, ammo and customize dummies</li>
           </ul>
           <button className="btn" id="btn" type="button">
