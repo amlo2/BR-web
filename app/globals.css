@@ -1,6 +1,22 @@
 @import url("https://fonts.googleapis.com/css2?family=Comic+Neue:ital,wght@0,400;0,700;1,700&family=Creepster&display=swap");
 @import "tailwindcss";
 
+@font-face {
+  font-family: "Fractal";
+  src: url("/fonts/fractal.ttf") format("truetype");
+  font-weight: normal;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "aSena";
+  src: url("/fonts/asenafv.ttf") format("truetype");
+  font-weight: normal;
+  font-style: normal;
+  font-display: swap;
+}
+
 :root {
   --bg: #dfe5ec;
   --panel: #ffffff;
@@ -15,8 +31,10 @@
   --shield-deep: #0e7490;
   --life: #ff5c6b;
   --danger: #e11d2e;
-  --font-display: "Comic Sans MS", "Comic Neue", Papyrus, "Chalkboard SE", "Curlz MT", cursive, fantasy;
-  --font-body: "Comic Sans MS", "Comic Neue", Papyrus, "Chalkboard SE", "Curlz MT", cursive, fantasy;
+  --font-cursed-title: "Fractal", "aSena", "Creepster", "Comic Sans MS", "Comic Neue", Papyrus, cursive, fantasy;
+  --font-cursed-button: "aSena", "Fractal", "Comic Sans MS", "Comic Neue", Papyrus, cursive, fantasy;
+  --font-display: "Fractal", "aSena", "Creepster", "Comic Sans MS", "Comic Neue", Papyrus, "Chalkboard SE", "Curlz MT", cursive, fantasy;
+  --font-body: "aSena", "Fractal", "Comic Sans MS", "Comic Neue", Papyrus, "Chalkboard SE", "Curlz MT", cursive, fantasy;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -1087,7 +1105,10 @@ body:not(.touch) .touch-only, body.touch .keys-only { display: none; }
 
 .menu-head h1 {
   margin: 0;
-  font: 800 2.5rem/1 var(--font-display);
+  font-family: var(--font-cursed-title);
+  font-weight: 800;
+  font-size: 2.7rem;
+  line-height: 1.1;
   letter-spacing: 0.05em;
   text-transform: uppercase;
   color: #fff;
@@ -1095,7 +1116,10 @@ body:not(.touch) .touch-only, body.touch .keys-only { display: none; }
 }
 
 .menu-head .eyebrow {
-  font: 700 0.78rem/1 var(--font-display);
+  font-family: var(--font-cursed-button);
+  font-weight: 700;
+  font-size: 0.85rem;
+  line-height: 1;
   letter-spacing: 0.18em;
   text-transform: uppercase;
   color: var(--accent);
@@ -1123,7 +1147,10 @@ body:not(.touch) .touch-only, body.touch .keys-only { display: none; }
 
 .menu-label {
   margin: 0 0 12px;
-  font: 700 0.95rem/1 var(--font-display);
+  font-family: var(--font-cursed-title);
+  font-weight: 700;
+  font-size: 1.05rem;
+  line-height: 1;
   letter-spacing: 0.14em;
   text-transform: uppercase;
   color: #cbd5e1;
@@ -1141,6 +1168,7 @@ body:not(.touch) .touch-only, body.touch .keys-only { display: none; }
 /* Semi-Transparent Glass Buttons */
 .char, .mode {
   position: relative;
+  font-family: var(--font-cursed-button);
   background: rgba(15, 23, 42, 0.42);
   backdrop-filter: blur(18px) saturate(180%);
   -webkit-backdrop-filter: blur(18px) saturate(180%);
@@ -1178,14 +1206,20 @@ body:not(.touch) .touch-only, body.touch .keys-only { display: none; }
 }
 
 .char-name {
-  font: 800 1.35rem/1.1 var(--font-display);
+  font-family: var(--font-cursed-button);
+  font-weight: 800;
+  font-size: 1.45rem;
+  line-height: 1.1;
   letter-spacing: 0.04em;
   text-transform: uppercase;
   color: #ffffff;
 }
 
 .char-role {
-  font: 600 0.88rem/1.2 var(--font-body);
+  font-family: var(--font-cursed-button);
+  font-weight: 600;
+  font-size: 0.95rem;
+  line-height: 1.2;
   color: #94a3b8;
 }
 
@@ -1200,19 +1234,25 @@ body:not(.touch) .touch-only, body.touch .keys-only { display: none; }
 }
 
 .mode-name {
-  font: 800 1.35rem/1 var(--font-display);
+  font-family: var(--font-cursed-button);
+  font-weight: 800;
+  font-size: 1.45rem;
+  line-height: 1.1;
   letter-spacing: 0.05em;
   text-transform: uppercase;
   color: #ffffff;
 }
 
 .mode-tag {
+  font-family: var(--font-cursed-title);
+  font-weight: 700;
+  font-size: 0.8rem;
+  line-height: 1;
   padding: 6px 12px;
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.1);
   border: 1px solid rgba(255, 255, 255, 0.15);
   color: #cbd5e1;
-  font: 700 0.72rem/1 var(--font-display);
   letter-spacing: 0.08em;
   text-transform: uppercase;
   white-space: nowrap;
@@ -1264,7 +1304,10 @@ body:not(.touch) .touch-only, body.touch .keys-only { display: none; }
   border: 1.5px solid rgba(255, 255, 255, 0.6);
   border-radius: 16px;
   color: #111620;
-  font: 800 1.5rem/1 var(--font-display);
+  font-family: var(--font-cursed-title);
+  font-weight: 800;
+  font-size: 1.65rem;
+  line-height: 1;
   letter-spacing: 0.12em;
   text-transform: uppercase;
   cursor: pointer;
