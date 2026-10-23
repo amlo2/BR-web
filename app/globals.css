@@ -1898,6 +1898,8 @@ body:not(.touch) .touch-build { display: none; }
 .compass-mark.c-outp b { color: #7fb2d9; }
 .compass-mark.c-tow { border-color: rgba(94, 207, 201, 0.6); }
 .compass-mark.c-tow b { color: #5ecfc9; }
+.compass-mark.c-ship { border-color: rgba(239, 68, 68, 0.65); }
+.compass-mark.c-ship b { color: #ef4444; }
 
 /* Off-screen landmarks go compact: label only, no distance row */
 .compass-mark.pinned {

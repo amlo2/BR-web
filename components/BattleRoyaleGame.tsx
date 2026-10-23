@@ -233,7 +233,8 @@ export default function BattleRoyaleGame() {
     // ----------------------------------------------------
     let terrainOn = false;
     let terrainSeed = 1;
-    const HARBOR_SPAWN = { x: 0, z: 0 };
+    let HARBOR_SPAWN = { x: 0, z: 0 }; // harbor: beach spawn beside the quay (set by planHarbor)
+    const PORT_SEARCH = { x: 0, z: 0 }; // where the coast scan starts (map centre)
     const RANGE_SPAWN = { x: 0, z: 14 };
     let spawn = RANGE_SPAWN;
 
@@ -382,20 +383,22 @@ export default function BattleRoyaleGame() {
       let land = keep * Math.max(0.3, raw);
       const lwe = BW.lw * keep; // lakes never swallow the spawn pad
       if (lwe > 0.002) land += (WATER_Y - LAKE_DEPTH * (1 + 0.5 * BW.jw) - land) * lwe;
-      // POI pads: blend the raw landscape toward each registered base
-      // height so structures sit level without floating or burying.
-      for (const f of flatZones) {
-        const fd = Math.hypot(x - f.x, z - f.z);
-        if (fd < f.r + 24) {
-          const t = 1 - THREE.MathUtils.smoothstep(fd, f.r - 10, f.r + 22);
-          land += (f.baseY - land) * t;
-        }
-      }
       const d = seaDist(x, z);
       const inland = THREE.MathUtils.smoothstep(-d, 10, 110);
       const shore = land * inland + BEACH_Y * (1 - inland);
       const bed = WATER_Y - SEA_DEPTH * THREE.MathUtils.smoothstep(d, 0, 200);
-      return shore + (bed - shore) * THREE.MathUtils.smoothstep(d, -10, 10);
+      let h = shore + (bed - shore) * THREE.MathUtils.smoothstep(d, -10, 10);
+      // Flatten pads LAST so terminal aprons can override the shore/sea
+      // blending — the raised port deck stands proud of the beach, and
+      // inland POI pads keep their exact same result (inland == 1 there).
+      for (const f of flatZones) {
+        const fd = Math.hypot(x - f.x, z - f.z);
+        if (fd < f.r + 24) {
+          const t = 1 - THREE.MathUtils.smoothstep(fd, f.r - 10, f.r + 22);
+          h += (f.baseY - h) * t;
+        }
+      }
+      return h;
     }
 
     function groundAt(x: number, z: number) {
@@ -866,8 +869,8 @@ export default function BattleRoyaleGame() {
         const vz = z0 + rnd() * TILE;
         // Keep the spawn pad, the port complex, the beach and every
         // POI pad clear — plants grow everywhere else.
-        if (Math.hypot(vx - HARBOR_SPAWN.x, vz - HARBOR_SPAWN.z) < 34) continue;
-        if (harborAnchor && Math.hypot(vx - harborAnchor.x, vz - harborAnchor.z) < 330) continue;
+        if (Math.hypot(vx - HARBOR_SPAWN.x, vz - HARBOR_SPAWN.z) < 40) continue;
+        if (harborAnchor && Math.hypot(vx - harborAnchor.x, vz - harborAnchor.z) < portClearR) continue;
         if (seaDist(vx, vz) > -14) continue;
         let pad = false;
         for (const f of flatZones) {
@@ -3471,6 +3474,9 @@ export default function BattleRoyaleGame() {
 
     const HARBOR_E = Math.SQRT1_2; // the sea lies toward the +X/+Z diagonal
     let harborAnchor: { x: number; z: number; t: number } | null = null;
+    // Clearing radius around the port — no vegetation and no POIs inside
+    // it. planHarbor grows it to cover the whole platform footprint.
+    let portClearR = 330;
     // Landmark chips the top compass tracks in Harbor mode. buildHarbor
     // swaps in a fresh array each entry; the compass reconfigures on change.
     type HarborMark = { x: number; z: number; label: string; cls: string };
@@ -3492,287 +3498,871 @@ export default function BattleRoyaleGame() {
       return -1;
     }
 
-    // Axis-aligned square wall segments chained along the coast diagonal,
-    // so the wooden pier reads as a boardwalk heading out over the water.
-    function buildPier(bx: number, bz: number) {
-      const hBeach = terrainHeight(bx, bz);
-      const deckTop = Math.max(hBeach + 0.42, WATER_Y + 0.6);
-      const deckBot = deckTop - 0.26;
-      const SEG = 2.9;
-      const GAP = 2.5; // centre-to-centre along the diagonal
-      const segs = 12;
-      for (let k = 0; k < segs; k++) {
-        const cx = bx + HARBOR_E * GAP * k;
-        const cz = bz + HARBOR_E * GAP * k;
-        const B = { x: cx, z: cz, rot: 0 };
-        bBox(B, 'z', -SEG / 2, SEG / 2, -SEG / 2, SEG / 2, deckBot, deckTop, k % 2 === 0 ? bmPlank : bmPlankDark, harborGroup);
-        if (k % 2 === 1) {
-          // pilings under alternating segments, seabed to deck
-          const px = cx + 0.95;
-          const pz = cz - 0.95;
-          const bed = terrainHeight(px, pz) - 0.4;
-          if (deckBot - bed > 0.2) bBox(B, 'x', 0.55, 0.85, 0.55, 0.85, bed, deckBot, bmPlankDark, harborGroup);
-          const px2 = cx - 0.95;
-          const pz2 = cz + 0.95;
-          const bed2 = terrainHeight(px2, pz2) - 0.4;
-          if (deckBot - bed2 > 0.2) bBox(B, 'x', -0.85, -0.55, -0.85, -0.55, bed2, deckBot, bmPlankDark, harborGroup);
-        }
-      }
-      // Pier head platform
-      const hx = bx + HARBOR_E * GAP * segs;
-      const hz = bz + HARBOR_E * GAP * segs;
-      bBox({ x: hx, z: hz, rot: 0 }, 'z', -2.8, 2.8, -2.8, 2.8, deckBot, deckTop, bmPlank, harborGroup);
-      // Loading crates + a container on the pier head
-      bBox({ x: hx + 1.2, z: hz + 1.2, rot: 0 }, 'z', -0.55, 0.55, -0.55, 0.55, deckTop, deckTop + 1.0, bmCrate, harborGroup);
-      bBox({ x: hx - 1.3, z: hz - 0.6, rot: 0 }, 'z', -0.45, 0.45, -0.45, 0.45, deckTop, deckTop + 0.9, bmCrate, harborGroup);
-      bBox({ x: hx - 0.6, z: hz + 0.6, rot: 0 }, 'z', -3, 3, -1.3, 1.3, deckTop, deckTop + 2.6, bmContainerRed, harborGroup);
-      // Gangway step if the deck sits too far above the beach to step onto
-      if (deckTop - hBeach > 0.45) {
-        bBox({ x: bx - HARBOR_E * 1.6, z: bz - HARBOR_E * 1.6, rot: 0 }, 'z', -1.45, 1.45, -1.45, 1.45, hBeach - 0.1, hBeach + 0.38, bmPlankDark, harborGroup);
-      }
-      return { hx, hz, deckTop };
-    }
+    // Shipping-container footprint (a 40ft high-cube unit): taller than
+    // the player, stackable, the workhorse of yards, cranes and decks.
+    const CONT_L = 12.2;
+    const CONT_W = 2.44;
+    const CONT_H = 2.9;
 
-    // The port is the map's centerpiece: pier, container yard,
-    // warehouses, gantry + tower cranes, customs office, fuel
-    // depot, dry dock with a half-built ship, breakwater with a
-    // climbable lighthouse and a moored boat — all destructible.
-    // Planning happens BEFORE terrain tiles stream so the flat
-    // pads under the warehouses/office/tanks are part of the mesh.
+    // Everything planHarbor decides before a single tile streams: the
+    // concrete platform the whole port stands on, the mega-ship berth,
+    // the beach spawn, the graving-dock and breakwater sites. Every
+    // dimension is drawn from the terrain seed, so two harbors from two
+    // games never look the same.
     interface PortPlan {
-      wx0: number;
-      wz0: number;
-      yx: number;
-      yz: number;
-      hYard: number;
-      padTop: number;
-      bestK: number;
-      wh1: { x: number; z: number };
-      wh2: { x: number; z: number };
-      office: { x: number; z: number };
-      tanks: { x: number; z: number };
+      cx: number;
+      cz: number;
+      L: number; // platform size along X (400-560)
+      D: number; // platform size along Z (250-360)
+      padTop: number; // deck surface height (absolute)
+      berth: 'east' | 'south';
+      ship: { axis: 'z' | 'x'; fixed: number; start: number; len: number; beam: number; deckY: number } | null;
+      spawn: { x: number; z: number };
       dock: { x: number; z: number } | null;
       bwall: { x: number; z: number };
+      stats: { buildings: number; containers: number; cranes: number; tanks: number; shipBoxes: number; solids: number };
     }
     let portPlan: PortPlan | null = null;
 
+    // Loot that lives ON structures — ship decks, dock walls, rock tops.
+    // poiLoot only knows terrain height, so these place pickups directly.
+    function shipLoot(kinds: string[], x: number, z: number, y: number) {
+      for (const kind of kinds) {
+        const group = pickupMesh(kind);
+        group.position.set(x, y, z);
+        group.userData.poi = -1;
+        scene.add(group);
+        pickups.push({ kind, x, z, group, taken: false, timer: 0 });
+      }
+    }
+
+    // Port warehouse: 30-46 m of roll-doored steel with a parapet roof
+    // you can walk, high windows, pillars and crate rows inside.
+    function buildMegaWarehouse(B: any, gy: number, hx: number, hz: number, doors: number, parent?: THREE.Object3D) {
+      const T = 0.5;
+      const E = gy + 9;
+      bWall(B, 'z', -hx, -hx + T, -hz, hz, gy, E, [], bmSteel, parent);
+      bWall(B, 'z', hx - T, hx, -hz, hz, gy, E, [], bmSteel, parent);
+      bWall(B, 'x', -hz, -hz + T, -hx, hx, gy, E, holes([[-hx + 4, -hx + 7], [hx - 7, hx - 4]], gy + 5.8, gy + 7.6), bmSteel, parent);
+      const doorList: any[] = [];
+      for (let i = 0; i < doors; i++) {
+        const c = -hx + ((2 * hx) / doors) * (i + 0.5);
+        doorList.push({ a: c - 2.6, b: c + 2.6, sill: gy, head: gy + 5.4, glass: false });
+      }
+      bWall(B, 'x', hz - T, hz, -hx, hx, gy, E, doorList, bmSteel, parent);
+      bBox(B, 'x', -hz, hz, -hx, hx, E, E + 0.4, bmSteelDark, parent); // roof deck
+      bBox(B, 'z', -hx, hx, -hz, -hz + 0.35, E + 0.4, E + 1.5, bmSteelDark, parent); // parapet ring
+      bBox(B, 'z', -hx, hx, hz - 0.35, hz, E + 0.4, E + 1.5, bmSteelDark, parent);
+      bBox(B, 'x', -hz, hz, -hx, -hx + 0.35, E + 0.4, E + 1.5, bmSteelDark, parent);
+      bBox(B, 'x', -hz, hz, hx - 0.35, hx, E + 0.4, E + 1.5, bmSteelDark, parent);
+      for (const px of [-hx + 2.6, hx - 2.6]) {
+        for (const pz of [-hz + 2.6, hz - 2.6]) {
+          bBox(B, 'z', px - 0.3, px + 0.3, pz - 0.3, pz + 0.3, gy, E, bmSteelDark, parent); // pillars
+        }
+      }
+      for (let i = 0; i < 5; i++) {
+        const cxx = -hx + 4 + (i / 4) * (2 * hx - 8);
+        bBox(B, 'z', cxx - 0.9, cxx + 0.9, -hz + 3.4, -hz + 5.2, gy, gy + 1.4, bmCrate, parent);
+        if (i % 2 === 0) bBox(B, 'z', cxx - 0.9, cxx + 0.9, -hz + 3.4, -hz + 5.2, gy + 1.4, gy + 2.6, bmCrate, parent);
+      }
+    }
+
+    // Portal gantry crane straddling a container block: four legs, two
+    // full-length booms, cross beam, trolley, spreader + hanging unit.
+    function buildGantry(B: any, gy: number, halfSpan: number, halfLen: number, hangMat: THREE.Material, parent?: THREE.Object3D) {
+      const legH = gy + 15.5;
+      for (const su of [-1, 1]) {
+        for (const sv of [-1, 1]) {
+          bBox(B, 'z', su * halfSpan - 0.5, su * halfSpan + 0.5, sv * halfLen - 0.5, sv * halfLen + 0.5, gy - 0.6, legH, bmSteelDark, parent);
+        }
+        bBox(B, 'x', -halfLen, halfLen, su * halfSpan - 0.45, su * halfSpan + 0.45, legH, legH + 0.9, bmSteel, parent);
+      }
+      bBox(B, 'z', -halfSpan - 0.4, halfSpan + 0.4, -0.5, 0.5, legH, legH + 1.0, bmWarnOrange, parent); // cross beam
+      bBox(B, 'z', -1.6, 1.6, -1.1, 1.1, legH - 1.7, legH, bmSteelDark, parent); // trolley
+      bBox(B, 'z', -1.9, 1.9, -1.9, 1.9, legH - 2.5, legH - 1.7, bmSteel, parent); // spreader
+      bBox(B, 'z', -CONT_W / 2, CONT_W / 2, -CONT_L / 2, CONT_L / 2, legH - 2.5 - CONT_H, legH - 2.5, hangMat, parent); // hanging unit
+    }
+
+    // THE mega-ship: 330-400 m of container freighter berthed at the
+    // platform's seaward corner — hundreds of times the player's size.
+    // Hull bands, bulkhead bays, open cargo holds you can drop into,
+    // deck container stacks, accommodation + bridge with wings, funnel,
+    // masts, rails, bollards. All of it voxel-destructible.
+    function buildMegaShip(sh: NonNullable<PortPlan['ship']>, rnd: () => number, stats: PortPlan['stats'], parent: THREE.Object3D) {
+      const along = sh.axis === 'z';
+      const su = sh.start;
+      const fixed = sh.fixed;
+      const len = sh.len;
+      const hb = sh.beam / 2;
+      const keelY = WATER_Y - 5.6;
+      const deckY = sh.deckY;
+      const before = solids.length;
+      // (u, v) -> world: u runs along the hull from the stern, v across.
+      // v-ranges arrive sometimes high-to-low (the s=-1 side runs), so
+      // normalize first — a negative half-extent would be a phantom box
+      // that never collides.
+      const box = (u0: number, u1: number, v0: number, v1: number, y0: number, y1: number, mat: THREE.Material) => {
+        const bv0 = Math.min(v0, v1);
+        const bv1 = Math.max(v0, v1);
+        const cu = (u0 + u1) / 2;
+        const cv = (bv0 + bv1) / 2;
+        const du = (u1 - u0) / 2;
+        const dv = (bv1 - bv0) / 2;
+        if (along) bBox({ x: fixed + cv, z: su + cu, rot: 0 }, 'z', -dv, dv, -du, du, y0, y1, mat, parent);
+        else bBox({ x: su + cu, z: fixed + cv, rot: 0 }, 'z', -du, du, -dv, dv, y0, y1, mat, parent);
+      };
+      // hull sides: full-beam run, then stepped bow taper — three bands
+      // (antifouling red / waterline white / dark topsides)
+      const sideRuns: Array<[number, number, number]> = [
+        [6, len - 44, hb],
+        [len - 44, len - 22, hb - 4],
+        [len - 22, len - 8, hb - 8.5],
+        [len - 8, len - 2, hb - 12],
+      ];
+      for (const [u0, u1, w] of sideRuns) {
+        for (const s of [-1, 1]) {
+          box(u0, u1, s * (w - 1.2), s * w, keelY + 0.7, WATER_Y + 0.2, bmContainerRed);
+          box(u0, u1, s * (w - 1.2), s * w, WATER_Y + 0.2, WATER_Y + 0.6, bmWhite);
+          box(u0, u1, s * (w - 1.2), s * w, WATER_Y + 0.6, deckY - 0.1, bmSteelDark);
+        }
+      }
+      // bow cap + bulbous bow + stern transom
+      box(len - 12, len - 2, -(hb - 11), hb - 11, deckY - 0.1, deckY + 1.5, bmSteelDark);
+      box(len - 18, len - 2, -2.4, 2.4, keelY, keelY + 2.6, bmContainerRed);
+      box(2, 8, -(hb - 1.2), hb - 1.2, keelY + 0.7, deckY - 0.1, bmSteelDark);
+      // transverse bulkheads every 46 m — the deck reads as cargo bays
+      const nb = Math.floor((len - 80) / 46);
+      for (let i = 0; i < nb; i++) {
+        box(46 + i * 46, 47.1 + i * 46, -(hb - 1.2), hb - 1.2, keelY + 1.5, deckY - 1.0, bmSteelDark);
+      }
+      // main deck segments; two seeded holds stay open (coaming ring,
+      // tank top, crates below, ladder back up) — drop in for loot
+      const holdSegs = new Set<number>();
+      holdSegs.add(1 + Math.floor(rnd() * 2));
+      holdSegs.add(3 + Math.floor(rnd() * 2));
+      const nSeg = Math.ceil((len - 60) / 44);
+      const holdU: Array<[number, number]> = [];
+      for (let i = 0; i < nSeg; i++) {
+        const u0 = 8 + i * 44;
+        const u1 = Math.min(u0 + 44, len - 52);
+        if (u1 - u0 < 20) break;
+        if (!holdSegs.has(i)) {
+          box(u0, u1, -(hb - 1.1), hb - 1.1, deckY - 0.9, deckY, bmSteel);
+          continue;
+        }
+        holdU.push([u0, u1]);
+        const w = hb - 1.8;
+        for (const s of [-1, 1]) box(u0 + 0.5, u1 - 0.5, s * w - 0.35, s * w, deckY, deckY + 1.3, bmWarnOrange);
+        box(u0 + 0.5, u0 + 0.85, -w, w, deckY, deckY + 1.3, bmWarnOrange);
+        box(u1 - 0.85, u1 - 0.5, -w, w, deckY, deckY + 1.3, bmWarnOrange);
+        box(u0 + 2, u1 - 2, -w + 1.0, w - 1.0, keelY + 2.6, keelY + 3.0, bmSteelDark); // tank top
+        for (let c = 0; c < 6; c++) {
+          const cu = u0 + 5 + Math.floor(c / 2) * ((u1 - u0 - 10) / 3);
+          const cv = c % 2 === 0 ? -w + 2.8 : w - 5.0;
+          box(cu - 1.1, cu + 1.1, cv - 1.1, cv + 1.1, keelY + 3.0, keelY + 5.4, bmCrate);
+        }
+        const steps = Math.ceil((deckY - keelY - 3.0) / 0.42);
+        for (let s2 = 0; s2 < steps; s2++) {
+          const off = s2 % 2 === 0 ? -w + 1.0 : -w + 1.8;
+          box(u0 + 2.2, u0 + 3.0, off - 0.36, off + 0.36, keelY + 3.0 + s2 * 0.42, keelY + 3.0 + (s2 + 1) * 0.42, bmPlankDark);
+        }
+      }
+      // forecastle: raised bow deck, steps up, windlass
+      box(len - 52, len - 10, -(hb - 6.5), hb - 6.5, deckY, deckY + 0.9, bmSteel);
+      box(len - 44, len - 42.5, -3.2, 3.2, deckY, deckY + 0.45, bmSteel);
+      box(len - 42.5, len - 41, -3.2, 3.2, deckY + 0.45, deckY + 0.9, bmSteel);
+      box(len - 26, len - 18, -1.6, 1.6, deckY + 0.9, deckY + 2.5, bmSteelDark);
+      // accommodation block aft + bridge with wings + funnel + masts
+      for (let i = 0; i < 4; i++) {
+        box(20, 46, -11, 11, deckY + i * 2.7, deckY + i * 2.7 + 2.45, bmCream);
+      }
+      box(21, 45, -11.5, 11.5, deckY + 10.8, deckY + 11.2, bmSlab); // roof
+      box(28, 44, -14, 14, deckY + 11.2, deckY + 13.8, bmWhite); // bridge with wings
+      box(28, 44, -12.6, 12.6, deckY + 12.2, deckY + 13.4, bmSteelDark); // glazing band
+      box(10, 18, -3.6, 3.6, deckY + 1.0, deckY + 9.5, bmWarnOrange); // funnel
+      box(9.8, 18.2, -3.7, 3.7, deckY + 9.5, deckY + 10.6, bmSteelDark); // funnel cap band
+      box(47.5, 48.3, -0.3, 0.3, deckY + 13.8, deckY + 21.5, bmSteelDark); // radar mast
+      box(50.5, 51.1, -0.22, 0.22, deckY + 13.8, deckY + 18.5, bmSteelDark); // halyard mast
+      // exterior stairs up the accommodation face to the roof + bridge
+      const stepsUp = Math.ceil((deckY + 11.2 - deckY) / 0.42);
+      for (let i = 0; i < stepsUp; i++) {
+        box(20 + i * 0.75, 20.9 + i * 0.75, -12.7, -11.9, deckY + i * 0.42, deckY + (i + 1) * 0.42, bmStair);
+      }
+      for (let i = 0; i < 6; i++) {
+        box(28 + i * 0.75, 28.9 + i * 0.75, -14.7, -14.0, deckY + 13.8 + i * 0.42, deckY + 13.8 + (i + 1) * 0.42, bmStair);
+      }
+      // deck cargo: seeded container bays between accom and bow
+      const rows = [-7.6, -4.5, -1.5, 1.5, 4.5, 7.6];
+      for (let u = 54; u + CONT_L < len - 60; u += CONT_L + 1.2) {
+        if (holdU.some(([h0, h1]) => u < h1 && u + CONT_L > h0)) continue;
+        for (const v of rows) {
+          if (rnd() < 0.4) continue;
+          const stackN = 1 + Math.floor(rnd() * 2);
+          const mat = [bmContainerRed, bmContainerBlue, bmContainerGreen, bmContainerOrange][Math.floor(rnd() * 4)];
+          for (let s = 0; s < stackN; s++) {
+            box(u, u + CONT_L, v - CONT_W / 2, v + CONT_W / 2, deckY + s * CONT_H, deckY + (s + 1) * CONT_H, mat);
+            stats.containers++;
+          }
+        }
+      }
+      // bulwark rails + mooring bollards along the deck edge
+      for (let u = 8; u < len - 52; u += 52) {
+        const u1 = Math.min(u + 52, len - 52);
+        for (const s of [-1, 1]) box(u, u1, s * (hb - 0.75), s * (hb - 0.45), deckY, deckY + 1.05, bmSteel);
+      }
+      for (const u of [24, len / 2, len - 64]) {
+        for (const s of [-1, 1]) box(u, u + 0.9, s * (hb - 2.4), s * (hb - 1.6), deckY, deckY + 1.0, bmSteelDark);
+      }
+      // loot: bridge roof, the centre deck lane, the bow, and inside each open hold
+      const shipAt = (u: number, v: number) => (along ? { x: fixed + v, z: su + u } : { x: su + u, z: fixed + v });
+      const bridge = shipAt(36, 0);
+      shipLoot(['sniper', 'shield'], bridge.x, bridge.z, deckY + 14.1);
+      const deck1 = shipAt(250, 0);
+      shipLoot(['smg', 'heavy'], deck1.x, deck1.z, deckY + 0.2);
+      const bowL = shipAt(len - 30, 0);
+      shipLoot(['heavy', 'shield'], bowL.x, bowL.z, deckY + 1.2);
+      for (const [h0, h1] of holdU) {
+        const hl = shipAt((h0 + h1) / 2, 0);
+        shipLoot(['heavy', 'light'], hl.x, hl.z, keelY + 3.4);
+      }
+      stats.shipBoxes = solids.length - before;
+    }
+
+    // Plan the whole port up front, BEFORE any terrain tile streams:
+    // the pads and the keep-spawn blend become part of the terrain mesh.
     function planHarbor() {
-      const tWater = marchWaterFrom(HARBOR_SPAWN.x, HARBOR_SPAWN.z, 1700);
+      HARBOR_SPAWN = { x: PORT_SEARCH.x, z: PORT_SEARCH.z };
+      portClearR = 330;
+      const tWater = marchWaterFrom(PORT_SEARCH.x, PORT_SEARCH.z, 1700);
       if (tWater < 0) {
         harborAnchor = null;
         portPlan = null;
         return;
       }
-      const wx0 = HARBOR_SPAWN.x + HARBOR_E * tWater;
-      const wz0 = HARBOR_SPAWN.z + HARBOR_E * tWater;
-      harborAnchor = { x: wx0, z: wz0, t: tWater };
-      const coastP = (k: number) => ({ x: wx0 + HARBOR_E * k, z: wz0 - HARBOR_E * k });
-      const inland = (p: { x: number; z: number }, d: number) => ({ x: p.x - HARBOR_E * d, z: p.z - HARBOR_E * d });
+      const rnd = mulberry32((terrainSeed ^ 0x7a2b0d5) >>> 0);
+      const ax0 = PORT_SEARCH.x + HARBOR_E * tWater;
+      const az0 = PORT_SEARCH.z + HARBOR_E * tWater;
 
-      // Flattest-sand scan for the container yard (unchanged heuristic)
-      let bestK = 0;
-      let bestScore = Infinity;
-      for (let k = -45; k <= 45; k += 9) {
-        const cx = wx0 + HARBOR_E * k;
-        const cz = wz0 - HARBOR_E * k;
-        const yx = cx - HARBOR_E * 26;
-        const yz = cz - HARBOR_E * 26;
-        let maxH = -Infinity;
-        let minH = Infinity;
-        for (let i = -1; i <= 1; i++) {
-          for (let j = -1; j <= 1; j++) {
-            const h = terrainHeight(yx + i * 8, yz + j * 8);
-            if (h > maxH) maxH = h;
-            if (h < minH) minH = h;
+      // Seeded dimensions, drawn once
+      const L = 400 + Math.floor(rnd() * 160); // 400-560 m
+      const D = 250 + Math.floor(rnd() * 110); // 250-360 m
+      const CORNER = 140 + rnd() * 70; // corner reach past the waterline
+      const cIn = (L / 2 + D / 2) / Math.SQRT2 - CORNER;
+      const beam = 30 + Math.floor(rnd() * 10);
+      const len = 330 + Math.floor(rnd() * 70);
+      const deckY = WATER_Y + 12.6;
+      const dockSide = rnd() < 0.5 ? -1 : 1;
+      const dockK = dockSide * (400 + Math.floor(rnd() * 90));
+      const bwK = -dockSide * (380 + Math.floor(rnd() * 120));
+
+      // The coast is noisy (SEA_WARP bends it +-200 m), so the rect is
+      // validated against REAL terrain at several spots and, if the bay
+      // is dirty here, the whole platform slides along the coast.
+      const hullClearLine = (x: number, z: number, axis: 'z' | 'x', start: number) => {
+        for (let u = 0; u <= len; u += 16) {
+          const px = axis === 'z' ? x : start + u;
+          const pz = axis === 'z' ? start + u : z;
+          if (terrainHeight(px, pz) > WATER_Y - 6.0) return false;
+        }
+        return true;
+      };
+      const berthAt = (side: 'east' | 'south', XE: number, ZS: number, cx: number, cz: number): PortPlan['ship'] => {
+        if (side === 'east') {
+          const fixed = XE + 6 + beam / 2;
+          let start = cz - 250;
+          for (; start < cz + 500; start += 16) {
+            if (hullClearLine(fixed, 0, 'z', start)) break;
+          }
+          return start < cz + 500 && hullClearLine(fixed, 0, 'z', start) ? { axis: 'z', fixed, start, len, beam, deckY } : null;
+        }
+        const fixed = ZS + 6 + beam / 2;
+        let start = cx - 250;
+        for (; start < cx + 500; start += 16) {
+          if (hullClearLine(0, fixed, 'x', start)) break;
+        }
+        return start < cx + 500 && hullClearLine(0, fixed, 'x', start) ? { axis: 'x', fixed, start, len, beam, deckY } : null;
+      };
+      // Last resort: park the mega-ship AT ANCHOR in the open bay — march
+      // the diagonal until a full hull length of deep water is verified.
+      // The bay is uniformly deep far out, so this always finds a line.
+      const anchorAt = (cx: number, cz: number): PortPlan['ship'] => {
+        for (let t = 260; t <= 1600; t += 40) {
+          const px = cx + HARBOR_E * t;
+          const pz = cz + HARBOR_E * t;
+          if (hullClearLine(px, 0, 'z', pz - len / 2)) return { axis: 'z', fixed: px, start: pz - len / 2, len, beam, deckY };
+          if (hullClearLine(0, pz, 'x', px - len / 2)) return { axis: 'x', fixed: pz, start: px - len / 2, len, beam, deckY };
+        }
+        return null;
+      };
+
+        let plan: PortPlan | null = null;
+        let fallback: PortPlan | null = null;
+        let fallbackPads: Array<{ x: number; z: number; r: number }> = [];
+        for (const k of [0, 110, -110, 220, -220, 330, -330, 440]) {
+        const wx0 = ax0 + HARBOR_E * k;
+        const wz0 = az0 - HARBOR_E * k;
+        const cx = wx0 - HARBOR_E * cIn;
+        const cz = wz0 - HARBOR_E * cIn;
+        const padTop = WATER_Y + 2.6;
+        const XW = cx - L / 2;
+        const XE = cx + L / 2;
+        const ZN = cz - D / 2;
+        const ZS = cz + D / 2;
+
+        // Terrain pads under the whole landward footprint; near the
+        // seaward edges the radius shrinks so the blend never raises
+        // open seabed far outside the quay. Computed first, registered
+        // only if this site is chosen (validation needs RAW terrain).
+        const pads: Array<{ x: number; z: number; r: number }> = [];
+        for (let gx = XW + 30; gx <= XE - 30; gx += 48) {
+          for (let gz = ZN + 30; gz <= ZS - 30; gz += 48) {
+            const dSea = Math.min(XE - gx, ZS - gz);
+            const r = Math.max(14, Math.min(56, Math.min(gx - XW, gz - ZN), dSea - 4));
+            if (r < 14) continue;
+            pads.push({ x: gx, z: gz, r });
           }
         }
-        const centerH = terrainHeight(yx, yz);
-        const score = maxH - minH + Math.max(0, centerH - (WATER_Y + 3.2)) * 3 + Math.max(0, WATER_Y + 0.4 - centerH) * 3;
-        if (score < bestScore) {
-          bestScore = score;
-          bestK = k;
+
+        // siting validation — the platform needs a real bay at the
+        // seaward corner, real land at the landward one, and low faces
+        const ok =
+          terrainHeight(XE, ZS) < WATER_Y + 0.3 && // corner in the water
+          terrainHeight(XE, cz) < WATER_Y + 0.5 &&
+          terrainHeight(cx, ZS) < WATER_Y + 0.5 &&
+          terrainHeight(cx, cz) > WATER_Y + 0.1 &&
+          terrainHeight(XW, ZN) > WATER_Y - 0.6; // landward corner dry
+
+        // berth: try both seaward faces (full hull length verified), then
+        // the open-bay anchor line — the ship ALWAYS exists
+        const berth: 'east' | 'south' = rnd() < 0.5 ? 'east' : 'south';
+        const ship =
+          berthAt(berth, XE, ZS, cx, cz) ||
+          berthAt(berth === 'east' ? 'south' : 'east', XE, ZS, cx, cz) ||
+          anchorAt(cx, cz);
+
+        // spawn: dry sand just outside a seaward face — the ocean
+        // is right there, the port in front of you
+        let sp: { x: number; z: number } | null = null;
+        for (let u = XW + 40; u <= XE - 40 && !sp; u += 6) {
+          for (const off of [12, 18, 26]) {
+            const h = terrainHeight(u, ZS + off);
+            const dd = seaDist(u, ZS + off);
+            if (h > WATER_Y + 0.35 && h < WATER_Y + 1.9 && dd < -2 && dd > -100) sp = { x: u, z: ZS + off };
+          }
         }
-      }
-      const yard = inland(coastP(bestK), 26);
-      const hYard = terrainHeight(yard.x, yard.z);
-      flatZones.push({ x: yard.x, z: yard.z, r: 21, baseY: hYard });
-      const wh1 = inland(yard, 22);
-      const wh2 = { x: wh1.x + HARBOR_E * 36, z: wh1.z - HARBOR_E * 36 };
-      const office = inland(coastP(bestK + 26), 9);
-      const tanks = inland(wh1, 21);
-      for (const [p, r] of [
-        [wh1, 12],
-        [wh2, 12],
-        [office, 10],
-        [tanks, 11],
-      ] as Array<[{ x: number; z: number }, number]>) {
-        flatZones.push({ x: p.x, z: p.z, r, baseY: terrainHeight(p.x, p.z) });
-      }
-      // Dry dock: a coast point 64 m along the bay, then due east
-      // (axis-aligned, so the ship and channel can be box-built).
-      const dockStart = coastP(bestK - 64);
-      let dockX: number | null = null;
-      for (let d = 0; d <= 300; d += 2) {
-        if (terrainHeight(dockStart.x + d, dockStart.z) < WATER_Y - 0.12) {
-          dockX = dockStart.x + d;
+        for (let w = ZN + 40; w <= ZS - 40 && !sp; w += 6) {
+          for (const off of [12, 18, 26]) {
+            const h = terrainHeight(XE + off, w);
+            const dd = seaDist(XE + off, w);
+            if (h > WATER_Y + 0.35 && h < WATER_Y + 1.9 && dd < -2 && dd > -100) sp = { x: XE + off, z: w };
+          }
+        }
+
+        // graving dock: a coast point clear of the platform, channel east
+        const dsx = wx0 + HARBOR_E * dockK;
+        const dsz = wz0 - HARBOR_E * dockK;
+        let dockX: number | null = null;
+        for (let dd = 0; dd <= 300; dd += 2) {
+          if (terrainHeight(dsx + dd, dsz) < WATER_Y - 0.12) {
+            dockX = dsx + dd;
+            break;
+          }
+        }
+        const dock = dockX !== null ? { x: dockX, z: dsz } : null;
+        const bwall = { x: wx0 + HARBOR_E * bwK, z: wz0 - HARBOR_E * bwK };
+
+        const candidate: PortPlan = {
+          cx,
+          cz,
+          L,
+          D,
+          padTop,
+          berth: (ship?.axis === 'x' ? 'south' : 'east') as 'east' | 'south',
+          ship,
+          spawn: sp ?? { x: XW - 26, z: cz + (rnd() - 0.5) * D * 0.4 },
+          dock,
+          bwall,
+          stats: { buildings: 0, containers: 0, cranes: 0, tanks: 0, shipBoxes: 0, solids: 0 },
+        };
+        if (!fallback) {
+          fallback = candidate;
+          fallbackPads = pads;
+        }
+        if (ok && ship && sp) {
+          for (const p of pads) flatZones.push({ x: p.x, z: p.z, r: p.r, baseY: padTop - 0.42 });
+          plan = candidate;
+          harborAnchor = { x: wx0, z: wz0, t: tWater };
+          HARBOR_SPAWN = sp;
           break;
         }
       }
-      portPlan = {
-        wx0,
-        wz0,
-        yx: yard.x,
-        yz: yard.z,
-        hYard,
-        padTop: hYard + 0.16,
-        bestK,
-        wh1,
-        wh2,
-        office,
-        tanks,
-        dock: dockX !== null ? { x: dockX, z: dockStart.z } : null,
-        bwall: coastP(bestK + 52),
-      };
+      if (!plan) {
+        plan = fallback; // dirty coast everywhere — best effort
+        if (plan) for (const p of fallbackPads) flatZones.push({ x: p.x, z: p.z, r: p.r, baseY: plan.padTop - 0.42 });
+      }
+      if (plan) {
+        if (!harborAnchor) harborAnchor = { x: ax0, z: az0, t: tWater };
+        HARBOR_SPAWN = plan.spawn; // keep-blend flattens the real spawn
+        portClearR = Math.hypot(plan.L, plan.D) / 2 + 70;
+      }
+      portPlan = plan;
     }
 
     function buildHarbor() {
       clearHarbor();
       harborMarks = []; // fresh chip set for this layout
       if (!harborAnchor || !portPlan) return; // no coastline this seed — bail out safely
-      const { yx, yz, padTop, wh1, wh2, office, tanks, dock, bwall } = portPlan;
-      const coastP = (k: number) => ({ x: portPlan!.wx0 + HARBOR_E * k, z: portPlan!.wz0 - HARBOR_E * k });
-      const inland = (p: { x: number; z: number }, d: number) => ({ x: p.x - HARBOR_E * d, z: p.z - HARBOR_E * d });
+      const P = portPlan;
+      const { cx, cz, L, D, padTop, dock, bwall } = P;
+      const stats = P.stats;
+      const XW = cx - L / 2;
+      const XE = cx + L / 2;
+      const ZN = cz - D / 2;
+      const ZS = cz + D / 2;
+      const rnd = mulberry32((terrainSeed ^ 0x5eed17e) >>> 0);
+      const contMat = () => [bmContainerRed, bmContainerBlue, bmContainerGreen, bmContainerOrange][Math.floor(rnd() * 4)];
+      const solidsBefore = solids.length;
 
-      // ---- Container yard pad ----
-      bBox({ x: yx, z: yz, rot: 0 }, 'z', -8, 8, -8, 8, padTop - 1, padTop, bmConcrete, harborGroup);
+      // footprint registry — every district checks it before building so
+      // the seeded layout can never stack two structures on one spot
+      const placedRects: Array<{ x: number; z: number; hx: number; hz: number }> = [];
+      const fits = (x: number, z: number, hx: number, hz: number, m = 8) =>
+        !placedRects.some((p) => Math.abs(x - p.x) < hx + p.hx + m && Math.abs(z - p.z) < hz + p.hz + m);
+      const markPlaced = (x: number, z: number, hx: number, hz: number) => placedRects.push({ x, z, hx, hz });
 
-      // ---- Warehouse 1 behind the yard (walkable roof, sea-side door) ----
-      const hWh = terrainHeight(wh1.x, wh1.z);
-      const WB = { x: wh1.x, z: wh1.z, rot: 0 };
-      const W0 = hWh - 0.6;
-      const W1 = W0 + 5.2;
-      bWall(WB, 'z', -7, -6.6, -5, 5, W0, W1, [], bmSteel, harborGroup); // west wall
-      bWall(WB, 'z', 6.6, 7, -5, 5, W0, W1, [{ a: -2, b: 2, sill: 0, head: 3.4, glass: false }], bmSteel, harborGroup); // east wall + door
-      bWall(WB, 'x', -5, -4.6, -7, 7, W0, W1, [], bmSteel, harborGroup); // north wall
-      bWall(WB, 'x', 4.6, 5, -7, 7, W0, W1, holes([[1, 3], [5, 6.5]], 2.2, 3.6), bmSteel, harborGroup); // south wall + windows
-      bBox(WB, 'x', -5.5, 5.5, -7.5, 7.5, W1, W1 + 0.35, bmSteelDark, harborGroup); // roof
-      bBox(WB, 'z', -2.4, -0.6, -4.2, -2.6, W0, W0 + 1.3, bmCrate, harborGroup); // interior crates
-      bBox(WB, 'z', 1.0, 2.8, 2.0, 3.4, W0, W0 + 1.3, bmCrate, harborGroup);
-      harborMarks.push({ x: wh1.x, z: wh1.z, label: 'WHSE', cls: 'c-whse' }); // compass chip
-
-      // ---- Warehouse 2 (reuse the range design) beside it ----
-      buildWarehouse({ x: wh2.x, z: wh2.z, rot: 1 }, terrainHeight(wh2.x, wh2.z) - 0.5, harborGroup);
-      harborMarks.push({ x: wh2.x, z: wh2.z, label: 'WHSE', cls: 'c-whse' });
-
-      // ---- Customs office: two storeys, roof parapet, sea view ----
-      buildOffice({ x: office.x, z: office.z, rot: 1 }, terrainHeight(office.x, office.z) - 0.25, harborGroup);
-
-      // ---- Port fuel depot behind the warehouses ----
-      const tY = terrainHeight(tanks.x, tanks.z);
-      buildTank({ x: tanks.x, z: tanks.z, rot: 0 }, tY, harborGroup);
-      const tank2 = { x: tanks.x + HARBOR_E * 15, z: tanks.z - HARBOR_E * 15 };
-      buildTank({ x: tank2.x, z: tank2.z, rot: 0 }, terrainHeight(tank2.x, tank2.z), harborGroup);
-
-      // ---- Portal gantry crane straddling the yard ----
-      const legH = padTop + 8.6;
-      bBox({ x: yx - 6.5, z: yz, rot: 0 }, 'z', -0.55, 0.55, -0.55, 0.55, padTop - 1, legH, bmSteelDark, harborGroup);
-      bBox({ x: yx + 6.5, z: yz, rot: 0 }, 'z', -0.55, 0.55, -0.55, 0.55, padTop - 1, legH, bmSteelDark, harborGroup);
-      bBox({ x: yx, z: yz, rot: 0 }, 'x', -0.6, 0.6, -7.4, 7.4, legH, legH + 0.9, bmSteel, harborGroup); // cross beam
-      bBox({ x: yx + 2.2, z: yz, rot: 0 }, 'z', -0.7, 0.7, -0.7, 0.7, legH - 1.2, legH, bmSteelDark, harborGroup); // trolley
-      bBox({ x: yx + 2.2, z: yz, rot: 0 }, 'z', -0.08, 0.08, -0.55, -0.35, legH - 4.6, legH - 1.2, bmSteelDark, harborGroup); // cables
-      bBox({ x: yx + 2.2, z: yz, rot: 0 }, 'z', -0.08, 0.08, 0.35, 0.55, legH - 4.6, legH - 1.2, bmSteelDark, harborGroup);
-      bBox({ x: yx + 2.2, z: yz, rot: 0 }, 'z', -1.8, 1.8, -1.3, 1.3, legH - 7.2, legH - 4.6, bmContainerBlue, harborGroup); // hanging box
-      harborMarks.push({ x: yx + 2.2, z: yz, label: 'CRANE', cls: 'c-crane' }); // compass chip (trolley)
-
-      // ---- Shipping containers: yard singles + stacked pair ----
-      const cont = (cx: number, cz: number, mat: THREE.Material, base: number) =>
-        bBox({ x: cx, z: cz, rot: 0 }, 'z', -3, 3, -1.3, 1.3, base, base + 2.6, mat, harborGroup);
-      cont(yx - 2, yz - 5.2, bmContainerRed, padTop);
-      cont(yx - 2, yz + 4.4, bmContainerGreen, padTop);
-      cont(yx + 3.5, yz + 4.4, bmContainerOrange, padTop);
-      cont(yx + 3.5, yz + 4.4, bmContainerBlue, padTop + 2.6); // stacked
-      harborMarks.push({ x: yx, z: yz, label: 'YARD', cls: 'c-yard' }); // compass chip (container yard)
-      const fx = portPlan.wx0 + HARBOR_E * portPlan.bestK + HARBOR_E * 7 - HARBOR_E * 3.6;
-      const fz = portPlan.wz0 - HARBOR_E * portPlan.bestK + HARBOR_E * 7 + HARBOR_E * 3.6;
-      const fTop = Math.max(WATER_Y + 0.62, terrainHeight(fx, fz) + 0.4);
-      cont(fx, fz, bmContainerOrange, fTop - 2.6); // half-sunk floating cover
-
-      // ---- Extra container rows flanking the yard on the sand ----
-      const rowA = inland(coastP(portPlan.bestK - 15), 5);
-      const rowB = inland(coastP(portPlan.bestK + 17), 7);
-      for (let i = 0; i < 3; i++) {
-        const px = rowA.x + i * 5.5 - 5.5;
-        const pz = rowA.z + i * 1.5 - 1.5;
-        cont(px, pz, i === 1 ? bmContainerGreen : bmContainerRed, Math.max(WATER_Y + 0.45, terrainHeight(px, pz) + 0.15));
-      }
-      for (let i = 0; i < 2; i++) {
-        const px = rowB.x + i * 5.5 - 2.8;
-        const pz = rowB.z - i * 2.2 + 1.1;
-        const bx = Math.max(WATER_Y + 0.45, terrainHeight(px, pz) + 0.15);
-        cont(px, pz, bmContainerOrange, bx);
-        if (i === 0) cont(px, pz, bmContainerBlue, bx + 2.6);
+      // ---- The platform: a field of thick concrete slabs; on the
+      // seaward sides the slab bottoms drop below the waterline, so the
+      // port reads as a real raised foundation standing in the bay ----
+      const nX = Math.max(3, Math.round(L / 130));
+      const nZ = Math.max(2, Math.round(D / 115));
+      for (let i = 0; i < nX; i++) {
+        for (let j = 0; j < nZ; j++) {
+          const x0 = XW + (i / nX) * L;
+          const x1 = XW + ((i + 1) / nX) * L;
+          const z0 = ZN + (j / nZ) * D;
+          const z1 = ZN + ((j + 1) / nZ) * D;
+          const bottom = Math.min(padTop - 1.4, WATER_Y - 2.2);
+          bBox({ x: (x0 + x1) / 2, z: (z0 + z1) / 2, rot: 0 }, 'z', -(x1 - x0) / 2, (x1 - x0) / 2, -(z1 - z0) / 2, (z1 - z0) / 2, bottom, padTop, bmConcrete, harborGroup);
+        }
       }
 
-      // ---- The pier, marching out to sea ----
-      const dWater = marchWaterFrom(yx, yz, 140);
-      if (dWater >= 0) {
-        const head = buildPier(yx + HARBOR_E * dWater, yz + HARBOR_E * dWater);
-        harborMarks.push({ x: head.hx, z: head.hz, label: 'PIER', cls: 'c-pier' }); // compass chip
-        // moored boat beside the pier head — a swim-out platform
-        buildBoat(head.hx + HARBOR_E * 10.6, head.hz - HARBOR_E * 10.6, harborGroup);
+      // ---- Perimeter fence (west + north faces) with a seeded gate ----
+      const gateZ = cz + (rnd() - 0.5) * D * 0.3;
+      for (let z = ZN + 16; z < ZS - 16; z += 22) {
+        if (Math.abs(z + 10 - gateZ) < 6) continue;
+        if (terrainHeight(XW - 2, z + 10) > padTop + 1.2) continue;
+        bBox({ x: XW - 1.1, z: z + 10, rot: 0 }, 'z', -0.12, 0.12, -10, 10, padTop, padTop + 1.15, bmSteelDark, harborGroup);
+      }
+      for (let x = XW + 16; x < XE - 16; x += 22) {
+        if (seaDist(x + 10, ZN - 2) > -12) continue; // fence stops at the waterline
+        if (terrainHeight(x + 10, ZN - 2) > padTop + 1.2) continue;
+        bBox({ x: x + 10, z: ZN - 1.1, rot: 0 }, 'z', -10, 10, -0.12, 0.12, padTop, padTop + 1.15, bmSteelDark, harborGroup);
+      }
+      if (fits(XW + 14, gateZ + 9, 3.5, 5.5, 4)) {
+        buildShed({ x: XW + 14, z: gateZ + 9, rot: 0 }, padTop, harborGroup); // gatehouse
+        markPlaced(XW + 14, gateZ + 9, 3.5, 5.5);
+        stats.buildings++;
       }
 
-      // ---- Dry dock with a half-built ship ----
-      if (dock) {
-        const DZ = dock.z;
-        const xIn = dock.x - 14;
-        const xOut = dock.x + 24;
-        const wallTop = WATER_Y + 1.05;
-        for (const s of [-1, 1]) {
-          for (let seg = 0; seg < 6; seg++) {
-            const sx = xIn + seg * (38 / 6) + 38 / 12;
-            const sz = DZ + s * 3.5;
-            const bed = Math.min(terrainHeight(sx, sz) - 0.5, WATER_Y - 4);
-            bBox({ x: sx, z: sz, rot: 0 }, 'x', -38 / 12, 38 / 12, -0.4, 0.4, bed, wallTop, bmConcreteDark, harborGroup);
+      // ---- Quay bollards along both seaward faces ----
+      for (let z = ZN + 18; z < ZS - 18; z += 16) {
+        if (seaDist(XE + 1, z) < -6) continue;
+        bBox({ x: XE + 0.7, z, rot: 0 }, 'z', -0.3, 0.3, -0.3, 0.3, padTop - 0.2, padTop + 0.95, bmSteelDark, harborGroup);
+      }
+      for (let x = XW + 24; x < XE - 18; x += 16) {
+        if (seaDist(x, ZS + 1) < -6) continue;
+        bBox({ x, z: ZS + 0.7, rot: 0 }, 'z', -0.3, 0.3, -0.3, 0.3, padTop - 0.2, padTop + 0.95, bmSteelDark, harborGroup);
+      }
+
+      // ---- Container yard: big-box bays with aisles + gantry cranes ----
+      const yardX0 = cx + 12;
+      const yardX1 = XE - 20;
+      const yardZ0 = ZN + 64; // south of the service band, clear of it
+      const yardZ1 = ZS - 26;
+      const blockW = 4; // containers side by side across x
+      const rows = 7; // bays along z
+      const blockPitch = blockW * 2.7 + 12;
+      const nBlocks = Math.max(2, Math.min(4, Math.floor((yardX1 - yardX0) / blockPitch)));
+      const blockZW = yardZ0 + 8 + ((rows - 1) * 13.2) / 2; // block z centre
+      markPlaced(
+        yardX0 + ((nBlocks - 1) * blockPitch + blockW * 2.7) / 2,
+        blockZW,
+        ((nBlocks - 1) * blockPitch + blockW * 2.7) / 2 + 6,
+        (rows * 13.2) / 2 + 6
+      );
+      for (let b = 0; b < nBlocks; b++) {
+        const bx0 = yardX0 + b * blockPitch;
+        for (let r = 0; r < rows; r++) {
+          if (r === 3) continue; // cross aisle
+          const rz = yardZ0 + 8 + r * 13.2;
+          for (let c = 0; c < blockW; c++) {
+            if (rnd() < 0.22) continue; // a missing unit — cover, or a gap
+            const rx = bx0 + c * 2.7;
+            const stackN = 1 + Math.floor(rnd() * 3);
+            const mat = contMat();
+            for (let s = 0; s < stackN; s++) {
+              bBox({ x: rx, z: rz, rot: 0 }, 'z', -CONT_W / 2, CONT_W / 2, -CONT_L / 2, CONT_L / 2, padTop + s * CONT_H, padTop + (s + 1) * CONT_H, mat, harborGroup);
+              stats.containers++;
+            }
           }
         }
-        for (let seg = 0; seg < 5; seg++) {
-          const sx = xIn + seg * (38 / 5) + 38 / 10;
-          bBox({ x: sx, z: DZ, rot: 0 }, 'x', -38 / 10, 38 / 10, -3.3, 3.3, WATER_Y - 0.85, WATER_Y - 0.22, bmConcrete, harborGroup);
+        buildGantry({ x: bx0 + blockW * 1.35, z: blockZW, rot: 0 }, padTop, blockW * 1.35 + 2.2, (rows * 13.2) / 2 + 3, contMat(), harborGroup);
+        stats.cranes++;
+        if (b === 0) {
+          harborMarks.push({ x: bx0 + blockW * 1.35, z: blockZW, label: 'YARD', cls: 'c-yard' });
+          harborMarks.push({ x: bx0 + blockW * 1.35, z: blockZW - (rows * 13.2) / 2, label: 'CRANE', cls: 'c-crane' });
         }
-        // caisson gate sealing the seaward end — climbable lid
-        bBox({ x: xOut, z: DZ, rot: 0 }, 'z', -0.45, 0.45, -3.5, 3.5, WATER_Y - 0.7, WATER_Y + 1.45, bmConcrete, harborGroup);
-        // walk-out steps at the beach end
-        bBox({ x: xIn - 1.4, z: DZ, rot: 0 }, 'z', -0.6, 0.6, -2.2, 2.2, terrainHeight(xIn - 1.4, DZ) - 0.3, WATER_Y + 0.42, bmConcrete, harborGroup);
-        buildShip(dock.x + 4, WATER_Y - 0.22, DZ, harborGroup);
-        harborMarks.push({ x: dock.x + 4, z: DZ, label: 'DOCK', cls: 'c-dock' });
+      }
+
+      // ---- Fuel depot first (bermed tank cluster + pump shed) so the
+      // warehouse row has to dodge IT, never the other way round ----
+      let tankC: { x: number; z: number } | null = null;
+      for (const [tx, tz] of [
+        [XW + 60, ZN + 40],
+        [XW + 60, ZS - 60],
+        [XW + 60, cz + 40],
+      ] as Array<[number, number]>) {
+        if (fits(tx, tz, 38, 36, 6)) {
+          tankC = { x: tx, z: tz };
+          break;
+        }
+      }
+      if (tankC) {
+        markPlaced(tankC.x, tankC.z, 38, 36);
+        for (const [fx0, fx1, fz0, fz1] of [
+          [-36, 36, -1.0, -0.3],
+          [-36, 36, 32.3, 33.0],
+          [-1.0, -0.3, -1.0, 33.0],
+          [35.3, 36.0, -1.0, 33.0],
+        ] as Array<[number, number, number, number]>) {
+          bBox({ x: tankC.x + (fx0 + fx1) / 2, z: tankC.z + (fz0 + fz1) / 2, rot: 0 }, 'z', -(fx1 - fx0) / 2, (fx1 - fx0) / 2, -(fz1 - fz0) / 2, (fz1 - fz0) / 2, padTop - 0.3, padTop + 0.9, bmConcreteDark, harborGroup);
+        }
+        const tankN = 4 + Math.floor(rnd() * 4);
+        for (let i = 0; i < tankN; i++) {
+          buildTank({ x: tankC.x - 20 + (i % 2) * 40, z: tankC.z - 12 + Math.floor(i / 2) * 28, rot: 0 }, padTop, harborGroup);
+          stats.tanks++;
+        }
+        harborMarks.push({ x: tankC.x, z: tankC.z, label: 'TANKS', cls: 'c-fuel' });
+      }
+      if (fits(XW + 38, cz - 20, 4, 4, 6)) {
+        buildShed({ x: XW + 38, z: cz - 20, rot: 0 }, padTop, harborGroup); // pump house
+        markPlaced(XW + 38, cz - 20, 4, 4);
+        stats.buildings++;
+      }
+
+      // ---- Admin corner: customs office + harbour control + water tower ----
+      const offB = { x: XW + 38, z: cz + 40 };
+      let offBuilt = false;
+      for (const [ox, oz] of [
+        [XW + 38, cz + 40],
+        [XW + 38, ZN + 100],
+        [XW + 38, ZS - 100],
+      ] as Array<[number, number]>) {
+        if (!fits(ox, oz, 6, 5, 6)) continue;
+        offB.x = ox;
+        offB.z = oz;
+        buildOffice({ x: ox, z: oz, rot: 1 }, padTop - 0.25, harborGroup);
+        markPlaced(ox, oz, 6, 5);
+        stats.buildings++;
+        offBuilt = true;
+        harborMarks.push({ x: ox, z: oz, label: 'OFFICE', cls: 'c-outp' });
+        break;
+      }
+      for (const [wx2, wz2] of [
+        [XW + 38, cz + 70],
+        [XW + 38, ZN + 60],
+        [XW + 38, ZS - 40],
+      ] as Array<[number, number]>) {
+        if (!fits(wx2, wz2, 4, 4, 6)) continue;
+        buildWaterTower({ x: wx2, z: wz2, rot: 0 }, padTop, harborGroup);
+        markPlaced(wx2, wz2, 4, 4);
+        stats.buildings++;
+        break;
+      }
+      for (const [mx2, mz2] of [
+        [XW + 62, cz + 50],
+        [XW + 62, ZN + 80],
+        [XW + 62, ZS - 30],
+      ] as Array<[number, number]>) {
+        if (!fits(mx2, mz2, 3, 3, 6)) continue;
+        buildRadioMast({ x: mx2, z: mz2, rot: 0 }, padTop, harborGroup); // harbour control
+        markPlaced(mx2, mz2, 3, 3);
+        break;
+      }
+
+      // ---- Grain silos + headhouse ----
+      let siloC: { x: number; z: number } | null = null;
+      for (const [sx2, sz2] of [
+        [XW + 96, cz + 70],
+        [XW + 96, ZN + 100],
+        [XW + 96, ZS - 100],
+      ] as Array<[number, number]>) {
+        if (fits(sx2, sz2, 18, 20, 6)) {
+          siloC = { x: sx2, z: sz2 };
+          break;
+        }
+      }
+      if (siloC) {
+        markPlaced(siloC.x, siloC.z, 18, 20);
+        const siloN = 4 + Math.floor(rnd() * 3);
+        for (let i = 0; i < siloN; i++) {
+          buildSilo({ x: siloC.x + (i % 2) * 10 - 5, z: siloC.z + Math.floor(i / 2) * 10 - 10, rot: 0 }, padTop, harborGroup);
+        }
+        if (fits(siloC.x + 24, siloC.z - 6, 3.2, 4.8, 4)) {
+          buildShed({ x: siloC.x + 24, z: siloC.z - 6, rot: 0 }, padTop, harborGroup); // headhouse
+          stats.buildings++;
+        }
+        harborMarks.push({ x: siloC.x, z: siloC.z, label: 'SILO', cls: 'c-farm' });
+      }
+
+      // ---- Warehouse row: 30-46 m roll-doored steel giants ----
+      const whRow: Array<{ x: number; z: number }> = [];
+      let wz = ZN + 70;
+      while (wz < ZS - 40 && whRow.length < 7) {
+        const hz = 11 + Math.floor(rnd() * 4);
+        const hx = 15 + Math.floor(rnd() * 8);
+        for (let t = 0; t < 10; t++) {
+          const wx = XW + 44 + hx + rnd() * Math.max(20, cx - XW - 90 - 2 * hx);
+          if (!fits(wx, wz + hz, hx, hz, 10)) continue;
+          buildMegaWarehouse({ x: wx, z: wz + hz, rot: 0 }, padTop, hx, hz, 2 + Math.floor(rnd() * 2), harborGroup);
+          markPlaced(wx, wz + hz, hx, hz);
+          stats.buildings++;
+          whRow.push({ x: wx, z: wz + hz });
+          break;
+        }
+        wz += hz * 2 + 18 + Math.floor(rnd() * 8);
+      }
+      if (whRow.length) harborMarks.push({ x: whRow[0].x, z: whRow[0].z, label: 'WHSE', cls: 'c-whse' });
+
+      // ---- Dockworkers' row: cottages + houses by the west gate ----
+      let hz2 = cz - 88;
+      let hN = 0;
+      while (hz2 < cz - 14 && hN < 5) {
+        const B = { x: XW + 152 + rnd() * 34, z: hz2, rot: rnd() < 0.5 ? 0 : 1 };
+        const r = hN % 2 === 0 ? { hx: 4.5, hz: 3.5 } : { hx: 6, hz: 4.5 };
+        if (fits(B.x, B.z, r.hx, r.hz, 6)) {
+          (hN % 2 === 0 ? buildCottage : buildHouse)(B, padTop, harborGroup);
+          markPlaced(B.x, B.z, r.hx, r.hz);
+          stats.buildings++;
+          hN++;
+        }
+        hz2 += 21;
+      }
+
+      // ---- Service row along the north face + campus extras ----
+      const serviceSlots: Array<{ x: number; z: number; rot: number }> = [];
+      for (let sx = cx - 40; sx < XE - 40; sx += 17 + Math.floor(rnd() * 6)) {
+        serviceSlots.push({ x: sx, z: ZN + 28 + rnd() * 22, rot: rnd() < 0.5 ? 0 : 1 });
+      }
+      let sN = 0;
+      while (sN < 11 && serviceSlots.length) {
+        const s = serviceSlots.shift()!;
+        if (!fits(s.x, s.z, 3.2, 4.8, 5)) continue;
+        buildShed({ x: s.x, z: s.z, rot: s.rot }, padTop, harborGroup);
+        markPlaced(s.x, s.z, 3.2, 4.8);
+        stats.buildings++;
+        sN++;
+      }
+      const campus: Array<[number, number, number, string]> = [
+        [cx - 66, ZN + 44, 0, 'cabin'],
+        [cx - 94, ZN + 44, 0, 'green'],
+        [cx - 122, ZN + 40, 1, 'ruin'],
+      ];
+      for (const [ex, ez, er, kind] of campus) {
+        if (!fits(ex, ez, kind === 'green' ? 4 : 6, 5, 6)) continue;
+        if (kind === 'cabin') buildCabinBox({ x: ex, z: ez, rot: er }, padTop, harborGroup);
+        else if (kind === 'green') buildGreenhouse({ x: ex, z: ez, rot: er }, padTop, harborGroup);
+        else buildRuin({ x: ex, z: ez, rot: er }, padTop, harborGroup);
+        markPlaced(ex, ez, 6, 5);
+        stats.buildings++;
+      }
+
+      // ---- Construction corner: tower crane + material + site cabin ----
+      const conC = { x: cx - 60, z: ZS - 60 };
+      if (fits(conC.x, conC.z, 14, 14, 6)) {
+        markPlaced(conC.x, conC.z, 14, 14);
+        buildTowerCrane({ x: conC.x, z: conC.z, rot: rnd() < 0.5 ? 0 : 1 }, padTop, harborGroup);
+        stats.cranes++;
+        if (fits(conC.x + 24, conC.z + 16, 4, 4, 4)) {
+          buildCabinBox({ x: conC.x + 24, z: conC.z + 16, rot: 0 }, padTop, harborGroup);
+          markPlaced(conC.x + 24, conC.z + 16, 4, 4);
+          stats.buildings++;
+        }
+        for (let i = 0; i < 4; i++) {
+          bBox({ x: conC.x - 14 + (i % 2) * 5, z: conC.z - 14 + Math.floor(i / 2) * 5, rot: 0 }, 'z', -1.1, 1.1, -1.1, 1.1, padTop, padTop + 1.6 + (i % 2) * 1.2, bmCrate, harborGroup);
+        }
+      }
+
+      // ---- Guard towers by the west gate ----
+      for (const [gx2, gz2] of [
+        [XW + 16, ZN + 100],
+        [XW + 16, ZS - 60],
+      ] as Array<[number, number]>) {
+        if (!fits(gx2, gz2, 3.5, 3.5, 6)) continue;
+        buildGuardTower({ x: gx2, z: gz2, rot: 0 }, padTop, harborGroup);
+        markPlaced(gx2, gz2, 3.5, 3.5);
+        stats.buildings++;
+      }
+
+      // ---- Moored boats ----
+      if (seaDist(XE + 26, cz - 60) > 12) buildBoat(XE + 26, cz - 60 + rnd() * 30, harborGroup);
+      for (let u = cx; u < XE; u += 8) {
+        if (seaDist(u, ZS + 26) > 14) {
+          buildBoat(u, ZS + 26, harborGroup);
+          break;
+        }
+      }
+
+      // ---- THE mega-ship at its berth + boarding stair + mooring line ----
+      if (P.ship) {
+        const sh = P.ship;
+        buildMegaShip(sh, rnd, stats, harborGroup);
+        const midU = sh.start + sh.len / 2;
+        const shipMid = sh.axis === 'z' ? { x: sh.fixed, z: midU } : { x: midU, z: sh.fixed };
+        harborMarks.push({ x: shipMid.x, z: shipMid.z, label: 'SHIP', cls: 'c-ship' });
+        // boarding: berthed ships get a walkway + stair from the quay;
+        // anchored ships (dirty-coast seeds) get a swim-out pontoon with
+        // a hull ladder. Both end in a landing over the bulwark rail.
+        const face = sh.fixed - sh.beam / 2; // quay-side hull face
+        const alongside = sh.axis === 'z' ? face - XE < 16 : face - ZS < 16;
+        const quayEnd = sh.axis === 'z' ? ZS : XE;
+        if (alongside) {
+          const bU = Math.max(sh.start + 8, Math.min(sh.start + 58, quayEnd - 34));
+          const climb = Math.ceil((sh.deckY + 1.25 - padTop) / 0.42);
+          if (sh.axis === 'z') {
+            bBox({ x: (XE - 1 + face) / 2, z: bU + 11, rot: 0 }, 'z', -(face - XE + 1) / 2, (face - XE + 1) / 2, -13, 13, WATER_Y - 2.2, padTop, bmSteelDark, harborGroup); // walkway across the gap
+            for (let i = 0; i < climb; i++) {
+              bBox({ x: (XE - 1 + face) / 2, z: bU + i * 0.8 + 0.4, rot: 0 }, 'z', -(face - XE + 1) / 2, (face - XE + 1) / 2, -0.4, 0.4, padTop + i * 0.42, padTop + (i + 1) * 0.42, bmStair, harborGroup);
+            }
+            bBox({ x: face - 2.3, z: bU + climb * 0.8 + 2.2, rot: 0 }, 'z', -4.7, 4.7, -1.4, 1.4, sh.deckY - 0.1, sh.deckY + 1.25, bmSteelDark, harborGroup); // landing onto the deck
+            bBox({ x: face - 2.3, z: bU + climb * 0.8 + 3.7, rot: 0 }, 'z', -4.7, 4.7, -0.12, 0.12, sh.deckY + 1.25, sh.deckY + 2.35, bmSteel, harborGroup); // far-edge rail
+            bBox({ x: XE + 2.5, z: bU + 34, rot: 0 }, 'z', -0.06, 0.06, -0.06, 0.06, padTop + 0.9, sh.deckY, bmSteelDark, harborGroup); // mooring line
+          } else {
+            bBox({ x: bU + 11, z: (ZS - 1 + face) / 2, rot: 0 }, 'z', -13, 13, -(face - ZS + 1) / 2, (face - ZS + 1) / 2, WATER_Y - 2.2, padTop, bmSteelDark, harborGroup); // walkway across the gap
+            for (let i = 0; i < climb; i++) {
+              bBox({ x: bU + i * 0.8 + 0.4, z: (ZS - 1 + face) / 2, rot: 0 }, 'z', -0.4, 0.4, -(face - ZS + 1) / 2, (face - ZS + 1) / 2, padTop + i * 0.42, padTop + (i + 1) * 0.42, bmStair, harborGroup);
+            }
+            bBox({ x: bU + climb * 0.8 + 2.2, z: face - 2.3, rot: 0 }, 'z', -1.4, 1.4, -4.7, 4.7, sh.deckY - 0.1, sh.deckY + 1.25, bmSteelDark, harborGroup); // landing onto the deck
+            bBox({ x: bU + climb * 0.8 + 3.7, z: face - 2.3, rot: 0 }, 'z', -0.12, 0.12, -4.7, 4.7, sh.deckY + 1.25, sh.deckY + 2.35, bmSteel, harborGroup); // far-edge rail
+            bBox({ x: bU + 34, z: ZS + 2.5, rot: 0 }, 'z', -0.06, 0.06, -0.06, 0.06, padTop + 0.9, sh.deckY, bmSteelDark, harborGroup); // mooring line
+          }
+        } else {
+          // AT ANCHOR: swim-out boarding at the hull's midpoint. The
+          // first wade step sits just below the swim-float feet so a
+          // swimmer glides over it and lands in wading depth, then
+          // climbs out onto the pontoon and up the hull ladder.
+          const pU = sh.start + sh.len / 2;
+          const climb2 = Math.ceil((sh.deckY + 1.25 - (WATER_Y + 0.35)) / 0.42);
+          if (sh.axis === 'z') {
+            for (let i = 0; i < 4; i++) {
+              bBox({ x: face - 12.5 + i, z: pU, rot: 0 }, 'z', -0.5, 0.5, -8, 8, WATER_Y - 3.3, WATER_Y - 1.35 + i * 0.45, bmStair, harborGroup); // wade-out steps
+            }
+            bBox({ x: face - 5, z: pU, rot: 0 }, 'z', -4, 4, -16, 16, WATER_Y - 1.4, WATER_Y + 0.35, bmSteelDark, harborGroup); // pontoon
+            for (let i = 0; i < climb2; i++) {
+              bBox({ x: face - 1.1, z: pU - 14 + i * 0.8 + 0.4, rot: 0 }, 'z', -0.5, 0.5, -0.4, 0.4, WATER_Y + 0.35 + i * 0.42, WATER_Y + 0.77 + i * 0.42, bmStair, harborGroup); // hull ladder
+            }
+            bBox({ x: face - 2.3, z: pU - 14 + climb2 * 0.8 + 2.2, rot: 0 }, 'z', -4.7, 4.7, -1.4, 1.4, sh.deckY - 0.1, sh.deckY + 1.25, bmSteelDark, harborGroup); // landing
+            bBox({ x: face - 2.3, z: pU - 14 + climb2 * 0.8 + 3.7, rot: 0 }, 'z', -4.7, 4.7, -0.12, 0.12, sh.deckY + 1.25, sh.deckY + 2.35, bmSteel, harborGroup); // rail
+            bBox({ x: face - 3, z: pU + 20, rot: 0 }, 'z', -0.06, 0.06, -0.06, 0.06, WATER_Y + 0.35, sh.deckY, bmSteelDark, harborGroup); // mooring line
+          } else {
+            for (let i = 0; i < 4; i++) {
+              bBox({ x: pU, z: face - 12.5 + i, rot: 0 }, 'z', -8, 8, -0.5, 0.5, WATER_Y - 3.3, WATER_Y - 1.35 + i * 0.45, bmStair, harborGroup); // wade-out steps
+            }
+            bBox({ x: pU, z: face - 5, rot: 0 }, 'z', -16, 16, -4, 4, WATER_Y - 1.4, WATER_Y + 0.35, bmSteelDark, harborGroup); // pontoon
+            for (let i = 0; i < climb2; i++) {
+              bBox({ x: pU - 14 + i * 0.8 + 0.4, z: face - 1.1, rot: 0 }, 'z', -0.4, 0.4, -0.5, 0.5, WATER_Y + 0.35 + i * 0.42, WATER_Y + 0.77 + i * 0.42, bmStair, harborGroup); // hull ladder
+            }
+            bBox({ x: pU - 14 + climb2 * 0.8 + 2.2, z: face - 2.3, rot: 0 }, 'z', -1.4, 1.4, -4.7, 4.7, sh.deckY - 0.1, sh.deckY + 1.25, bmSteelDark, harborGroup); // landing
+            bBox({ x: pU - 14 + climb2 * 0.8 + 3.7, z: face - 2.3, rot: 0 }, 'z', -0.12, 0.12, -4.7, 4.7, sh.deckY + 1.25, sh.deckY + 2.35, bmSteel, harborGroup); // rail
+            bBox({ x: pU + 20, z: face - 3, rot: 0 }, 'z', -0.06, 0.06, -0.06, 0.06, WATER_Y + 0.35, sh.deckY, bmSteelDark, harborGroup); // mooring line
+          }
+        }
+        // spilled floating containers beside the hull (seaward side when
+        // anchored, quay side when berthed — never under the boarding)
+        for (let i = 0; i < 3; i++) {
+          const su = sh.start + 40 + i * 60;
+          const dir = alongside ? -1 : 1;
+          const sv = sh.fixed + dir * (sh.beam / 2 + 3 + rnd() * 3);
+          if (sh.axis === 'z') bBox({ x: sv, z: su, rot: 0 }, 'z', -CONT_W / 2, CONT_W / 2, -CONT_L / 2, CONT_L / 2, WATER_Y - 1.1, WATER_Y + CONT_H - 1.1, contMat(), harborGroup);
+          else bBox({ x: su, z: sv, rot: 0 }, 'z', -CONT_L / 2, CONT_L / 2, -CONT_W / 2, CONT_W / 2, WATER_Y - 1.1, WATER_Y + CONT_H - 1.1, contMat(), harborGroup);
+        }
+      }
+
+      // ---- Graving dock + the half-built hull ----
+      if (dock) {
+        const DZ = dock.z;
+        const xIn = dock.x - 18;
+        const xOut = dock.x + 58;
+        const wallTop = WATER_Y + 1.05;
+        for (const s of [-1, 1]) {
+          for (let seg = 0; seg < 10; seg++) {
+            const sx = xIn + seg * (76 / 10) + 76 / 20;
+            const sz = DZ + s * 7.4;
+            const bed = Math.min(terrainHeight(sx, sz) - 0.5, WATER_Y - 5);
+            bBox({ x: sx, z: sz, rot: 0 }, 'x', -76 / 20, 76 / 20, -0.5, 0.5, bed, wallTop, bmConcreteDark, harborGroup);
+          }
+        }
+        for (let seg = 0; seg < 7; seg++) {
+          const sx = xIn + seg * (76 / 7) + 76 / 14;
+          bBox({ x: sx, z: DZ, rot: 0 }, 'x', -76 / 14, 76 / 14, -7.0, 7.0, WATER_Y - 1.0, WATER_Y - 0.3, bmConcrete, harborGroup);
+        }
+        bBox({ x: xOut, z: DZ, rot: 0 }, 'z', -0.55, 0.55, -7.6, 7.6, WATER_Y - 0.85, WATER_Y + 1.6, bmConcrete, harborGroup); // caisson gate
+        bBox({ x: xIn - 1.8, z: DZ, rot: 0 }, 'z', -0.7, 0.7, -2.6, 2.6, terrainHeight(xIn - 1.8, DZ) - 0.3, WATER_Y + 0.45, bmConcrete, harborGroup); // steps
+        buildShip(xIn + 18, WATER_Y - 0.3, DZ, harborGroup);
+        shipLoot(['betgun', 'heavy'], xOut, DZ, wallTop + 0.2);
+        harborMarks.push({ x: dock.x, z: DZ, label: 'DOCK', cls: 'c-dock' });
       }
 
       // ---- Breakwater arc + lighthouse at its tip ----
       {
         let bx = bwall.x;
         let bz = bwall.z;
-        let lTop = 0;
-        for (let i = 0; i < 9; i++) {
-          const t = i * 4.8;
-          const drift = i * i * 0.11;
+        let lTop = WATER_Y + 1.2;
+        for (let i = 0; i < 14; i++) {
+          const t = i * 5.4;
+          const drift = i * i * 0.13;
           bx = bwall.x + HARBOR_E * t + HARBOR_E * drift * 0.6;
           bz = bwall.z + HARBOR_E * t - HARBOR_E * drift * 0.6;
-          const w = (i === 8 ? 6.5 : 5.1 - i * 0.22) + hash2(i, 7, terrainSeed) * 0.9;
-          const top = WATER_Y + (i === 8 ? 0.85 : 0.45 + hash2(i, 3, terrainSeed) * 0.5);
+          const w = (i === 13 ? 8.5 : 6.8 - i * 0.2) + hash2(i, 7, terrainSeed) * 1.2;
+          const top = WATER_Y + (i === 13 ? 1.8 : 1.1 + hash2(i, 3, terrainSeed) * 0.7);
           const bed = terrainHeight(bx, bz) - 0.55;
           bBox({ x: bx, z: bz, rot: 0 }, 'z', -w / 2, w / 2, -w / 2, w / 2, bed, top, bmRock, harborGroup);
           lTop = top;
         }
         buildLighthouse({ x: bx, z: bz, rot: 0 }, lTop, harborGroup);
+        stats.buildings++;
+        shipLoot(['light', 'shield'], bx, bz, lTop + 0.3);
         harborMarks.push({ x: bx, z: bz, label: 'LIGHT', cls: 'c-light' });
       }
 
+      // ---- Guarantee 30+ buildings: fill remaining service slots,
+      // then a south-band sweep ----
+      while (stats.buildings < 30 && serviceSlots.length) {
+        const s = serviceSlots.shift()!;
+        if (!fits(s.x, s.z, 3.2, 4.8, 4)) continue;
+        buildShed({ x: s.x, z: s.z, rot: s.rot }, padTop, harborGroup);
+        markPlaced(s.x, s.z, 3.2, 4.8);
+        stats.buildings++;
+      }
+      let fillZ = ZS - 88;
+      while (stats.buildings < 30 && fillZ > ZN + 180) {
+        for (const fx of [XW + 130, XW + 155, XW + 180, cx - 70, cx - 45]) {
+          if (stats.buildings >= 30) break;
+          if (!fits(fx, fillZ, 3.2, 4.8, 4)) continue;
+          buildShed({ x: fx, z: fillZ, rot: 0 }, padTop, harborGroup);
+          markPlaced(fx, fillZ, 3.2, 4.8);
+          stats.buildings++;
+        }
+        fillZ -= 26;
+      }
+
       // ---- Port loot: the richest rewards on the coast ----
-      const rnd = mulberry32((terrainSeed ^ 0x5eed) >>> 0);
-      poiLoot(['smg', 'sniper', 'shield', 'heavy', 'shield'], wh1.x, wh1.z, 10, terrainHeight(wh1.x, wh1.z), -1, rnd);
-      poiLoot(['heavy', 'light'], wh2.x, wh2.z, 8, terrainHeight(wh2.x, wh2.z), -1, rnd);
-      poiLoot(['smg', 'shield'], office.x, office.z, 7, terrainHeight(office.x, office.z), -1, rnd);
+      for (const w of whRow) poiLoot(['smg', 'heavy', 'shield', 'light'], w.x, w.z, 12, padTop, -1, rnd);
+      if (offBuilt) poiLoot(['sniper', 'shield'], offB.x, offB.z, 9, padTop, -1, rnd);
+      if (tankC) poiLoot(['heavy', 'shield'], tankC.x, tankC.z, 14, padTop, -1, rnd);
+      poiLoot(['smg', 'light', 'shield'], yardX0 + 8, (yardZ0 + yardZ1) / 2, 16, padTop, -1, rnd);
+
+      stats.solids = solids.length - solidsBefore;
     }
 
     // ----------------------------------------------------
@@ -3838,7 +4428,7 @@ export default function BattleRoyaleGame() {
             const z = (rnd() * 2 - 1) * (HARBOR_HALF - 330);
             if (seaDist(x, z) > -160) continue; // dry land, well inland
             if (Math.hypot(x - HARBOR_SPAWN.x, z - HARBOR_SPAWN.z) < 340) continue; // spawn stays clear
-            if (harborAnchor && Math.hypot(x - harborAnchor.x, z - harborAnchor.z) < 560) continue; // the port owns the coast
+            if (harborAnchor && Math.hypot(x - harborAnchor.x, z - harborAnchor.z) < portClearR + 260) continue; // the port owns the coast
             if (pois.some((p) => Math.hypot(p.x - x, p.z - z) < 300)) continue; // spread out
             const h0 = terrainHeight(x, z);
             if (h0 < WATER_Y + 2.5) continue;
@@ -4242,7 +4832,7 @@ export default function BattleRoyaleGame() {
       spawn = HARBOR_SPAWN;
       eyeH = EYE;
       camera.position.set(spawn.x, EYE + groundAt(spawn.x, spawn.z), spawn.z);
-      yaw = 0;
+      yaw = portPlan ? Math.atan2(-(portPlan.cx - spawn.x), -(portPlan.cz - spawn.z)) : 0; // face the port centre
       pitch = 0;
       kick = 0;
       vy = 0;
@@ -4483,8 +5073,15 @@ export default function BattleRoyaleGame() {
             blast: (bx: number, bz: number) =>
               explode(bx, bz, GREN.blast.radius, GREN.blast.dmg, GREN.blast.selfDmg),
             buildings: () => BUILDINGS.map((b: any) => ({ x: b.x, z: b.z, hx: b.hx, hz: b.hz, kind: b.kind, rot: b.rot })),
-            moveTo: (mx: number, mz: number) => {
-              camera.position.set(mx, groundAt(mx, mz) + EYE, mz);
+            moveTo: (mx: number, mz: number, my?: number) => {
+              if (my !== undefined) {
+                camera.position.set(mx, my, mz);
+                vy = 0;
+                grounded = true;
+                return;
+              }
+              const s = supportAt(mx, mz, groundAt(mx, mz) + 3);
+              camera.position.set(mx, s + EYE, mz);
               vy = 0;
               grounded = true;
             },
@@ -4506,6 +5103,7 @@ export default function BattleRoyaleGame() {
             voxStats: () => ({
               boxes: voxBoxes.length,
               alive: voxBoxes.reduce((n, v) => n + (v.gone ? 0 : 1), 0),
+              aliveVox: voxBoxes.reduce((n, v) => n + (v.gone ? 0 : v.aliveCount), 0),
               collapsed: voxBoxes.reduce((n, v) => n + (v.collapsed ? 1 : 0), 0),
               walls: wallDests.size,
               popups: damagePopups.length,
@@ -6053,8 +6651,8 @@ export default function BattleRoyaleGame() {
       // parapet ring — rooftop cover with the sea view
       bBox(B, 'x', N - 0.2, S + 0.2, L - 0.2, L + 0.15, TOP + 0.28, TOP + 1.05, bmCream, parent);
       bBox(B, 'x', N - 0.2, S + 0.2, R - 0.15, R + 0.2, TOP + 0.28, TOP + 1.05, bmCream, parent);
-      bBox(B, 'z', L - 0.2, L + 0.15, L + 0.15, R - 0.15, TOP + 0.28, TOP + 1.05, bmCream, parent);
-      bBox(B, 'z', R - 0.15, R + 0.2, L + 0.15, R - 0.15, TOP + 0.28, TOP + 1.05, bmCream, parent);
+      bBox(B, 'z', L - 0.2, L + 0.15, N - 0.2, S + 0.2, TOP + 0.28, TOP + 1.05, bmCream, parent);
+      bBox(B, 'z', R - 0.15, R + 0.2, N - 0.2, S + 0.2, TOP + 0.28, TOP + 1.05, bmCream, parent);
       bBox(B, 'x', -1.0, 1.0, 2.0, 2.9, gy, gy + 0.85, bmCrate, parent); // stacked import crates
       bBox(B, 'x', -2.1, -1.2, 2.2, 2.9, gy, gy + 0.6, bmCrate, parent);
     }
@@ -6132,17 +6730,18 @@ export default function BattleRoyaleGame() {
     // Half-built ship for the dry dock: keel, stepped hull sides,
     // deck plate, cabin and funnel — chunky cover you can fight on.
     function buildShip(cx: number, floorTop: number, cz: number, parent?: THREE.Object3D) {
-      bBox({ x: cx, z: cz, rot: 0 }, 'x', -7.5, 7.5, -0.65, 0.65, floorTop + 0.15, floorTop + 1.25, bmRust, parent); // keel
-      for (const s of [-1, 1]) {
-        bBox({ x: cx, z: cz, rot: 0 }, 'x', -7.2, 7.2, s * 1.2 - 0.55, s * 1.2 + 0.55, floorTop + 1.25, floorTop + 2.6, bmRust, parent);
-        bBox({ x: cx, z: cz, rot: 0 }, 'x', -7.2, 7.2, s * 2.75 - 0.55, s * 2.75 + 0.55, floorTop + 0.6, floorTop + 1.9, bmRust, parent);
+      const s = 2.2; // graving-dock hull — twice the old scale
+      bBox({ x: cx, z: cz, rot: 0 }, 'x', -7.5 * s, 7.5 * s, -0.65 * s, 0.65 * s, floorTop + 0.3, floorTop + 2.75, bmRust, parent); // keel
+      for (const sd of [-1, 1]) {
+        bBox({ x: cx, z: cz, rot: 0 }, 'x', -7.2 * s, 7.2 * s, sd * 1.2 * s - 0.55 * s, sd * 1.2 * s + 0.55 * s, floorTop + 2.75, floorTop + 5.7, bmRust, parent);
+        bBox({ x: cx, z: cz, rot: 0 }, 'x', -7.2 * s, 7.2 * s, sd * 2.75 * s - 0.55 * s, sd * 2.75 * s + 0.55 * s, floorTop + 1.3, floorTop + 4.2, bmRust, parent);
       }
-      bBox({ x: cx, z: cz, rot: 0 }, 'x', -7.4, 7.4, -3.1, 3.1, floorTop + 2.6, floorTop + 2.95, bmSteelDark, parent); // deck
-      bBox({ x: cx, z: cz, rot: 0 }, 'x', 6.0, 8.6, -2.1, 2.1, floorTop + 2.95, floorTop + 3.3, bmRust, parent); // bow
-      bBox({ x: cx, z: cz, rot: 0 }, 'x', 7.8, 9.6, -1.2, 1.2, floorTop + 2.6, floorTop + 2.95, bmRust, parent); // bow tip
-      bBox({ x: cx - 4.4, z: cz, rot: 0 }, 'z', -1.6, 1.6, -1.3, 1.3, floorTop + 2.95, floorTop + 5.25, bmWhite, parent); // cabin
-      bBox({ x: cx - 4.4, z: cz, rot: 0 }, 'z', -0.5, 0.5, -0.5, 0.5, floorTop + 5.25, floorTop + 7.1, bmWarnOrange, parent); // funnel
-      bBox({ x: cx + 1.5, z: cz, rot: 0 }, 'z', -1.1, 1.1, -1.1, 1.1, floorTop + 2.95, floorTop + 4.0, bmCrate, parent); // deck cargo
+      bBox({ x: cx, z: cz, rot: 0 }, 'x', -7.4 * s, 7.4 * s, -3.1 * s, 3.1 * s, floorTop + 5.7, floorTop + 6.5, bmSteelDark, parent); // deck
+      bBox({ x: cx, z: cz, rot: 0 }, 'x', 6.0 * s, 8.6 * s, -2.1 * s, 2.1 * s, floorTop + 6.5, floorTop + 7.3, bmRust, parent); // bow
+      bBox({ x: cx, z: cz, rot: 0 }, 'x', 7.8 * s, 9.6 * s, -1.2 * s, 1.2 * s, floorTop + 5.7, floorTop + 6.5, bmRust, parent); // bow tip
+      bBox({ x: cx - 4.4 * s, z: cz, rot: 0 }, 'z', -1.6 * s, 1.6 * s, -1.3 * s, 1.3 * s, floorTop + 6.5, floorTop + 11.6, bmWhite, parent); // cabin
+      bBox({ x: cx - 4.4 * s, z: cz, rot: 0 }, 'z', -0.5 * s, 0.5 * s, -0.5 * s, 0.5 * s, floorTop + 11.6, floorTop + 15.6, bmWarnOrange, parent); // funnel
+      bBox({ x: cx + 1.5 * s, z: cz, rot: 0 }, 'z', -1.1 * s, 1.1 * s, -1.1 * s, 1.1 * s, floorTop + 6.5, floorTop + 8.8, bmCrate, parent); // deck cargo
     }
 
     // Small moored boat beside the pier head — a swim-out platform.
