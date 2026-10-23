@@ -325,3 +325,20 @@ export function calculateVoxelImpulse(
     z: normZ * speed,
   };
 }
+
+/**
+ * Calculates voxel grid dimensions for a bounding box given a voxel size.
+ * Clamps each axis between 1 and maxDim.
+ */
+export function calculateVoxelDimensions(
+  width: number,
+  height: number,
+  depth: number,
+  voxSize = 0.55,
+  maxDim = 96
+): { nx: number; ny: number; nz: number; total: number } {
+  const nx = Math.max(1, Math.min(maxDim, Math.round(width / voxSize)));
+  const ny = Math.max(1, Math.min(maxDim, Math.round(height / voxSize)));
+  const nz = Math.max(1, Math.min(maxDim, Math.round(depth / voxSize)));
+  return { nx, ny, nz, total: nx * ny * nz };
+}

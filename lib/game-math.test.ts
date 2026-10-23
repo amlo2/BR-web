@@ -15,6 +15,7 @@ import {
   isCoverBlocked,
   calculateStructureDamage,
   calculateVoxelImpulse,
+  calculateVoxelDimensions,
 } from './game-math.ts';
 
 test('powerAt applies three damage falloff brackets', () => {
@@ -177,5 +178,19 @@ test('calculateVoxelImpulse blasts voxels outward with upward pop', () => {
   assert(impulse.x > 5);
   // Y should have upward pop
   assert(impulse.y > 4);
+});
+
+test('calculateVoxelDimensions creates chunky foundation voxels without whole-floor voxelization', () => {
+  // A chunky 22m x 4.8m x 22m harbor foundation block with 2.2m voxels
+  const chunky = calculateVoxelDimensions(22, 4.8, 22, 2.2);
+  assert.equal(chunky.nx, 10);
+  assert.equal(chunky.ny, 2);
+  assert.equal(chunky.nz, 10);
+  assert.equal(chunky.total, 200);
+
+  // Contrast with a monolithic 140m slab with fine 0.55m voxels (which would freeze the game with 80k+ voxels)
+  const monolithic = calculateVoxelDimensions(140, 4.8, 140, 0.55);
+  assert.equal(chunky.total < monolithic.total, true);
+  assert.equal(chunky.total <= 300, true);
 });
 

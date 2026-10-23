@@ -1103,11 +1103,12 @@ export default function BattleRoyaleGame() {
       collapsed: boolean;
     }
 
-    function registerDestructible(b: SolidBox, mesh: THREE.Mesh, mat: THREE.Material) {
+    function registerDestructible(b: SolidBox, mesh: THREE.Mesh, mat: THREE.Material, customVoxSize?: number) {
       const bottom = b.bottom ?? 0;
-      const nx = Math.max(1, Math.min(VOX_MAX_DIM, Math.round((b.hx * 2) / VOX_SIZE)));
-      const ny = Math.max(1, Math.min(VOX_MAX_DIM, Math.round((b.top - bottom) / VOX_SIZE)));
-      const nz = Math.max(1, Math.min(VOX_MAX_DIM, Math.round((b.hz * 2) / VOX_SIZE)));
+      const vs = customVoxSize ?? VOX_SIZE;
+      const nx = Math.max(1, Math.min(VOX_MAX_DIM, Math.round((b.hx * 2) / vs)));
+      const ny = Math.max(1, Math.min(VOX_MAX_DIM, Math.round((b.top - bottom) / vs)));
+      const nz = Math.max(1, Math.min(VOX_MAX_DIM, Math.round((b.hz * 2) / vs)));
       const total = nx * ny * nz;
       const voxHp = voxHpMap.get(mat) ?? 100;
       const order = new Int32Array(total);
@@ -3930,11 +3931,16 @@ export default function BattleRoyaleGame() {
         !placedRects.some((p) => Math.abs(x - p.x) < hx + p.hx + m && Math.abs(z - p.z) < hz + p.hz + m);
       const markPlaced = (x: number, z: number, hx: number, hz: number) => placedRects.push({ x, z, hx, hz });
 
-      // ---- The platform: a field of thick concrete slabs; on the
+      // ---- The platform: chunky modular foundation caisson blocks; on the
       // seaward sides the slab bottoms drop below the waterline, so the
-      // port reads as a real raised foundation standing in the bay ----
-      const nX = Math.max(3, Math.round(L / 130));
-      const nZ = Math.max(2, Math.round(D / 115));
+      // port reads as a real raised foundation standing in the bay.
+      // Slabs are subdivided into chunky ~20-22m blocks with chunky 2.2m
+      // voxels so shooting the ground only chips the local caisson block,
+      // never voxelizing the entire floor! ----
+      const CHUNK_PITCH = 22;
+      const nX = Math.max(8, Math.round(L / CHUNK_PITCH));
+      const nZ = Math.max(6, Math.round(D / CHUNK_PITCH));
+      const FOUNDATION_VOX = 2.2;
       for (let i = 0; i < nX; i++) {
         for (let j = 0; j < nZ; j++) {
           const x0 = XW + (i / nX) * L;
@@ -3942,7 +3948,19 @@ export default function BattleRoyaleGame() {
           const z0 = ZN + (j / nZ) * D;
           const z1 = ZN + ((j + 1) / nZ) * D;
           const bottom = Math.min(padTop - 1.4, WATER_Y - 2.2);
-          bBox({ x: (x0 + x1) / 2, z: (z0 + z1) / 2, rot: 0 }, 'z', -(x1 - x0) / 2, (x1 - x0) / 2, -(z1 - z0) / 2, (z1 - z0) / 2, bottom, padTop, bmConcrete, harborGroup);
+          bBox(
+            { x: (x0 + x1) / 2, z: (z0 + z1) / 2, rot: 0 },
+            'z',
+            -(x1 - x0) / 2,
+            (x1 - x0) / 2,
+            -(z1 - z0) / 2,
+            (z1 - z0) / 2,
+            bottom,
+            padTop,
+            bmConcrete,
+            harborGroup,
+            FOUNDATION_VOX
+          );
         }
       }
 
@@ -4304,7 +4322,7 @@ export default function BattleRoyaleGame() {
         }
         for (let seg = 0; seg < 7; seg++) {
           const sx = xIn + seg * (76 / 7) + 76 / 14;
-          bBox({ x: sx, z: DZ, rot: 0 }, 'x', -76 / 14, 76 / 14, -7.0, 7.0, WATER_Y - 1.0, WATER_Y - 0.3, bmConcrete, harborGroup);
+          bBox({ x: sx, z: DZ, rot: 0 }, 'x', -76 / 14, 76 / 14, -7.0, 7.0, WATER_Y - 1.0, WATER_Y - 0.3, bmConcrete, harborGroup, 2.0);
         }
         bBox({ x: xOut, z: DZ, rot: 0 }, 'z', -0.55, 0.55, -7.6, 7.6, WATER_Y - 0.85, WATER_Y + 1.6, bmConcrete, harborGroup); // caisson gate
         bBox({ x: xIn - 1.8, z: DZ, rot: 0 }, 'z', -0.7, 0.7, -2.6, 2.6, terrainHeight(xIn - 1.8, DZ) - 0.3, WATER_Y + 0.45, bmConcrete, harborGroup); // steps
@@ -6168,7 +6186,19 @@ export default function BattleRoyaleGame() {
     const spanOf = (axisName: string, f0: number, f1: number, a0: number, a1: number): [number, number, number, number] =>
       axisName === 'x' ? [a0, a1, f0, f1] : [f0, f1, a0, a1];
 
-    function bBox(B: any, axisName: string, f0: number, f1: number, a0: number, a1: number, y0: number, y1: number, mat: THREE.Material, parent?: THREE.Object3D) {
+    function bBox(
+      B: any,
+      axisName: string,
+      f0: number,
+      f1: number,
+      a0: number,
+      a1: number,
+      y0: number,
+      y1: number,
+      mat: THREE.Material,
+      parent?: THREE.Object3D,
+      customVoxSize?: number
+    ) {
       const w = turnBox(B, ...spanOf(axisName, f0, f1, a0, a1));
       const mesh = new THREE.Mesh(new THREE.BoxGeometry(w.hx * 2, y1 - y0, w.hz * 2), mat);
       mesh.position.set(w.x, (y0 + y1) / 2, w.z);
@@ -6178,7 +6208,7 @@ export default function BattleRoyaleGame() {
       const sb: SolidBox = { x: w.x, z: w.z, hx: w.hx, hz: w.hz, top: y1, bottom: y0, group: parent };
       solids.push(sb);
       shootable.push(mesh);
-      registerDestructible(sb, mesh, mat);
+      registerDestructible(sb, mesh, mat, customVoxSize);
     }
 
     function bPane(B: any, axisName: string, f0: number, f1: number, a0: number, a1: number, y0: number, y1: number, parent?: THREE.Object3D) {
