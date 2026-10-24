@@ -354,6 +354,66 @@ export default function BattleRoyaleGame() {
     }
     const flatZones: PoiZone[] = [];
 
+    // ----------------------------------------------------
+    // Transition routes: a seeded road network that stitches every
+    // POI (and the port gate) together with dust trails, mud tracks
+    // and gravel roads. Rendered as terrain-vertex colour overrides
+    // (never underwater), painted onto the tactical-map canvas, and
+    // kept clear of vegetation so they read as real corridors.
+    // ----------------------------------------------------
+    interface PathSeg {
+      pts: number[]; // flat x,z polyline, resampled every ~8 m
+      w: number;
+      kind: number; // 0 dust · 1 mud · 2 gravel road
+    }
+    const paths: PathSeg[] = [];
+    const PATH_CELL = 48;
+    const pathGrid = new Map<string, number[]>(); // cell -> sample indices
+    const pathSamples: number[] = []; // flat x,z of every ~8 m sample
+    const pathMeta: Array<{ w: number; kind: number }> = [];
+    const PATH_COLORS = [new THREE.Color(0xc2ab7a), new THREE.Color(0x6e5e43), new THREE.Color(0x9c9384)];
+    const PATH_KIND_CSS = ['#cdb98a', '#7d6c4d', '#aaa393'];
+
+    function registerPathSample(x: number, z: number, w: number, kind: number) {
+      pathSamples.push(x, z);
+      pathMeta.push({ w, kind });
+      const key = Math.floor(x / PATH_CELL) + ',' + Math.floor(z / PATH_CELL);
+      let arr = pathGrid.get(key);
+      if (!arr) {
+        arr = [];
+        pathGrid.set(key, arr);
+      }
+      arr.push(pathMeta.length - 1);
+    }
+
+    // Nearest-route lookup for tile painting + vegetation exclusion.
+    // Samples sit every ~8 m, so point distance is a good proxy for
+    // distance-to-centreline at road widths of 4-7 m.
+    function nearPath(x: number, z: number): { d: number; w: number; kind: number } | null {
+      if (!pathGrid.size) return null;
+      const cx = Math.floor(x / PATH_CELL);
+      const cz = Math.floor(z / PATH_CELL);
+      let best = -1;
+      let bestD = Infinity;
+      for (let gz = cz - 1; gz <= cz + 1; gz++) {
+        for (let gx = cx - 1; gx <= cx + 1; gx++) {
+          const arr = pathGrid.get(gx + ',' + gz);
+          if (!arr) continue;
+          for (const idx of arr) {
+            const dx = pathSamples[idx * 2] - x;
+            const dz = pathSamples[idx * 2 + 1] - z;
+            const d = dx * dx + dz * dz;
+            if (d < bestD) {
+              bestD = d;
+              best = idx;
+            }
+          }
+        }
+      }
+      if (best < 0) return null;
+      return { d: Math.sqrt(bestD), w: pathMeta[best].w, kind: pathMeta[best].kind };
+    }
+
     function seaDist(x: number, z: number) {
       const base = (x + z - SEA_C) / Math.SQRT2;
       if (base < -(SEA_WARP + 200) || base > SEA_WARP + 300) return base;
@@ -533,6 +593,16 @@ export default function BattleRoyaleGame() {
           // Sandy ring around lake shorelines, just above the waterline
           const lshore = CW.lw * THREE.MathUtils.smoothstep(h - WATER_Y, 0.35, 1.7);
           if (lshore > 0.01) c.lerp(TILE_SAND, Math.min(0.85, lshore));
+          // Transition routes: dust / mud / gravel painted where the
+          // road network passes — after every biome rule so paths stay
+          // legible on sand and rock alike, but never underwater.
+          if (h > WATER_Y + 0.2 && pathGrid.size) {
+            const np = nearPath(vx, vz);
+            if (np) {
+              const road = 1 - THREE.MathUtils.smoothstep(np.d, np.w / 2 - 0.5, np.w / 2 + 5.5);
+              if (road > 0.02) c.lerp(PATH_COLORS[np.kind], road * 0.94);
+            }
+          }
           c.lerp(TILE_DEEP, THREE.MathUtils.clamp((WATER_Y - h) / 3, 0, 1));
           col.set([c.r, c.g, c.b], k * 3);
         }
@@ -880,6 +950,10 @@ export default function BattleRoyaleGame() {
           }
         }
         if (pad) continue;
+        // Roads stay clear — no trees or boulders mid-track, so the
+        // transition routes read as walked corridors, not noise
+        const npv = nearPath(vx, vz);
+        if (npv && npv.d < npv.w / 2 + 1.5) continue;
         const h = terrainHeight(vx, vz);
         biomeWeights(vx, vz, VW);
         const pick = rnd();
@@ -2074,7 +2148,7 @@ export default function BattleRoyaleGame() {
         const p = BUILD_PIECES[buildPieceIdx];
         showMessage(
           p.kind === 'auto'
-            ? '🎯 Auto build: look down on the ground = ramp · look forward = wall · look down from a ramp / structure = platform. [LEFT CLICK / TAP AIM] place · [Wheel / T / double-tap WALL] pick manually · [V / RIGHT CLICK] cancel'
+            ? '🎯 Auto build: look up = ladder · look forward = wall · look down on the ground = ramp · look down from a ramp / structure = platform. [LEFT CLICK / TAP AIM] place · [Wheel / T / double-tap WALL] pick manually · [V / RIGHT CLICK] cancel'
             : p.icon + ' ' + p.label + ': [LEFT CLICK / TAP AIM] place (' + p.hp + ' HP) · [Wheel / T / double-tap WALL] cycle piece · [V / RIGHT CLICK] cancel',
           p.kind === 'auto' ? 5 : 3.2
         );
@@ -2094,10 +2168,10 @@ export default function BattleRoyaleGame() {
     }
 
     // ----------------------------------------------------
-    // Fortnite Build Pieces — Wall, Door Wall, Floor, Ramp.
+    // Fortnite Build Pieces — Wall, Door Wall, Floor, Ramp, Ladder.
     // V cycles build mode, mouse wheel or T cycles the piece.
-    // Wall / Door are whole-object built walls; Floor / Ramp are
-    // voxel-chippable planks so grenades can blow holes in them.
+    // Wall / Door are whole-object built walls; Floor / Ramp / Ladder
+    // are voxel-chippable planks so grenades can blow holes in them.
     // ----------------------------------------------------
     const BUILD_PIECES = [
       { kind: 'auto', icon: '🎯', label: 'Auto Piece', hp: 250 },
@@ -2105,6 +2179,7 @@ export default function BattleRoyaleGame() {
       { kind: 'door', icon: '🚪', label: 'Door Wall', hp: 250 },
       { kind: 'floor', icon: '🟫', label: 'Floor', hp: 300 },
       { kind: 'ramp', icon: '📐', label: 'Ramp', hp: 300 },
+      { kind: 'ladder', icon: '🪜', label: 'Ladder', hp: 300 },
     ];
     let buildPieceIdx = 0;
     const PIECE_PREVIEW: Record<string, [number, number, number]> = {
@@ -2112,10 +2187,12 @@ export default function BattleRoyaleGame() {
       door: [3.2, 2.6, 0.35],
       floor: [3, 0.3, 3],
       ramp: [3, 1.05, 2.7],
+      ladder: [0.9, 3.4, 1.2],
     };
 
     // Aim-directed building (mobile-first): the default Auto piece reads your
     // pitch and footing so ONE button covers every structure mid-fight —
+    //   look up                     -> Ladder (bolt one onto any wall)
     //   look forward               -> Wall
     //   look down, on the ground   -> Ramp (run up it)
     //   look down, elevated / air  -> Floor platform (on a ramp, container,
@@ -2123,6 +2200,7 @@ export default function BattleRoyaleGame() {
     function resolvedBuildKind() {
       const cur = BUILD_PIECES[buildPieceIdx].kind;
       if (cur !== 'auto') return cur;
+      if (pitch > 0.5) return 'ladder';
       if (pitch > -0.45) return 'wall';
       const feetY = camera.position.y - eyeH;
       const elevated = !grounded || feetY - groundAt(camera.position.x, camera.position.z) > 0.6;
@@ -2153,7 +2231,7 @@ export default function BattleRoyaleGame() {
       const stateEl = $('buildWallState');
       if (stateEl)
         stateEl.textContent = auto
-          ? p.hp + ' HP · aim decides: down = ramp / platform · forward = wall'
+          ? p.hp + ' HP · aim decides: up = ladder · down = ramp / platform · forward = wall'
           : p.hp + ' HP · wheel / T cycles piece';
       const tIcon = $('buildPieceIcon');
       if (tIcon) tIcon.textContent = p.icon;
@@ -2168,7 +2246,7 @@ export default function BattleRoyaleGame() {
         setPreviewGeometry(resolvedBuildKind());
         updateBuildHud();
         if (buildMode)
-          showMessage('🎯 Auto piece: your aim decides — down on the ground = ramp, forward = wall, down from a ramp / structure = platform', 2.4);
+          showMessage('🎯 Auto piece: your aim decides — up = ladder, forward = wall, down on the ground = ramp, down from a ramp / structure = platform', 2.4);
         return;
       }
       setPreviewGeometry(p.kind);
@@ -2231,6 +2309,21 @@ export default function BattleRoyaleGame() {
       }
     }
 
+    // Ladder: a 45-degree rung ladder you walk straight up — rungs
+    // advance 0.42 m along your facing (ramp-style footprint, so the
+    // proven step-up mechanics climb it) and zig-zag laterally so it
+    // reads as a ladder. ~6.7 m of climb per placement; stand on a
+    // rung and place another to keep going.
+    function buildFortniteLadder(x: number, z: number, angleY: number, feetY: number) {
+      const base = Math.max(feetY, groundAt(x, z) + 0.02);
+      const ca = Math.cos(angleY);
+      const sa = Math.sin(angleY);
+      for (let i = 0; i < 16; i++) {
+        const off = i % 2 === 0 ? -0.34 : 0.34;
+        addVoxSolid(x + sa * 0.42 * i + ca * off, base + i * 0.42, base + (i + 1) * 0.42, z + ca * 0.42 * i - sa * off, 0.85, 0.5, bmPlank, angleY);
+      }
+    }
+
     function placeWall() {
       if (!buildMode || !running() || playerDown) return;
       const forward = new THREE.Vector3();
@@ -2255,6 +2348,9 @@ export default function BattleRoyaleGame() {
         const top = Math.max(feetY, groundAt(px, pz) + 0.05) + 0.06;
         addVoxSolid(px, top - 0.28, top, pz, 3, 3, bmPlank);
         showMessage('🟫 Floor placed! Bridge water or raise a platform!', 2.5);
+      } else if (kind === 'ladder') {
+        buildFortniteLadder(px, pz, angle, feetY);
+        showMessage('🪜 Ladder placed! Walk in and keep moving — you climb it like a stair!', 2.5);
       } else {
         buildFortniteRamp(px, pz, angle, feetY);
         showMessage('📐 Ramp placed! Run up onto roofs and containers!', 2.5);
@@ -2340,6 +2436,10 @@ export default function BattleRoyaleGame() {
           const feet = camera.position.y - eyeH;
           const top = Math.max(feet, groundAt(px, pz) + 0.05) + 0.06;
           previewMesh.position.set(px, top + 0.15, pz);
+        } else if (kind === 'ladder') {
+          const feet = camera.position.y - eyeH;
+          const base = Math.max(feet, groundAt(px, pz) + 0.02);
+          previewMesh.position.set(px, base + 1.75, pz);
         } else if (kind === 'ramp') {
           const feet = camera.position.y - eyeH;
           const base = Math.max(feet, groundAt(px, pz) + 0.02);
@@ -3611,10 +3711,11 @@ export default function BattleRoyaleGame() {
       D: number; // platform size along Z (250-360)
       padTop: number; // deck surface height (absolute)
       berth: 'east' | 'south';
-      ship: { axis: 'z' | 'x'; fixed: number; start: number; len: number; beam: number; deckY: number } | null;
+      ship: { axis: 'z' | 'x'; fixed: number; start: number; len: number; beam: number; deckY: number; gap?: number } | null;
       spawn: { x: number; z: number };
       dock: { x: number; z: number } | null;
       bwall: { x: number; z: number };
+      ladders: Array<{ x: number; z: number }>;
       stats: { buildings: number; containers: number; cranes: number; tanks: number; shipBoxes: number; solids: number };
     }
     let portPlan: PortPlan | null = null;
@@ -3842,7 +3943,6 @@ export default function BattleRoyaleGame() {
       const L = 400 + Math.floor(rnd() * 160); // 400-560 m
       const D = 250 + Math.floor(rnd() * 110); // 250-360 m
       const CORNER = 140 + rnd() * 70; // corner reach past the waterline
-      const cIn = (L / 2 + D / 2) / Math.SQRT2 - CORNER;
       const beam = 30 + Math.floor(rnd() * 10);
       const len = 330 + Math.floor(rnd() * 70);
       const deckY = WATER_Y + 12.6;
@@ -3850,54 +3950,109 @@ export default function BattleRoyaleGame() {
       const dockK = dockSide * (400 + Math.floor(rnd() * 90));
       const bwK = -dockSide * (380 + Math.floor(rnd() * 120));
 
-      // The coast is noisy (SEA_WARP bends it +-200 m), so the rect is
-      // validated against REAL terrain at several spots and, if the bay
-      // is dirty here, the whole platform slides along the coast.
-      const hullClearLine = (x: number, z: number, axis: 'z' | 'x', start: number) => {
+      // The coast is noisy (SEA_WARP bends it +-200 m), so every slid
+      // site re-marches to ITS OWN waterline and the rect is validated
+      // against REAL terrain at several spots; if the bay is dirty here,
+      // the whole platform slides along the coast.
+      const hullClearLine = (x: number, z: number, axis: 'z' | 'x', start: number, depth: number) => {
         for (let u = 0; u <= len; u += 16) {
           const px = axis === 'z' ? x : start + u;
           const pz = axis === 'z' ? start + u : z;
-          if (terrainHeight(px, pz) > WATER_Y - 6.0) return false;
+          if (terrainHeight(px, pz) > WATER_Y - depth) return false;
         }
         return true;
       };
+      // Dock the mega-ship RIGHT NEXT TO THE HARBOUR: walk the hull out
+      // from the quay face gap by gap and moor at the FIRST line where
+      // the seabed clears the hold floor (holds sit ~2.6 m under the
+      // waterline). The walkway then bridges whatever gap is left, so
+      // the ship reads as berthed at its quay, not anchored in the bay.
+      // Pass 2 relaxes to any wet line; pass 3 — for dirty coasts —
+      // moors at the DEEPEST line seen even if a shallow bump kisses
+      // the keel. Only a truly dry coast falls back to the bay anchor.
       const berthAt = (side: 'east' | 'south', XE: number, ZS: number, cx: number, cz: number): PortPlan['ship'] => {
-        if (side === 'east') {
-          const fixed = XE + 6 + beam / 2;
-          let start = cz - 250;
-          for (; start < cz + 500; start += 16) {
-            if (hullClearLine(fixed, 0, 'z', start)) break;
+        const isZ = side === 'east'; // east face: hull runs along z at x=fixed
+        const faceC = isZ ? cz : cx;
+        const scan = (gaps: number[], depth: number): PortPlan['ship'] => {
+          for (const gap of gaps) {
+            const fixed = (isZ ? XE : ZS) + gap + beam / 2;
+            for (let start = faceC - 250; start < faceC + 500; start += 16) {
+              if (hullClearLine(isZ ? fixed : start, isZ ? start : fixed, isZ ? 'z' : 'x', start, depth)) {
+                return { axis: isZ ? 'z' : 'x', fixed, start, len, beam, deckY, gap };
+              }
+            }
           }
-          return start < cz + 500 && hullClearLine(fixed, 0, 'z', start) ? { axis: 'z', fixed, start, len, beam, deckY } : null;
+          return null;
+        };
+        const pass1 =
+          scan([8, 18, 30, 44, 60, 80, 105, 135, 170, 210], 2.6) ||
+          scan([10, 24, 44, 80, 130, 180, 240], 0.1);
+        if (pass1) return pass1;
+        // pass 3: deepest-line mooring — the ship docks beside the quay
+        // even when a shallow saddle crosses under part of the hull
+        let bestShip: PortPlan['ship'] | null = null;
+        let bestWorst = Infinity;
+        for (const gap of [20, 60, 120, 200]) {
+          const fixed = (isZ ? XE : ZS) + gap + beam / 2;
+          for (let start = faceC - 250; start < faceC + 500; start += 32) {
+            let worst = -Infinity;
+            for (let u = 0; u <= len; u += len / 10) {
+              const px = isZ ? fixed : start + u;
+              const pz = isZ ? start + u : fixed;
+              worst = Math.max(worst, terrainHeight(px, pz));
+            }
+            if (worst < bestWorst) {
+              bestWorst = worst;
+              bestShip = { axis: isZ ? 'z' : 'x', fixed, start, len, beam, deckY, gap };
+            }
+          }
         }
-        const fixed = ZS + 6 + beam / 2;
-        let start = cx - 250;
-        for (; start < cx + 500; start += 16) {
-          if (hullClearLine(0, fixed, 'x', start)) break;
-        }
-        return start < cx + 500 && hullClearLine(0, fixed, 'x', start) ? { axis: 'x', fixed, start, len, beam, deckY } : null;
+        if (bestShip && bestWorst < WATER_Y + 0.9) return bestShip;
+        return null;
       };
       // Last resort: park the mega-ship AT ANCHOR in the open bay — march
       // the diagonal until a full hull length of deep water is verified.
       // The bay is uniformly deep far out, so this always finds a line.
       const anchorAt = (cx: number, cz: number): PortPlan['ship'] => {
-        for (let t = 260; t <= 1600; t += 40) {
+        for (let t = 160; t <= 1600; t += 40) {
           const px = cx + HARBOR_E * t;
           const pz = cz + HARBOR_E * t;
-          if (hullClearLine(px, 0, 'z', pz - len / 2)) return { axis: 'z', fixed: px, start: pz - len / 2, len, beam, deckY };
-          if (hullClearLine(0, pz, 'x', px - len / 2)) return { axis: 'x', fixed: pz, start: px - len / 2, len, beam, deckY };
+          if (hullClearLine(px, 0, 'z', pz - len / 2, 6.0)) return { axis: 'z', fixed: px, start: pz - len / 2, len, beam, deckY };
+          if (hullClearLine(0, pz, 'x', px - len / 2, 6.0)) return { axis: 'x', fixed: pz, start: px - len / 2, len, beam, deckY };
         }
         return null;
       };
 
-        let plan: PortPlan | null = null;
-        let fallback: PortPlan | null = null;
-        let fallbackPads: Array<{ x: number; z: number; r: number }> = [];
-        for (const k of [0, 110, -110, 220, -220, 330, -330, 440]) {
+      // Site scan: slide along the coast, re-anchoring every candidate to
+      // its OWN waterline, then keep the WETTEST valid site — the port
+      // always hugs the ocean, even on noisy or cliffy coasts. The
+      // expensive berth walk + spawn search run ONLY on the winner.
+      const R = (L / 2 + D / 2) / Math.SQRT2; // centre -> seaward corner, diagonal
+      type Site = {
+        plan: PortPlan;
+        pads: Array<{ x: number; z: number; r: number }>;
+        score: number;
+        ok: boolean;
+        wx0: number;
+        wz0: number;
+        XE: number;
+        ZS: number;
+      };
+      let bestSite: Site | null = null;
+      let wetSite: Site | null = null; // wettest site with a dry landward corner (fallback)
+      let firstSite: Site | null = null;
+      for (const k of [0, 80, -80, 160, -160, 240, -240, 320, -320, 400, -400, 480, -480, 560, -560, 640]) {
         const wx0 = ax0 + HARBOR_E * k;
         const wz0 = az0 - HARBOR_E * k;
-        const cx = wx0 - HARBOR_E * cIn;
-        const cz = wz0 - HARBOR_E * cIn;
+        // Re-anchor every slid site to ITS OWN waterline: the coast
+        // bends +-200 m along the slide, so without this a slid site
+        // could site the platform half-inland. The seaward corner now
+        // always juts CORNER metres past the LOCAL waterline — the
+        // harbour hugs the ocean at every candidate.
+        const tw = marchWaterFrom(wx0, wz0, 320);
+        if (tw < 0) continue;
+        const cx = wx0 + HARBOR_E * (tw + CORNER - R);
+        const cz = wz0 + HARBOR_E * (tw + CORNER - R);
         const padTop = WATER_Y + 2.6;
         const XW = cx - L / 2;
         const XE = cx + L / 2;
@@ -3920,13 +4075,49 @@ export default function BattleRoyaleGame() {
 
         // siting validation — the platform needs a real bay at the
         // seaward corner, real land at the landward one, and low faces
+        // (face mids get +0.9: a noisy coast can hold the quay a little
+        // above the waterline while the corner still stands in the bay)
+        const landwardDry = terrainHeight(XW, ZN) > WATER_Y - 0.6;
         const ok =
           terrainHeight(XE, ZS) < WATER_Y + 0.3 && // corner in the water
-          terrainHeight(XE, cz) < WATER_Y + 0.5 &&
-          terrainHeight(cx, ZS) < WATER_Y + 0.5 &&
+          terrainHeight(XE, cz) < WATER_Y + 0.9 &&
+          terrainHeight(cx, ZS) < WATER_Y + 0.9 &&
           terrainHeight(cx, cz) > WATER_Y + 0.1 &&
-          terrainHeight(XW, ZN) > WATER_Y - 0.6; // landward corner dry
+          landwardDry; // landward corner dry
+        // wetness score: lower = more ocean at the seaward faces
+        const score = terrainHeight(XE, ZS) + terrainHeight(XE, cz) + terrainHeight(cx, ZS);
 
+        const candidate: PortPlan = {
+          cx,
+          cz,
+          L,
+          D,
+          padTop,
+          berth: 'east',
+          ship: null,
+          spawn: { x: XE - 30, z: cz }, // provisional — the real search runs on the winner
+          dock: null,
+          bwall: { x: wx0 + HARBOR_E * bwK, z: wz0 - HARBOR_E * bwK },
+          ladders: [],
+          stats: { buildings: 0, containers: 0, cranes: 0, tanks: 0, shipBoxes: 0, solids: 0 },
+        };
+        const site: Site = { plan: candidate, pads, score, ok, wx0, wz0, XE, ZS };
+        if (!firstSite) firstSite = site;
+        if (ok && (!bestSite || score < bestSite.score)) bestSite = site;
+        // even on a coast where nothing fully validates, the wettest
+        // site that still has dry land at the landward corner beats a
+        // dry k=0 fallback — the port hugs the ocean whenever it can
+        if (!ok && landwardDry && (!wetSite || score < wetSite.score)) wetSite = site;
+      }
+
+      const site = bestSite ?? wetSite ?? firstSite;
+      let plan: PortPlan | null = null;
+      if (site) {
+        const { plan: P, XE, ZS } = site;
+        const cx = P.cx;
+        const cz = P.cz;
+        const XW = cx - L / 2;
+        const ZN = cz - D / 2;
         // berth: try both seaward faces (full hull length verified), then
         // the open-bay anchor line — the ship ALWAYS exists
         const berth: 'east' | 'south' = rnd() < 0.5 ? 'east' : 'south';
@@ -3934,9 +4125,13 @@ export default function BattleRoyaleGame() {
           berthAt(berth, XE, ZS, cx, cz) ||
           berthAt(berth === 'east' ? 'south' : 'east', XE, ZS, cx, cz) ||
           anchorAt(cx, cz);
+        P.ship = ship;
+        P.berth = (ship?.axis === 'x' ? 'south' : 'east') as 'east' | 'south';
 
-        // spawn: dry sand just outside a seaward face — the ocean
-        // is right there, the port in front of you
+        // spawn: dry sand just outside a seaward face — the ocean is
+        // right there, the port in front of you. If no dry-sand slot
+        // exists on this coast, stand ON the quay next to the berth
+        // instead of deep inland.
         let sp: { x: number; z: number } | null = null;
         for (let u = XW + 40; u <= XE - 40 && !sp; u += 6) {
           for (const off of [12, 18, 26]) {
@@ -3952,10 +4147,11 @@ export default function BattleRoyaleGame() {
             if (h > WATER_Y + 0.35 && h < WATER_Y + 1.9 && dd < -2 && dd > -100) sp = { x: XE + off, z: w };
           }
         }
+        P.spawn = sp ?? { x: XE - 30, z: cz + (rnd() - 0.5) * D * 0.4 };
 
         // graving dock: a coast point clear of the platform, channel east
-        const dsx = wx0 + HARBOR_E * dockK;
-        const dsz = wz0 - HARBOR_E * dockK;
+        const dsx = site.wx0 + HARBOR_E * dockK;
+        const dsz = site.wz0 - HARBOR_E * dockK;
         let dockX: number | null = null;
         for (let dd = 0; dd <= 300; dd += 2) {
           if (terrainHeight(dsx + dd, dsz) < WATER_Y - 0.12) {
@@ -3963,42 +4159,13 @@ export default function BattleRoyaleGame() {
             break;
           }
         }
-        const dock = dockX !== null ? { x: dockX, z: dsz } : null;
-        const bwall = { x: wx0 + HARBOR_E * bwK, z: wz0 - HARBOR_E * bwK };
+        P.dock = dockX !== null ? { x: dockX, z: dsz } : null;
 
-        const candidate: PortPlan = {
-          cx,
-          cz,
-          L,
-          D,
-          padTop,
-          berth: (ship?.axis === 'x' ? 'south' : 'east') as 'east' | 'south',
-          ship,
-          spawn: sp ?? { x: XW - 26, z: cz + (rnd() - 0.5) * D * 0.4 },
-          dock,
-          bwall,
-          stats: { buildings: 0, containers: 0, cranes: 0, tanks: 0, shipBoxes: 0, solids: 0 },
-        };
-        if (!fallback) {
-          fallback = candidate;
-          fallbackPads = pads;
-        }
-        if (ok && ship && sp) {
-          for (const p of pads) flatZones.push({ x: p.x, z: p.z, r: p.r, baseY: padTop - 0.42 });
-          plan = candidate;
-          harborAnchor = { x: wx0, z: wz0, t: tWater };
-          HARBOR_SPAWN = sp;
-          break;
-        }
-      }
-      if (!plan) {
-        plan = fallback; // dirty coast everywhere — best effort
-        if (plan) for (const p of fallbackPads) flatZones.push({ x: p.x, z: p.z, r: p.r, baseY: plan.padTop - 0.42 });
-      }
-      if (plan) {
-        if (!harborAnchor) harborAnchor = { x: ax0, z: az0, t: tWater };
-        HARBOR_SPAWN = plan.spawn; // keep-blend flattens the real spawn
-        portClearR = Math.hypot(plan.L, plan.D) / 2 + 70;
+        for (const p of site.pads) flatZones.push({ x: p.x, z: p.z, r: p.r, baseY: P.padTop - 0.42 });
+        harborAnchor = { x: site.wx0, z: site.wz0, t: tWater };
+        HARBOR_SPAWN = P.spawn; // keep-blend flattens the real spawn
+        portClearR = Math.hypot(L, D) / 2 + 70;
+        plan = P;
       }
       portPlan = plan;
     }
@@ -4228,7 +4395,7 @@ export default function BattleRoyaleGame() {
       }
 
       // ---- Warehouse row: 30-46 m roll-doored steel giants ----
-      const whRow: Array<{ x: number; z: number }> = [];
+      const whRow: Array<{ x: number; z: number; hx: number; hz: number }> = [];
       let wz = ZN + 70;
       while (wz < ZS - 40 && whRow.length < 7) {
         const hz = 11 + Math.floor(rnd() * 4);
@@ -4239,12 +4406,22 @@ export default function BattleRoyaleGame() {
           buildMegaWarehouse({ x: wx, z: wz + hz, rot: 0 }, padTop, hx, hz, 2 + Math.floor(rnd() * 2), harborGroup);
           markPlaced(wx, wz + hz, hx, hz);
           stats.buildings++;
-          whRow.push({ x: wx, z: wz + hz });
+          whRow.push({ x: wx, z: wz + hz, hx, hz });
           break;
         }
         wz += hz * 2 + 18 + Math.floor(rnd() * 8);
       }
       if (whRow.length) harborMarks.push({ x: whRow[0].x, z: whRow[0].z, label: 'WHSE', cls: 'c-whse' });
+      // LADDER objects up the east wall of the first two warehouses:
+      // the parapet roof + its loot open up without building a ramp.
+      // The 45-degree rungs start near the south corner and climb
+      // north along the wall face.
+      for (const w of whRow.slice(0, 2)) {
+        const lx = w.x + w.hx + 0.55;
+        const lz = w.z - 4;
+        bLadder(lx, lz, padTop, padTop + 10.7, bmPlankDark, harborGroup, 'z');
+        P.ladders.push({ x: lx, z: lz });
+      }
 
       // ---- Dockworkers' row: cottages + houses by the west gate ----
       let hz2 = cz - 88;
@@ -4351,7 +4528,7 @@ export default function BattleRoyaleGame() {
         // anchored ships (dirty-coast seeds) get a swim-out pontoon with
         // a hull ladder. Both end in a landing over the bulwark rail.
         const face = sh.fixed - sh.beam / 2; // quay-side hull face
-        const alongside = sh.axis === 'z' ? face - XE < 16 : face - ZS < 16;
+        const alongside = sh.gap !== undefined; // berthed: walkway bridges the gap
         const quayEnd = sh.axis === 'z' ? ZS : XE;
         if (alongside) {
           const bU = Math.max(sh.start + 8, Math.min(sh.start + 58, quayEnd - 34));
@@ -4372,6 +4549,18 @@ export default function BattleRoyaleGame() {
             bBox({ x: bU + climb * 0.8 + 2.2, z: face - 2.3, rot: 0 }, 'z', -1.4, 1.4, -4.7, 4.7, sh.deckY - 0.1, sh.deckY + 1.25, bmSteelDark, harborGroup); // landing onto the deck
             bBox({ x: bU + climb * 0.8 + 3.7, z: face - 2.3, rot: 0 }, 'z', -0.12, 0.12, -4.7, 4.7, sh.deckY + 1.25, sh.deckY + 2.35, bmSteel, harborGroup); // far-edge rail
             bBox({ x: bU + 34, z: ZS + 2.5, rot: 0 }, 'z', -0.06, 0.06, -0.06, 0.06, padTop + 0.9, sh.deckY, bmSteelDark, harborGroup); // mooring line
+          }
+          // Long-gap moorings read as a proper jetty: pilings under the
+          // walkway every ~14 m so the deck isn't a floating slab.
+          if ((sh.gap ?? 0) > 18) {
+            const nP = Math.floor((sh.gap ?? 0) / 14);
+            for (let i = 1; i <= nP; i++) {
+              const t = i / (nP + 1);
+              const bx = sh.axis === 'z' ? XE + (face - XE) * t : bU + 11;
+              const bz = sh.axis === 'z' ? bU + 11 : ZS + (face - ZS) * t;
+              const bed = Math.min(terrainHeight(bx, bz) - 0.4, WATER_Y - 2.6);
+              bBox({ x: bx, z: bz, rot: 0 }, 'z', -0.45, 0.45, -0.45, 0.45, bed, WATER_Y - 2.2, bmConcreteDark, harborGroup);
+            }
           }
         } else {
           // AT ANCHOR: swim-out boarding at the hull's midpoint. The
@@ -4578,6 +4767,99 @@ export default function BattleRoyaleGame() {
           pois.push({ id: id++, kind, label: def.label, cls: def.cls, x: best.x, z: best.z, rot: rnd() < 0.5 ? 0 : 1, gy, r: def.r, group: null, built: false, tries: 0 });
           flatZones.push({ x: best.x, z: best.z, r: def.r * 0.65 + 10, baseY: gy });
         }
+      }
+    }
+
+    // Build the transition-route network AFTER the POIs exist but
+    // BEFORE any tile streams (tiles paint it). Minimum spanning tree
+    // over POI centres + the port gate keeps every place reachable,
+    // then 3 seeded short-circuit edges add loops so it feels like a
+    // real road web. Every edge jitters into waypoints and resamples
+    // to ~8 m; kind (dust / mud / gravel) and width are seeded.
+    function generatePaths() {
+      paths.length = 0;
+      pathGrid.clear();
+      pathSamples.length = 0;
+      pathMeta.length = 0;
+      if (!pois.length) return;
+      const rnd = mulberry32((terrainSeed ^ 0x51a3c7e) >>> 0);
+      const nodes: Array<{ x: number; z: number }> = pois.map((p) => ({ x: p.x, z: p.z }));
+      if (portPlan) nodes.push({ x: portPlan.cx - portPlan.L / 2 - 14, z: portPlan.cz }); // the landward gate
+      else nodes.push({ x: HARBOR_SPAWN.x, z: HARBOR_SPAWN.z });
+      const n = nodes.length;
+      // Prim MST
+      const inTree = new Array(n).fill(false);
+      const edges: Array<[number, number]> = [];
+      inTree[0] = true;
+      for (let e = 0; e < n - 1; e++) {
+        let bi = -1;
+        let bj = -1;
+        let bd = Infinity;
+        for (let i = 0; i < n; i++) {
+          if (!inTree[i]) continue;
+          for (let j = 0; j < n; j++) {
+            if (inTree[j]) continue;
+            const d = Math.hypot(nodes[i].x - nodes[j].x, nodes[i].z - nodes[j].z);
+            if (d < bd) {
+              bd = d;
+              bi = i;
+              bj = j;
+            }
+          }
+        }
+        if (bj < 0) break;
+        inTree[bj] = true;
+        edges.push([bi, bj]);
+      }
+      // Seeded loop edges: the 3 shortest non-tree links under 950 m
+      const loops: Array<{ a: number; b: number; d: number }> = [];
+      for (let i = 0; i < n; i++) {
+        for (let j = i + 1; j < n; j++) {
+          if (edges.some(([a, b]) => (a === i && b === j) || (a === j && b === i))) continue;
+          const d = Math.hypot(nodes[i].x - nodes[j].x, nodes[i].z - nodes[j].z);
+          if (d < 950) loops.push({ a: i, b: j, d });
+        }
+      }
+      loops.sort((p, q) => p.d - q.d);
+      for (const lp of loops.slice(0, 3)) edges.push([lp.a, lp.b]);
+      // Edge -> jittered polyline -> ~8 m samples
+      for (const [ai, bi] of edges) {
+        const A = nodes[ai];
+        const B = nodes[bi];
+        const len = Math.hypot(B.x - A.x, B.z - A.z);
+        if (len < 40) continue;
+        const dirx = (B.x - A.x) / len;
+        const dirz = (B.z - A.z) / len;
+        const perpx = -dirz;
+        const perpz = dirx;
+        const wp: Array<{ x: number; z: number }> = [{ x: A.x, z: A.z }];
+        const nW = Math.max(1, Math.min(4, Math.floor(len / 260)));
+        for (let i = 1; i <= nW; i++) {
+          const t = i / (nW + 1);
+          const jitter = (rnd() * 2 - 1) * Math.min(70, len * 0.09);
+          wp.push({ x: A.x + dirx * len * t + perpx * jitter, z: A.z + dirz * len * t + perpz * jitter });
+        }
+        wp.push({ x: B.x, z: B.z });
+        const roll = rnd();
+        const kind = roll < 0.5 ? 0 : roll < 0.75 ? 1 : 2;
+        const w = kind === 2 ? 6.2 + rnd() * 1.4 : 3.8 + rnd() * 1.2;
+        const seg: PathSeg = { pts: [], w, kind };
+        for (let i = 0; i < wp.length - 1; i++) {
+          const p0 = wp[i];
+          const p1 = wp[i + 1];
+          const segLen = Math.hypot(p1.x - p0.x, p1.z - p0.z);
+          const steps = Math.max(1, Math.ceil(segLen / 8));
+          for (let s = 0; s < steps; s++) {
+            const t = s / steps;
+            const x = p0.x + (p1.x - p0.x) * t;
+            const z = p0.z + (p1.z - p0.z) * t;
+            seg.pts.push(x, z);
+            registerPathSample(x, z, w, kind);
+          }
+        }
+        seg.pts.push(B.x, B.z);
+        registerPathSample(B.x, B.z, w, kind);
+        paths.push(seg);
       }
     }
 
@@ -4932,7 +5214,9 @@ export default function BattleRoyaleGame() {
       resetVox();
       pickups.length = 0;
       BUILDINGS.length = 0;
-      terrainSeed = 1 + Math.floor(Math.random() * 1000000);
+      // ?seed=N pins the map (reproducible harbours for e2e / sharing)
+      const wantedSeed = typeof window !== 'undefined' ? new URLSearchParams(window.location.search).get('seed') : null;
+      terrainSeed = wantedSeed ? Math.abs(Math.floor(+wantedSeed)) || 1 : 1 + Math.floor(Math.random() * 1000000);
       for (const t of tiles.values()) disposeTile(t);
       tiles.clear();
       vegSolids.length = 0;
@@ -4948,6 +5232,7 @@ export default function BattleRoyaleGame() {
       // pads) fill the inland — the streamed mesh carries the pads.
       planHarbor();
       generatePois();
+      generatePaths(); // road network paints onto the tiles as they stream
       streamTerrain(true);
       // Harbor infrastructure: pier over the sea, container yard,
       // warehouses, crane, customs office, fuel tanks, dry dock,
@@ -4984,6 +5269,16 @@ export default function BattleRoyaleGame() {
         const x = HARBOR_SPAWN.x + Math.cos(a) * r;
         const z = HARBOR_SPAWN.z + Math.sin(a) * r;
         if (terrainHeight(x, z) < WATER_Y + 0.5) continue; // land only
+        // never inside the port platform itself — patrols belong on
+        // the island, not wedged between warehouse walls
+        if (
+          portPlan &&
+          x > portPlan.cx - portPlan.L / 2 - 12 &&
+          x < portPlan.cx + portPlan.L / 2 + 12 &&
+          z > portPlan.cz - portPlan.D / 2 - 12 &&
+          z < portPlan.cz + portPlan.D / 2 + 12
+        )
+          continue;
         if (!aiFree(x, z, null)) continue;
         if (dummies.some((o) => Math.hypot(o.group.position.x - x, o.group.position.z - z) < 30)) continue;
         const d = spawnDummy(x, z, true, true);
@@ -5354,6 +5649,92 @@ export default function BattleRoyaleGame() {
               return d === Infinity ? null : +d.toFixed(2);
             },
             port: () => portPlan,
+            seed: () => terrainSeed,
+            paths: () => ({
+              segs: paths.length,
+              samples: pathMeta.length,
+              kinds: paths.reduce((acc, s) => {
+                acc[s.kind] = (acc[s.kind] || 0) + 1;
+                return acc;
+              }, {} as Record<number, number>),
+              totalLen: Math.round(paths.reduce((a, s) => a + (s.pts.length / 2 - 1) * 8, 0)),
+              longest: paths.length ? Math.round(Math.max(...paths.map((s) => (s.pts.length / 2 - 1) * 8))) : 0,
+            }),
+            pathAt: (x: number, z: number) => {
+              const np = nearPath(x, z);
+              return np ? { d: +np.d.toFixed(1), w: +np.w.toFixed(1), kind: np.kind } : null;
+            },
+            dummiesInfo: () =>
+              dummies.map((d) => ({
+                hp: +d.hp.toFixed(1),
+                lifeMax: d.lifeMax,
+                shield: +d.shield.toFixed(1),
+                state: d.state,
+                x: +d.group.position.x.toFixed(1),
+                z: +d.group.position.z.toFixed(1),
+                shooter: !!d.shooter,
+                ai: !!d.ai,
+              })),
+            fire: () => {
+              const w = current;
+              // report whether the trigger pull would actually shoot —
+              // e2e uses it to tell "missed" apart from "never fired"
+              const can = !!w && w.loaded > 0 && cooldown <= 0 && reloadT <= 0 && !roll && !buildMode && !gArmed && !bombArmed;
+              shoot();
+              return can;
+            },
+            rayHit: () => {
+              applyView();
+              raycaster.setFromCamera(centre, camera);
+              const hit = raycaster.intersectObjects(nearShootable(170), false)[0];
+              let reach = hit ? hit.distance : 150;
+              const gc = shotCut(raycaster.ray, reach);
+              const cut = gc < reach;
+              if (cut) reach = gc;
+              const vc = vegCut(raycaster.ray.origin, raycaster.ray.direction, reach);
+              const veg = vc < reach;
+              if (veg) reach = vc;
+              const smoke = smokeDist(raycaster.ray.origin, raycaster.ray.direction, reach) < Infinity;
+              return {
+                d: +reach.toFixed(2),
+                // dummy AND the full shoot() cut pipeline is clean — a
+                // bullet fired with this camera state WILL damage it
+                dummy: !!hit && !!hit.object.userData.dummy && !cut && !veg && !smoke,
+                seesDummy: !!hit?.object.userData.dummy,
+                cut,
+                veg,
+                smoke,
+              };
+            },
+            // Atomic e2e probe: aim the camera at patrol `idx`'s chest,
+            // run the exact shoot() cut pipeline, and — when the line is
+            // clean — pull the trigger for real. No eval-latency gaps
+            // between aim, probe and shot.
+            shootPatrol: (idx: number) => {
+              const d2 = dummies[idx];
+              if (!d2 || d2.state !== 'up') return { saw: false, clean: false, fired: false, reason: 'gone' };
+              const px = d2.group.position.x;
+              const pz = d2.group.position.z;
+              const gy = Math.max(groundAt(px, pz), WATER_Y);
+              const dx = px - camera.position.x;
+              const dz = pz - camera.position.z;
+              const dist = Math.max(2, Math.hypot(dx, dz));
+              yaw = Math.atan2(-dx, -dz);
+              pitch = Math.atan2(gy + 1.15 - camera.position.y, dist);
+              applyView();
+              raycaster.setFromCamera(centre, camera);
+              const hit = raycaster.intersectObjects(nearShootable(170), false)[0];
+              const saw = !!hit?.object.userData.dummy;
+              if (!saw) return { saw, clean: false, fired: false, reason: 'no-dummy' };
+              const reach = hit.distance;
+              if (shotCut(raycaster.ray, reach) < reach) return { saw, clean: false, fired: false, reason: 'structure' };
+              if (vegCut(raycaster.ray.origin, raycaster.ray.direction, reach) < reach) return { saw, clean: false, fired: false, reason: 'veg' };
+              if (smokeDist(raycaster.ray.origin, raycaster.ray.direction, reach) < Infinity) return { saw, clean: false, fired: false, reason: 'smoke' };
+              const w = current;
+              const can = !!w && w.loaded > 0 && cooldown <= 0 && reloadT <= 0 && !roll && !buildMode && !gArmed && !bombArmed;
+              shoot();
+              return { saw, clean: true, fired: can };
+            },
             pickupsInfo: () =>
               pickups.map((p) => ({
                 k: p.kind,
@@ -6135,12 +6516,44 @@ export default function BattleRoyaleGame() {
       const m2 = maxDist * maxDist;
       const out: THREE.Object3D[] = [];
       for (const o of shootable) {
-        const vox = (o as any).userData?.vox as VoxelBox | undefined;
-        const ant = (o as any).userData?.antenna as any;
+        const u = (o as any).userData ?? {};
+        const vox = u.vox as VoxelBox | undefined;
+        const ant = u.antenna as any;
         // Antenna meshes live in a group placed at world coords, so their
         // local positions cannot seed the distance test — use the mast base.
-        const px = vox ? vox.x0 + (vox.nx * vox.sx) / 2 : ant ? ant.group.position.x : o.position.x;
-        const pz = vox ? vox.z0 + (vox.nz * vox.sz) / 2 : ant ? ant.group.position.z : o.position.z;
+        // SAME CLASS OF BUG for three more groups of objects whose meshes
+        // are children of a positioned group (or carry world coords in the
+        // geometry): dummy FIGURE PARTS, player-built WALL panels and
+        // GABLE roofs. Their .position is local / near-origin, so the
+        // pre-filter used to reject them the moment the fight happened
+        // far from the map origin — Harbor — which is exactly the
+        // "can't damage bots in harbor mode" bug (every patrol figure
+        // sat at local ~(0,0) while the camera was 500+ m away).
+        const dum = u.dummy as DummyObject | undefined;
+        const wd = (u.wallDest ?? (o.parent ? (o.parent as any).userData?.wallDest : null)) as any;
+        const wc = u.wc as { x: number; z: number } | undefined;
+        const px = vox
+          ? vox.x0 + (vox.nx * vox.sx) / 2
+          : ant
+          ? ant.group.position.x
+          : dum
+          ? dum.group.position.x
+          : wd
+          ? wd.bounds.x
+          : wc
+          ? wc.x
+          : o.position.x;
+        const pz = vox
+          ? vox.z0 + (vox.nz * vox.sz) / 2
+          : ant
+          ? ant.group.position.z
+          : dum
+          ? dum.group.position.z
+          : wd
+          ? wd.bounds.z
+          : wc
+          ? wc.z
+          : o.position.z;
         const dx = px - ox;
         const dz = pz - oz;
         if (dx * dx + dz * dz < m2) out.push(o);
@@ -6504,8 +6917,32 @@ export default function BattleRoyaleGame() {
       const mesh = new THREE.Mesh(geo, mat);
       mesh.castShadow = true;
       mesh.receiveShadow = true;
+      // Gable geometry carries WORLD coords with the mesh parked at the
+      // origin, so stash the real centre for nearShootable's pre-filter
+      // (roofs far from the map origin would otherwise be un-hittable).
+      geo.computeBoundingBox();
+      if (geo.boundingBox) {
+        const bc = geo.boundingBox.getCenter(new THREE.Vector3());
+        mesh.userData.wc = { x: bc.x, z: bc.z };
+      }
       (parent ?? world).add(mesh);
       shootable.push(mesh);
+    }
+
+    // LADDER object: a 45-degree rung ladder — each rung advances
+    // 0.42 m along `climb` ('x' or 'z') so the footprint works like
+    // the buildable ramp (walk straight up via the step logic), with
+    // the rungs reading as a ladder. Bolt it onto walls, tanks, silos.
+    function bLadder(x: number, z: number, gy: number, topY: number, mat: THREE.Material, parent?: THREE.Object3D, climb: 'x' | 'z' = 'z') {
+      const steps = Math.max(2, Math.ceil((topY - gy) / 0.42));
+      for (let i = 0; i < steps; i++) {
+        const y0 = gy + i * 0.42;
+        if (climb === 'z') {
+          bBox({ x, z: z + 0.42 * i, rot: 0 }, 'z', -0.42, 0.42, -0.25, 0.25, y0, y0 + 0.42, mat, parent);
+        } else {
+          bBox({ x: x + 0.42 * i, z, rot: 0 }, 'z', -0.25, 0.25, -0.42, 0.42, y0, y0 + 0.42, mat, parent);
+        }
+      }
     }
 
     function buildHouse(B: any, gy = 0, parent?: THREE.Object3D) {
@@ -7373,10 +7810,18 @@ export default function BattleRoyaleGame() {
     function clearSpotAhead(dists: number[]) {
       const fx = -Math.sin(yaw);
       const fz = -Math.cos(yaw);
+      // Floor solids (top at/below the player's feet) are NOT obstacles —
+      // the harbor deck is one solid foundation grid, and treating the
+      // floor as a blocker made turret/antenna deployment impossible
+      // anywhere on the port platform.
+      const feet = camera.position.y - eyeH;
       for (const dist of dists) {
         const x = camera.position.x + fx * dist;
         const z = camera.position.z + fz * dist;
-        if (!nearPool(x, z, 1) && solids.every((b) => Math.abs(x - b.x) >= b.hx + 0.5 || Math.abs(z - b.z) >= b.hz + 0.5)) {
+        if (
+          !nearPool(x, z, 1) &&
+          solids.every((b) => b.top <= feet + 0.15 || Math.abs(x - b.x) >= b.hx + 0.5 || Math.abs(z - b.z) >= b.hz + 0.5)
+        ) {
           return { x, z };
         }
       }
@@ -8800,6 +9245,28 @@ export default function BattleRoyaleGame() {
           c.fillStyle = col;
           c.fillRect(i * cell, j * cell, cell + 1, cell + 1);
         }
+      }
+      // Transition routes over the sampled terrain: dust / mud / gravel
+      // strokes — the minimap crop and the big tactical map both inherit
+      // them, so navigating POI-to-POI reads at a glance.
+      if (paths.length) {
+        const toPx = (wx: number) => ((wx + half) / (2 * half)) * S;
+        c.lineJoin = 'round';
+        c.lineCap = 'round';
+        c.globalAlpha = 0.85;
+        for (const seg of paths) {
+          c.strokeStyle = PATH_KIND_CSS[seg.kind];
+          c.lineWidth = Math.max(1.4, (seg.w * S) / (2 * half));
+          c.beginPath();
+          for (let i = 0; i < seg.pts.length; i += 2) {
+            const px = toPx(seg.pts[i]);
+            const pz = toPx(seg.pts[i + 1]);
+            if (i === 0) c.moveTo(px, pz);
+            else c.lineTo(px, pz);
+          }
+          c.stroke();
+        }
+        c.globalAlpha = 1;
       }
     }
 
@@ -10296,11 +10763,14 @@ export default function BattleRoyaleGame() {
               <b>Harbor is a procedural map.</b> The port owns the coast — pier, container yard, warehouses, gantry cranes, customs office, fuel tanks, a dry dock with a half-built ship, and a breakwater crowned by a climbable lighthouse. Every structure is destructible and the port holds the best loot
             </li>
             <li>
-              The rest of the map fills with POIs — <b>VILL</b>age, <b>FARM</b>, <b>FUEL</b> depot, construction <b>SITE</b> (tower crane!), <b>CAMP</b>, radio <b>MAST</b>, <b>RUIN</b>s, <b>OUTP</b>ost and <b>WATER</b> tower — each with loot and a compass chip. Guard towers and lighthouses have walkable stairs to the top
+              The rest of the map fills with POIs — <b>VILL</b>age, <b>FARM</b>, <b>FUEL</b> depot, construction <b>SITE</b> (tower crane!), <b>CAMP</b>, radio <b>MAST</b>, <b>RUIN</b>ns, <b>OUTP</b>ost and <b>WATER</b> tower — each with loot and a compass chip. Guard towers and lighthouses have walkable stairs to the top, and the port's warehouses have LADDERs up to their roofs
             </li>
             <li>
-              <kbd>V</kbd> opens build mode. The default <b>Auto</b> piece reads your aim: look <b>down on the ground</b> = <b>Ramp</b>, look <b>forward</b> = <b>Wall</b>, look <b>down while on a ramp / roof / container</b> (or mid-air) = <b>Platform</b>. <kbd>T</kbd> or the mouse wheel cycles manual pieces — <b>Wall</b>, <b>Door Wall</b>, <b>Floor</b>, <b>Ramp</b>; <kbd>Left click</kbd> places. Wall and Door
-              stop gunfire and blasts until they shatter; Floors bridge water; Ramps run you onto roofs
+              Dust, mud and gravel transition routes stitch the port gate to every POI — follow the tan / brown corridors through the biomes instead of bushwhacking, and watch for them on the tactical map
+            </li>
+            <li>
+              <kbd>V</kbd> opens build mode. The default <b>Auto</b> piece reads your aim: look <b>up</b> = <b>Ladder</b>, look <b>down on the ground</b> = <b>Ramp</b>, look <b>forward</b> = <b>Wall</b>, look <b>down while on a ramp / roof / container</b> (or mid-air) = <b>Platform</b>. <kbd>T</kbd> or the mouse wheel cycles manual pieces — <b>Wall</b>, <b>Door Wall</b>, <b>Floor</b>, <b>Ramp</b>, <b>Ladder</b>; <kbd>Left click</kbd> places. Wall and Door
+              stop gunfire and blasts until they shatter; Floors bridge water; Ramps run you onto roofs; Ladders climb any wall — walk into them and keep moving
             </li>
             <li>Bullets lose power with range: SMG past 20 m, SK past 60 m, sniper past 200 m</li>
             <li>Shield takes hits first, then life. It recharges after 6 s without damage</li>
@@ -10331,10 +10801,11 @@ export default function BattleRoyaleGame() {
             <li>Tap slider to jump. Slide left/right to roll, down to crouch — while running it slides</li>
             <li>Tap GRENADE to arm, tap AIM to throw. Hold GRENADE and slide up to pick kind</li>
             <li>
-              Tap WALL to arm build mode, then tap AIM to place. Auto reads your aim — look down on the ground = ramp, look forward = wall, look down from a ramp / roof = platform. Double-tap WALL to cycle pieces manually
+              Tap WALL to arm build mode, then tap AIM to place. Auto reads your aim — look up = ladder, look down on the ground = ramp, look forward = wall, look down from a ramp / roof = platform. Double-tap WALL to cycle pieces manually
             </li>
             <li>Wade into the sea: you slow down, then swim. Hold crouch to dive, tap jump to stroke up</li>
             <li>The top compass shows the nearest landmarks with distances — edge-pinned chips show which way to turn. Follow the port chips (PIER, YARD, DOCK, LIGHT) for the best loot</li>
+            <li>Dust, mud and gravel routes run between the port gate and every POI — follow the tan / brown corridors instead of bushwhacking</li>
             <li>Tap INVENTORY to purchase weapons, ammo and customize dummies</li>
             <li>Antenna recon: tap the round minimap (top right) for the full map. Tap ANTENNA to start the 60 s enemy scan — it has 300 HP, so guard it</li>
           </ul>
