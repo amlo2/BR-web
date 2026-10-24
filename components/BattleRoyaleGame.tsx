@@ -2072,7 +2072,14 @@ export default function BattleRoyaleGame() {
           aimBtn.classList.add('build-active');
         }
         const p = BUILD_PIECES[buildPieceIdx];
-        showMessage(p.icon + ' ' + p.label + ': [LEFT CLICK / TAP AIM] place (' + p.hp + ' HP) · [Wheel / T / double-tap WALL] cycle piece · [V / RIGHT CLICK] cancel', 3.2);
+        showMessage(
+          p.kind === 'auto'
+            ? '🎯 Auto build: look down on the ground = ramp · look forward = wall · look down from a ramp / structure = platform. [LEFT CLICK / TAP AIM] place · [Wheel / T / double-tap WALL] pick manually · [V / RIGHT CLICK] cancel'
+            : p.icon + ' ' + p.label + ': [LEFT CLICK / TAP AIM] place (' + p.hp + ' HP) · [Wheel / T / double-tap WALL] cycle piece · [V / RIGHT CLICK] cancel',
+          p.kind === 'auto' ? 5 : 3.2
+        );
+        setPreviewGeometry(resolvedBuildKind());
+        updateBuildHud();
         playSfx('build');
       } else {
         setStatus('');
@@ -2093,6 +2100,7 @@ export default function BattleRoyaleGame() {
     // voxel-chippable planks so grenades can blow holes in them.
     // ----------------------------------------------------
     const BUILD_PIECES = [
+      { kind: 'auto', icon: '🎯', label: 'Auto Piece', hp: 250 },
       { kind: 'wall', icon: '🧱', label: 'Wall Cover', hp: 250 },
       { kind: 'door', icon: '🚪', label: 'Door Wall', hp: 250 },
       { kind: 'floor', icon: '🟫', label: 'Floor', hp: 300 },
@@ -2106,12 +2114,47 @@ export default function BattleRoyaleGame() {
       ramp: [3, 1.05, 2.7],
     };
 
+    // Aim-directed building (mobile-first): the default Auto piece reads your
+    // pitch and footing so ONE button covers every structure mid-fight —
+    //   look forward               -> Wall
+    //   look down, on the ground   -> Ramp (run up it)
+    //   look down, elevated / air  -> Floor platform (on a ramp, container,
+    //                                 roof, or mid-air to bridge a gap)
+    function resolvedBuildKind() {
+      const cur = BUILD_PIECES[buildPieceIdx].kind;
+      if (cur !== 'auto') return cur;
+      if (pitch > -0.45) return 'wall';
+      const feetY = camera.position.y - eyeH;
+      const elevated = !grounded || feetY - groundAt(camera.position.x, camera.position.z) > 0.6;
+      return elevated ? 'floor' : 'ramp';
+    }
+
+    function pieceFor(kind: string) {
+      return BUILD_PIECES.find((p) => p.kind === kind) || BUILD_PIECES[1];
+    }
+
+    let lastPreviewKind = '';
+    // Swap the hologram geometry when the resolved piece changes; returns
+    // true on a swap so callers can refresh the HUD chip too.
+    function setPreviewGeometry(kind: string) {
+      if (kind === lastPreviewKind) return false;
+      lastPreviewKind = kind;
+      const g = PIECE_PREVIEW[kind];
+      previewMesh.geometry.dispose();
+      previewMesh.geometry = new THREE.BoxGeometry(g[0], g[1], g[2]);
+      return true;
+    }
+
     function updateBuildHud() {
-      const p = BUILD_PIECES[buildPieceIdx];
+      const auto = BUILD_PIECES[buildPieceIdx].kind === 'auto';
+      const p = auto ? pieceFor(resolvedBuildKind()) : BUILD_PIECES[buildPieceIdx];
       const nameEl = $('buildWallName');
-      if (nameEl) nameEl.textContent = p.icon + ' ' + p.label;
+      if (nameEl) nameEl.textContent = (auto ? '🎯 ' : '') + p.icon + ' ' + p.label;
       const stateEl = $('buildWallState');
-      if (stateEl) stateEl.textContent = p.hp + ' HP · wheel / T cycles piece';
+      if (stateEl)
+        stateEl.textContent = auto
+          ? p.hp + ' HP · aim decides: down = ramp / platform · forward = wall'
+          : p.hp + ' HP · wheel / T cycles piece';
       const tIcon = $('buildPieceIcon');
       if (tIcon) tIcon.textContent = p.icon;
       const tLabel = $('buildPieceLabel');
@@ -2121,9 +2164,14 @@ export default function BattleRoyaleGame() {
     function cycleBuildPiece(dir = 1) {
       buildPieceIdx = (buildPieceIdx + dir + BUILD_PIECES.length) % BUILD_PIECES.length;
       const p = BUILD_PIECES[buildPieceIdx];
-      const g = PIECE_PREVIEW[p.kind];
-      previewMesh.geometry.dispose();
-      previewMesh.geometry = new THREE.BoxGeometry(g[0], g[1], g[2]);
+      if (p.kind === 'auto') {
+        setPreviewGeometry(resolvedBuildKind());
+        updateBuildHud();
+        if (buildMode)
+          showMessage('🎯 Auto piece: your aim decides — down on the ground = ramp, forward = wall, down from a ramp / structure = platform', 2.4);
+        return;
+      }
+      setPreviewGeometry(p.kind);
       updateBuildHud();
       if (buildMode) showMessage(p.icon + ' ' + p.label + ' selected (' + p.hp + ' HP) — aim & click to place', 1.8);
     }
@@ -2194,15 +2242,16 @@ export default function BattleRoyaleGame() {
       const pz = camera.position.z + forward.z * placeDist;
       const angle = Math.atan2(forward.x, forward.z);
       const feetY = camera.position.y - eyeH;
-      const piece = BUILD_PIECES[buildPieceIdx];
+      const kind = resolvedBuildKind();
+      const piece = pieceFor(kind);
 
-      if (piece.kind === 'wall') {
+      if (kind === 'wall') {
         buildFortniteWall(px, groundAt(px, pz), pz, angle);
-        showMessage('🧱 Wall deployed! (250 HP) Take cover from gunfire & grenades!', 2.5);
-      } else if (piece.kind === 'door') {
+        showMessage('🧱 Wall deployed! (' + piece.hp + ' HP) Take cover from gunfire & grenades!', 2.5);
+      } else if (kind === 'door') {
         buildFortniteDoor(px, groundAt(px, pz), pz, angle);
         showMessage('🚪 Door wall up! Cover with a doorway you control!', 2.5);
-      } else if (piece.kind === 'floor') {
+      } else if (kind === 'floor') {
         const top = Math.max(feetY, groundAt(px, pz) + 0.05) + 0.06;
         addVoxSolid(px, top - 0.28, top, pz, 3, 3, bmPlank);
         showMessage('🟫 Floor placed! Bridge water or raise a platform!', 2.5);
@@ -2285,7 +2334,8 @@ export default function BattleRoyaleGame() {
         forward.normalize();
         const px = camera.position.x + forward.x * 2.8;
         const pz = camera.position.z + forward.z * 2.8;
-        const kind = BUILD_PIECES[buildPieceIdx].kind;
+        const kind = resolvedBuildKind();
+        if (setPreviewGeometry(kind) && BUILD_PIECES[buildPieceIdx].kind === 'auto') updateBuildHud();
         if (kind === 'floor') {
           const feet = camera.position.y - eyeH;
           const top = Math.max(feet, groundAt(px, pz) + 0.05) + 0.06;
@@ -2754,6 +2804,13 @@ export default function BattleRoyaleGame() {
     const ROLL_IFRAMES = 0.48;
     const ROLL_COOL = 0.4;
     let eyeH = EYE;
+    // Feet level of the last grounded moment — the "takeoff" floor. While
+    // airborne, horizontal collision bands cap at groundRef + standing head
+    // height: overhead slabs, lintels and window heads are CEILINGS there,
+    // never walls. Without this cap, a jump that pokes your head into an
+    // overhead band lets the per-axis wall clamp sling you metres across a
+    // room — the "lean on a wall and get teleported" bug.
+    let groundRef = 0;
     let slide: any = null;
     let roll: any = null;
     let airCarry: any = null;
@@ -2825,10 +2882,14 @@ export default function BattleRoyaleGame() {
       if (axis === 0) p.x += d;
       else p.z += d;
       const feet = p.y - eyeH;
-      const head = p.y + 0.2;
+      // Band top caps at the takeoff floor + standing head height: a box
+      // that starts above your standing head (2nd-floor slab, door lintel,
+      // window head) is a CEILING, not a wall — it must never grab you
+      // horizontally mid-jump. overheadAt still bonks your head on it.
+      const bandTop = Math.min(p.y + 0.2, groundRef + EYE + 0.2);
       for (const b of solids) {
         // Vertical band must overlap the box, same test as pushOut
-        if (b.top <= feet + 0.05 || (b.bottom ?? 0) >= head) continue;
+        if (b.top <= feet + 0.05 || (b.bottom ?? 0) >= bandTop) continue;
         // Other axis must overlap (player square vs box square)
         const other = axis === 0 ? p.z : p.x;
         const bOther = axis === 0 ? b.z : b.x;
@@ -2841,9 +2902,19 @@ export default function BattleRoyaleGame() {
         const nearFace = bMove - bMoveHalf - RADIUS;
         const farFace = bMove + bMoveHalf + RADIUS;
         if (move > nearFace && move < farFace) {
-          const clamped = d > 0 ? nearFace : farFace;
-          if (axis === 0) p.x = clamped;
-          else p.z = clamped;
+          const prev = move - d;
+          if (prev > nearFace && prev < farFace) {
+            // Already inside this box's span when the substep began (band
+            // flipped mid-jump, a POI streamed in around us, a shove from a
+            // neighbouring box): cancel the move. Ejecting to the far face
+            // here is what read as a teleport THROUGH the wall.
+            if (axis === 0) p.x -= d;
+            else p.z -= d;
+          } else {
+            const clamped = d > 0 ? nearFace : farFace;
+            if (axis === 0) p.x = clamped;
+            else p.z = clamped;
+          }
         }
       }
     }
@@ -2896,7 +2967,8 @@ export default function BattleRoyaleGame() {
     const crouchHeld = () => keys.has('KeyC') || crouched || sliderTouch?.down === true;
 
     function updateStance(dt: number, swimming: boolean) {
-      if (sprinting) crouched = false;
+      // Sprinting deliberately does NOT cancel a toggled crouch: running keeps
+      // the stance, it only raises the eye when nothing holds crouch anymore.
       const isCrouching = crouchHeld() && !swimming && !climb;
       if (sliderEl) sliderEl.classList.toggle('crouched', isCrouching);
       const wanted = slide ? SLIDE_EYE : isCrouching ? CROUCH_EYE : EYE;
@@ -2980,7 +3052,12 @@ export default function BattleRoyaleGame() {
       const wz = len > 0 ? (-Math.cos(yaw) * f - Math.sin(yaw) * s) / len : 0;
       const onGround = grounded && !swimming && !climb;
       const triggerSlide =
-        (slideReq || (sliderTouch?.down && !sliderTouch?.slid)) && !slide && !roll && moving && onGround;
+        (slideReq || (sliderTouch?.down && !sliderTouch?.slid)) &&
+        !slide &&
+        !roll &&
+        moving &&
+        onGround &&
+        sprinting; // a slide is a sprint move — tapping C while walking just crouches
       if (triggerSlide) {
         slide = { t: 0, dx: wx, dz: wz, v: SLIDE_SPEED, lean: 0, step: 0, x0: 0, z0: 0 };
         if (sliderTouch) sliderTouch.slid = true;
@@ -3084,7 +3161,10 @@ export default function BattleRoyaleGame() {
       sweepMove(preX, preZ);
 
       for (const b of solids) {
-        if (b.top > camera.position.y - eyeH + 0.05 && (b.bottom ?? 0) < camera.position.y + 0.2) {
+        if (
+          b.top > camera.position.y - eyeH + 0.05 &&
+          (b.bottom ?? 0) < Math.min(camera.position.y + 0.2, groundRef + EYE + 0.2)
+        ) {
           pushOut(b);
         }
       }
@@ -3192,7 +3272,10 @@ export default function BattleRoyaleGame() {
           grounded = false;
         }
       }
-      if (!grounded) {
+      if (grounded) {
+        // Remember the takeoff floor for the airborne collision band cap.
+        groundRef = camera.position.y - eyeH;
+      } else {
         slide = null;
         roll = null;
       }
@@ -4233,6 +4316,21 @@ export default function BattleRoyaleGame() {
         stats.buildings++;
       }
 
+      // ---- Top-up to the "at least 30 buildings" floor ----
+      // fits() rejections on a cramped seed can dip the count below the
+      // spec'd 30, so scatter small sheds into free pad space (seeded, so
+      // two harbours still never look the same) until the floor is met.
+      let topTries = 0;
+      while (stats.buildings < 30 && topTries < 80) {
+        topTries++;
+        const tx = XW + 14 + rnd() * Math.max(10, XE - XW - 28);
+        const tz = ZN + 14 + rnd() * Math.max(10, ZS - ZN - 28);
+        if (!fits(tx, tz, 3.2, 4.8, 5)) continue;
+        buildShed({ x: tx, z: tz, rot: rnd() < 0.5 ? 0 : 1 }, padTop, harborGroup);
+        markPlaced(tx, tz, 3.2, 4.8);
+        stats.buildings++;
+      }
+
       // ---- Moored boats ----
       if (seaDist(XE + 26, cz - 60) > 12) buildBoat(XE + 26, cz - 60 + rnd() * 30, harborGroup);
       for (let u = cx; u < XE; u += 8) {
@@ -5125,7 +5223,7 @@ export default function BattleRoyaleGame() {
           (window as any).__debug = {
             blast: (bx: number, bz: number) =>
               explode(bx, bz, GREN.blast.radius, GREN.blast.dmg, GREN.blast.selfDmg),
-            buildings: () => BUILDINGS.map((b: any) => ({ x: b.x, z: b.z, hx: b.hx, hz: b.hz, kind: b.kind, rot: b.rot })),
+            buildings: () => BUILDINGS.map((b: any) => ({ x: b.x, z: b.z, hx: b.hx, hz: b.hz, kind: b.kind, rot: b.rot, door: b.door })),
             moveTo: (mx: number, mz: number, my?: number) => {
               if (my !== undefined) {
                 camera.position.set(mx, my, mz);
@@ -5189,6 +5287,38 @@ export default function BattleRoyaleGame() {
               mapOpen,
               minimapHidden: ($('minimap') as any)?.hidden ?? true,
             }),
+            moveInfo: () => ({
+              x: +camera.position.x.toFixed(2),
+              y: +camera.position.y.toFixed(2),
+              z: +camera.position.z.toFixed(2),
+              feet: +(camera.position.y - eyeH).toFixed(2),
+              ground: +groundAt(camera.position.x, camera.position.z).toFixed(2),
+              groundRef: +groundRef.toFixed(2),
+              grounded,
+              sprinting,
+              crouched: crouchHeld(),
+              sliding: !!slide,
+              eyeH: +eyeH.toFixed(2),
+              pitch: +pitch.toFixed(2),
+            }),
+            buildInfo: () => ({
+              mode: buildMode,
+              piece: BUILD_PIECES[buildPieceIdx].kind,
+              resolved: buildMode ? resolvedBuildKind() : null,
+            }),
+            setPitch: (rad: number) => {
+              pitch = THREE.MathUtils.clamp(rad, -1.5, 1.5);
+            },
+            placeAuto: () => {
+              buildPieceIdx = 0;
+              toggleBuildWall(true);
+              placeWall();
+            },
+            armBuild: () => {
+              buildPieceIdx = 0;
+              toggleBuildWall(true);
+            },
+            disarmBuild: () => toggleBuildWall(false),
             biome: (bx: number, bz: number) => {
               biomeWeights(bx, bz, VW);
               return {
@@ -9533,7 +9663,7 @@ export default function BattleRoyaleGame() {
 
       {/* Control Hints (desktop) */}
       <div className="hud hint">
-        WASD move &middot; Shift sprint &middot; Space jump &middot; C crouch/slide &middot; Z/X roll &middot; R reload
+        WASD move &middot; Shift sprint &middot; Space jump &middot; C crouch / sprint-slide &middot; Z/X roll &middot; R reload
         &middot; 1/2/Q weapon slots &middot; E turret/bombard/antenna &middot; G grenade (hold to pick) &middot; Right click
         aim/call &middot; M map (Antenna) &middot; B inventory &middot; Esc pause
       </div>
@@ -10148,7 +10278,7 @@ export default function BattleRoyaleGame() {
               <kbd>D</kbd> move, <kbd>Shift</kbd> sprint, <kbd>Space</kbd> jump
             </li>
             <li>
-              <kbd>C</kbd> hold to crouch, or tap while moving to slide. <kbd>Z</kbd> and <kbd>X</kbd> roll the way you are moving
+              <kbd>C</kbd> hold to crouch, or tap while <b>sprinting</b> to slide. <kbd>Z</kbd> and <kbd>X</kbd> roll the way you are moving
             </li>
             <li>Mouse to look, hold <kbd>Left click</kbd> to fire</li>
             <li>Dummies within 15 m are shot automatically. Hold <kbd>Right click</kbd> to aim at range.</li>
@@ -10169,8 +10299,7 @@ export default function BattleRoyaleGame() {
               The rest of the map fills with POIs — <b>VILL</b>age, <b>FARM</b>, <b>FUEL</b> depot, construction <b>SITE</b> (tower crane!), <b>CAMP</b>, radio <b>MAST</b>, <b>RUIN</b>s, <b>OUTP</b>ost and <b>WATER</b> tower — each with loot and a compass chip. Guard towers and lighthouses have walkable stairs to the top
             </li>
             <li>
-              <kbd>V</kbd> opens build mode with four pieces — <b>Wall</b>, <b>Door Wall</b>, <b>Floor</b> and{' '}
-              <b>Ramp</b>. <kbd>T</kbd> or the mouse wheel cycles them, <kbd>Left click</kbd> places. Wall and Door
+              <kbd>V</kbd> opens build mode. The default <b>Auto</b> piece reads your aim: look <b>down on the ground</b> = <b>Ramp</b>, look <b>forward</b> = <b>Wall</b>, look <b>down while on a ramp / roof / container</b> (or mid-air) = <b>Platform</b>. <kbd>T</kbd> or the mouse wheel cycles manual pieces — <b>Wall</b>, <b>Door Wall</b>, <b>Floor</b>, <b>Ramp</b>; <kbd>Left click</kbd> places. Wall and Door
               stop gunfire and blasts until they shatter; Floors bridge water; Ramps run you onto roofs
             </li>
             <li>Bullets lose power with range: SMG past 20 m, SK past 60 m, sniper past 200 m</li>
@@ -10199,9 +10328,11 @@ export default function BattleRoyaleGame() {
             <li>Left stick to move. Push fully forward to run</li>
             <li>Slide the screen to look</li>
             <li>Hold AIM to aim and turn the view</li>
-            <li>Tap slider to jump. Slide left/right to roll, down to crouch/slide</li>
+            <li>Tap slider to jump. Slide left/right to roll, down to crouch — while running it slides</li>
             <li>Tap GRENADE to arm, tap AIM to throw. Hold GRENADE and slide up to pick kind</li>
-            <li>Tap WALL to arm build mode, then tap AIM to place. Double-tap WALL to cycle Wall, Door, Floor, Ramp</li>
+            <li>
+              Tap WALL to arm build mode, then tap AIM to place. Auto reads your aim — look down on the ground = ramp, look forward = wall, look down from a ramp / roof = platform. Double-tap WALL to cycle pieces manually
+            </li>
             <li>Wade into the sea: you slow down, then swim. Hold crouch to dive, tap jump to stroke up</li>
             <li>The top compass shows the nearest landmarks with distances — edge-pinned chips show which way to turn. Follow the port chips (PIER, YARD, DOCK, LIGHT) for the best loot</li>
             <li>Tap INVENTORY to purchase weapons, ammo and customize dummies</li>
