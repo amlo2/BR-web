@@ -2674,6 +2674,7 @@ export default function BattleRoyaleGame() {
       world.add(d.group);
       dummies.push(d);
       spots.push({ x, z });
+      return d;
     }
 
     function addCrate(x: number, z: number, w: number, h: number, depth: number, color: THREE.Color) {
@@ -3233,6 +3234,7 @@ export default function BattleRoyaleGame() {
     function showPause() {
       if (!overlay || !btn) return;
       overlay.hidden = false;
+      setMapOpen(false); // the tactical map never lingers behind the pause
       btn.textContent = touchDevice ? 'Tap to resume' : 'Click to resume';
       keys.clear();
       mouseHeld = aimMouse = false;
@@ -3270,6 +3272,10 @@ export default function BattleRoyaleGame() {
       if (e.code === 'Escape') {
         if (buildMode) toggleBuildWall(false);
         if (running()) showPause();
+        return;
+      }
+      if (e.code === 'KeyM' && !e.repeat && running() && character === 'antenna') {
+        setMapOpen(!mapOpen);
         return;
       }
       if (!running()) return;
@@ -3331,6 +3337,11 @@ export default function BattleRoyaleGame() {
     };
 
     const onMouseDown = (e: MouseEvent) => {
+      if (mapOpen) {
+        // The tactical map is glance-only: any click closes it
+        setMapOpen(false);
+        return;
+      }
       if (!running()) return;
       getAudio(); // Ensure audio context is running on user interaction
       if (buildMode) {
@@ -3390,7 +3401,7 @@ export default function BattleRoyaleGame() {
     };
 
     const onMouseMove = (e: MouseEvent) => {
-      if (!running()) return;
+      if (!running() || mapOpen) return;
       if (sliderTouch && sliderTouch.id === -1) {
         const dx = e.clientX - sliderTouch.x0;
         const dy = e.clientY - sliderTouch.y0;
@@ -4861,6 +4872,30 @@ export default function BattleRoyaleGame() {
       airCarry = null;
       slideReq = false;
       rollReq = 0;
+      // Harbor patrols: AI squads roam the island so recon (the
+      // Antenna's scan, the shooters' duel) has someone to track.
+      spawnHarborPatrols();
+    }
+
+    const HARBOR_PATROLS = 8;
+    function spawnHarborPatrols() {
+      let placed = 0;
+      for (let t = 0; placed < HARBOR_PATROLS && t < 600; t++) {
+        const a = Math.random() * Math.PI * 2;
+        const r = 55 + Math.random() * 130;
+        const x = HARBOR_SPAWN.x + Math.cos(a) * r;
+        const z = HARBOR_SPAWN.z + Math.sin(a) * r;
+        if (terrainHeight(x, z) < WATER_Y + 0.5) continue; // land only
+        if (!aiFree(x, z, null)) continue;
+        if (dummies.some((o) => Math.hypot(o.group.position.x - x, o.group.position.z - z) < 30)) continue;
+        const d = spawnDummy(x, z, true, true);
+        // The flat range world group is hidden in Harbor: patrols live
+        // on the scene and ride the streamed terrain mesh.
+        world.remove(d.group);
+        scene.add(d.group);
+        d.group.position.set(x, Math.max(groundAt(x, z), WATER_Y), z);
+        placed += 1;
+      }
     }
 
     // ----------------------------------------------------
@@ -5039,7 +5074,7 @@ export default function BattleRoyaleGame() {
       }
       if (lobbyCharTag) {
         const modeLabel = mode === 'harbor' ? 'HARBOR SHORE' : mode === 'quarry' ? 'QUARRY PITS' : 'FIRING RANGE';
-        const charLabel = char === 'barrage' ? 'BARRAGE' : 'BULWARK';
+        const charLabel = char === 'barrage' ? 'BARRAGE' : char === 'antenna' ? 'ANTENNA' : 'BULWARK';
         lobbyCharTag.textContent = `OPERATOR // ${charLabel} - FACING ${modeLabel}`;
       }
     }
@@ -5136,6 +5171,24 @@ export default function BattleRoyaleGame() {
               return { floor: +s.floor.toFixed(2), wet: s.wet, swimming: s.swimming, depth: +(WATER_Y - s.floor).toFixed(2), underFx };
             },
             harborInfo: () => harborAnchor,
+            antenna: () =>
+              antenna
+                ? {
+                    x: +antenna.group.position.x.toFixed(1),
+                    z: +antenna.group.position.z.toFixed(1),
+                    hp: Math.ceil(antenna.hp),
+                    maxHp: antenna.maxHp,
+                    left: +antenna.left.toFixed(1),
+                  }
+                : null,
+            charInfo: () => ({
+              character,
+              life: Math.ceil(life),
+              lifeMax: lifeMax(),
+              enemiesUp: dummies.filter((d) => d.state === 'up').length,
+              mapOpen,
+              minimapHidden: ($('minimap') as any)?.hidden ?? true,
+            }),
             biome: (bx: number, bz: number) => {
               biomeWeights(bx, bz, VW);
               return {
@@ -5246,6 +5299,33 @@ export default function BattleRoyaleGame() {
           const dest = Array.from(wallDests.values())[i];
           if (dest) damageWall(dest, amount);
         },
+        pickCharacter: (c: string) => {
+          character = c;
+          applyCharacter();
+          return character;
+        },
+        deployAntenna: () => {
+          summonAntenna();
+          return !!antenna;
+        },
+        antennaInfo: () =>
+          antenna
+            ? {
+                hp: +antenna.hp.toFixed(1),
+                maxHp: antenna.maxHp,
+                left: +antenna.left.toFixed(1),
+                x: +antenna.group.position.x.toFixed(1),
+                z: +antenna.group.position.z.toFixed(1),
+              }
+            : null,
+        hurtAntenna: (amount: number) => {
+          damageAntenna(amount);
+          return antenna ? Math.ceil(antenna.hp) : 0;
+        },
+        toggleMap: (open: boolean) => {
+          setMapOpen(open);
+          return mapOpen;
+        },
       };
     }
 
@@ -5303,6 +5383,7 @@ export default function BattleRoyaleGame() {
       };
       if (inRect($('fireModeAuto'), x, y, 6)) return 'fireModeAuto';
       if (inRect($('fireModeManual'), x, y, 6)) return 'fireModeManual';
+      if (inRect(minimapEl, x, y, 8)) return 'minimap';
       if (near(stickBase, 1.5)) return 'stick';
       if (near(aimBtn, 1.2)) return 'aim';
       if (near(turretEl, 1)) return 'turret';
@@ -5364,6 +5445,11 @@ export default function BattleRoyaleGame() {
 
     const onTouchStart = (e: TouchEvent) => {
       if (!running()) return;
+      if (mapOpen) {
+        e.preventDefault();
+        setMapOpen(false);
+        return;
+      }
       e.preventDefault();
       for (const t of Array.from(e.changedTouches)) {
         let role = roleAt(t.clientX, t.clientY);
@@ -5373,6 +5459,10 @@ export default function BattleRoyaleGame() {
         }
         if (role === 'fireModeManual') {
           setFireMode('manual');
+          continue;
+        }
+        if (role === 'minimap') {
+          setMapOpen(true);
           continue;
         }
         if (role === 'stick' && stickId !== null) role = 'look';
@@ -5490,6 +5580,8 @@ export default function BattleRoyaleGame() {
     const reserve = { heavy: 60, light: 0 } as Record<string, number>;
 
     const LIFE_MAX = 120;
+    // Antenna is a recon frame: 100 life instead of the usual 120
+    const lifeMax = () => (character === 'antenna' ? 100 : LIFE_MAX);
     const SHIELD_LEVELS = [152, 304, 456];
     const SHIELD_DELAY = 6;
     const SHIELD_REGEN = 0.25;
@@ -5914,8 +6006,11 @@ export default function BattleRoyaleGame() {
       const out: THREE.Object3D[] = [];
       for (const o of shootable) {
         const vox = (o as any).userData?.vox as VoxelBox | undefined;
-        const px = vox ? vox.x0 + (vox.nx * vox.sx) / 2 : o.position.x;
-        const pz = vox ? vox.z0 + (vox.nz * vox.sz) / 2 : o.position.z;
+        const ant = (o as any).userData?.antenna as any;
+        // Antenna meshes live in a group placed at world coords, so their
+        // local positions cannot seed the distance test — use the mast base.
+        const px = vox ? vox.x0 + (vox.nx * vox.sx) / 2 : ant ? ant.group.position.x : o.position.x;
+        const pz = vox ? vox.z0 + (vox.nz * vox.sz) / 2 : ant ? ant.group.position.z : o.position.z;
         const dx = px - ox;
         const dz = pz - oz;
         if (dx * dx + dz * dz < m2) out.push(o);
@@ -5965,19 +6060,25 @@ export default function BattleRoyaleGame() {
         const s = shotDamage(w, hit.distance);
         hitDummy(hit.object.userData.dummy, s.dmg, s.pen);
       } else if (sd === Infinity && hit?.object) {
-        const wall = hit.object.userData.wallDest || (hit.object.parent && hit.object.parent.userData.wallDest);
-        if (wall) {
-          // Bullets chew player-built walls (structure damage, same kind as BR-web)
+        if (hit.object.userData.antenna) {
+          // Own fire can smash the scanner — it is a soft 300 HP target
           const s = shotDamage(w, hit.distance);
-          damageWall(wall, calculateStructureDamage(w.kind || 'sk', s.dmg), hit.point);
-        } else if (hit.object.userData.vox) {
-          // Bullets chew chunks out of walls and crates
-          const s = shotDamage(w, hit.distance);
-          chipVoxelAtPoint(
-            hit.object.userData.vox as VoxelBox,
-            hit.point,
-            calculateStructureDamage(w.kind || 'sk', s.dmg)
-          );
+          damageAntenna(s.dmg, hit.point);
+        } else {
+          const wall = hit.object.userData.wallDest || (hit.object.parent && hit.object.parent.userData.wallDest);
+          if (wall) {
+            // Bullets chew player-built walls (structure damage, same kind as BR-web)
+            const s = shotDamage(w, hit.distance);
+            damageWall(wall, calculateStructureDamage(w.kind || 'sk', s.dmg), hit.point);
+          } else if (hit.object.userData.vox) {
+            // Bullets chew chunks out of walls and crates
+            const s = shotDamage(w, hit.distance);
+            chipVoxelAtPoint(
+              hit.object.userData.vox as VoxelBox,
+              hit.point,
+              calculateStructureDamage(w.kind || 'sk', s.dmg)
+            );
+          }
         }
       }
       kick = w.recoil;
@@ -6932,7 +7033,7 @@ export default function BattleRoyaleGame() {
 
     function respawn() {
       playerDown = false;
-      life = LIFE_MAX;
+      life = lifeMax();
       shield = shieldMax();
       sinceHurt = 99;
       eyeH = EYE;
@@ -6967,11 +7068,11 @@ export default function BattleRoyaleGame() {
       if (key !== vitalsShown) {
         vitalsShown = key;
         if (shieldNumEl) shieldNumEl.textContent = Math.ceil(shield) + ' / ' + cap;
-        if (lifeNumEl) lifeNumEl.textContent = Math.ceil(life) + ' / ' + LIFE_MAX;
+        if (lifeNumEl) lifeNumEl.textContent = Math.ceil(life) + ' / ' + lifeMax();
         pipEls.forEach((p, i) => p.classList.toggle('on', i < shieldLevel));
       }
       if (shieldFill) shieldFill.style.transform = 'scaleX(' + sf.toFixed(4) + ')';
-      if (lifeFill) lifeFill.style.transform = 'scaleX(' + Math.max(0, life / LIFE_MAX).toFixed(4) + ')';
+      if (lifeFill) lifeFill.style.transform = 'scaleX(' + Math.max(0, life / lifeMax()).toFixed(4) + ')';
       shieldRow?.classList.toggle('regen', regenerating);
       if (shieldFx) {
         shieldFx.style.setProperty('--sh', sf.toFixed(3));
@@ -7048,12 +7149,18 @@ export default function BattleRoyaleGame() {
 
     const TURRET_UPGRADES: Record<number, any> = {
       2: { text: 'your shield up to 304', shieldLevel: 2 },
-      3: { text: 'turret damage +50%', damageMult: 1.5, bomb: { dmgMult: 1.5, text: 'bombardment damage +50%' } },
+      3: {
+        text: 'turret damage +50%',
+        damageMult: 1.5,
+        bomb: { dmgMult: 1.5, text: 'bombardment damage +50%' },
+        ant: { hpMult: 1.5, text: 'antenna durability +50%' },
+      },
       4: { text: 'your shield up to 456', shieldLevel: 3 },
       5: {
         text: 'turret fire rate +50%',
         delay: 0.4,
         bomb: { radiusMult: 1.25, shellsMult: 1.5, text: 'bombardment radius +25%, 50% more shells' },
+        ant: { durMult: 1.5, text: 'antenna uptime +50% (90 s scan)' },
       },
     };
     const TURRET = { range: 30, mag: 40, spinUp: 0.3, reach: 2.5, carryDist: [1.2, 0.8, 0.4] };
@@ -7099,7 +7206,22 @@ export default function BattleRoyaleGame() {
         }
         if (up.bomb.shellsMult) BOMB.shells = Math.round(BOMB.shells * up.bomb.shellsMult);
       }
-      const msg = character === 'barrage' && up.bomb ? up.bomb.text : up.text;
+      if (up.ant && character === 'antenna') {
+        if (up.ant.hpMult) {
+          antHpMult *= up.ant.hpMult;
+          if (antenna) {
+            const add = Math.round(antenna.maxHp * (up.ant.hpMult - 1));
+            antenna.maxHp += add;
+            antenna.hp += add;
+          }
+        }
+        if (up.ant.durMult) {
+          antDurMult *= up.ant.durMult;
+          if (antenna) antenna.left += ANT.duration * (up.ant.durMult - 1);
+        }
+      }
+      const msg =
+        character === 'barrage' && up.bomb ? up.bomb.text : character === 'antenna' && up.ant ? up.ant.text : up.text;
       showMessage('Level ' + l + ': ' + msg, 2.5);
     }
 
@@ -7252,6 +7374,7 @@ export default function BattleRoyaleGame() {
 
     function updateTurretHud() {
       if (character === 'barrage') return updateBombHud();
+      if (character === 'antenna') return updateAntennaHud();
       const state = !turret
         ? 'Ready'
         : turret.carried
@@ -7267,6 +7390,147 @@ export default function BattleRoyaleGame() {
       if (turretLvEl) turretLvEl.textContent = 'Lv ' + turretLevel;
       if (turretStateEl) turretStateEl.textContent = state;
       turretEl?.classList.toggle('ready', !turret);
+    }
+
+    // ----------------------------------------------------
+    // Antenna Ability (Antenna character): plant a scanner
+    // mast that runs for 60 s and reveals every enemy on
+    // the minimap and the tactical map. 300 HP — bullets,
+    // blasts and shooters can knock it offline early.
+    // ----------------------------------------------------
+    const ANT = { hp: 300, duration: 60 };
+    const ANT_SHOT_DMG = 18; // per enemy hit on the mast
+    let antHpMult = 1;
+    let antDurMult = 1;
+    let antenna: any = null;
+    let antKey = '';
+
+    function buildAntennaMesh() {
+      const g = new THREE.Group();
+      part(g, new THREE.CylinderGeometry(0.36, 0.44, 0.16, 14), metal, 0, 0.08, 0);
+      part(g, new THREE.TorusGeometry(0.4, 0.03, 8, 24), cyanCore, 0, 0.19, 0, Math.PI / 2);
+      for (let i = 0; i < 3; i++) {
+        const a = (i / 3) * Math.PI * 2 + 0.5;
+        const leg = new THREE.Mesh(new THREE.CylinderGeometry(0.03, 0.03, 1.35, 6), metal);
+        leg.position.set(Math.cos(a) * 0.33, 0.72, Math.sin(a) * 0.33);
+        leg.rotation.z = -Math.cos(a) * 0.42;
+        leg.rotation.x = Math.sin(a) * 0.42;
+        leg.castShadow = true;
+        g.add(leg);
+      }
+      part(g, new THREE.CylinderGeometry(0.045, 0.06, 1.5, 10), steel, 0, 1.62, 0);
+      part(g, new THREE.BoxGeometry(0.86, 0.05, 0.05), dark, 0, 2.02, 0);
+      part(g, new THREE.BoxGeometry(0.05, 0.05, 0.86), dark, 0, 2.02, 0);
+      part(g, new THREE.BoxGeometry(0.6, 0.045, 0.045), dark, 0, 2.28, 0);
+      part(g, new THREE.BoxGeometry(0.045, 0.045, 0.6), dark, 0, 2.28, 0);
+      part(g, new THREE.SphereGeometry(0.07, 12, 10), cyanCore, 0, 2.52, 0);
+      const beacon = new THREE.Mesh(
+        new THREE.SphereGeometry(0.085, 12, 10),
+        new THREE.MeshBasicMaterial({ color: 0x67e8f9, transparent: true, opacity: 0.95, depthWrite: false })
+      );
+      beacon.position.set(0, 2.52, 0);
+      g.add(beacon);
+      const halo = new THREE.Mesh(
+        new THREE.SphereGeometry(0.24, 14, 10),
+        new THREE.MeshBasicMaterial({
+          color: 0x67e8f9,
+          transparent: true,
+          opacity: 0.35,
+          blending: THREE.AdditiveBlending,
+          depthWrite: false,
+        })
+      );
+      halo.position.set(0, 2.52, 0);
+      g.add(halo);
+      return { group: g, beacon, halo };
+    }
+
+    function removeAntenna(silent = false) {
+      if (!antenna) return;
+      for (let i = shootable.length - 1; i >= 0; i--) {
+        if ((shootable[i] as any).userData?.antenna === antenna) shootable.splice(i, 1);
+      }
+      scene.remove(antenna.group);
+      disposeBar(antenna.bar);
+      antenna = null;
+      antKey = '';
+      if (!silent) updateAntennaHud();
+    }
+
+    function summonAntenna(redeploy = false) {
+      const spot = clearSpotAhead([2.6, 1.7, 1.0]);
+      if (!spot) {
+        showMessage('No room for the antenna here', 1.5);
+        return;
+      }
+      removeAntenna(true);
+      const { group, beacon, halo } = buildAntennaMesh();
+      const gy = groundAt(spot.x, spot.z);
+      group.position.set(spot.x, gy, spot.z);
+      scene.add(group);
+      const { group: bar, fill } = makeHealthBar();
+      bar.position.set(spot.x, gy + 3.15, spot.z);
+      scene.add(bar);
+      const maxHp = Math.round(ANT.hp * antHpMult);
+      antenna = { group, beacon, halo, bar, barFill: fill, hp: maxHp, maxHp, t: 0, left: ANT.duration * antDurMult };
+      group.traverse((o) => {
+        if (o instanceof THREE.Mesh) {
+          o.userData.antenna = antenna;
+          shootable.push(o);
+        }
+      });
+      showMessage(
+        redeploy ? 'Antenna redeployed — scanning' : 'Antenna online — every enemy revealed for ' + Math.round(ANT.duration * antDurMult) + ' s',
+        1.8
+      );
+      updateAntennaHud();
+    }
+
+    function antennaAction() {
+      if (playerDown) return;
+      summonAntenna(!!antenna);
+    }
+
+    function damageAntenna(amount: number, point?: THREE.Vector3) {
+      if (!antenna || amount <= 0) return;
+      antenna.hp -= amount;
+      const at = point ?? antenna.group.position.clone().setY(antenna.group.position.y + 2.2);
+      const shown = Math.round(amount);
+      if (shown > 0) showDamagePopup(String(shown), at, '#67e8f9', false);
+      if (antenna.hp <= 0) {
+        showDamagePopup('ANTENNA DOWN', at.clone().setY(at.y + 0.6), '#ef4444', true);
+        playSfx('shatter');
+        removeAntenna();
+        showMessage('Antenna destroyed — enemy scan lost', 2.2);
+      }
+    }
+
+    function updateAntenna(dt: number) {
+      if (!antenna) return;
+      antenna.t += dt;
+      antenna.left -= dt;
+      antenna.group.scale.setScalar(0.3 + 0.7 * Math.min(1, antenna.t / 0.25));
+      const pulse = 0.5 + 0.5 * Math.sin(antenna.t * 8);
+      antenna.beacon.scale.setScalar(0.8 + 0.5 * pulse);
+      (antenna.halo.material as THREE.MeshBasicMaterial).opacity = 0.2 + 0.5 * pulse;
+      antenna.bar.lookAt(camera.position);
+      setBarFill(antenna.barFill, Math.max(0, antenna.hp / antenna.maxHp));
+      updateAntennaHud();
+      if (antenna.left <= 0) {
+        removeAntenna();
+        showMessage('Antenna power spent — press E to redeploy', 2);
+      }
+    }
+
+    function updateAntennaHud() {
+      const state = !antenna
+        ? 'Ready · ' + Math.round(ANT.duration * antDurMult) + ' s scan'
+        : 'Scan ' + Math.ceil(antenna.left) + ' s · ' + Math.max(0, Math.ceil(antenna.hp)) + ' HP';
+      if (state === antKey) return;
+      antKey = state;
+      if (turretLvEl) turretLvEl.textContent = 'Lv ' + turretLevel;
+      if (turretStateEl) turretStateEl.textContent = state;
+      turretEl?.classList.toggle('ready', !antenna);
     }
 
     // ----------------------------------------------------
@@ -7573,6 +7837,16 @@ export default function BattleRoyaleGame() {
       }
       // Blocking walls soak the blast for whoever hid behind them
       for (const [box, amount] of wallHits) damageStructureSolid(box, amount, blastOrigin);
+      // The scanner is a soft target: blasts knock the antenna offline fast
+      if (antenna) {
+        const aDist = Math.hypot(antenna.group.position.x - x, antenna.group.position.z - z);
+        if (aDist < radius) {
+          damageAntenna(
+            dmg * share(aDist),
+            antenna.group.position.clone().setY(antenna.group.position.y + 1.6)
+          );
+        }
+      }
       if (playerCoverBox) {
         damageStructureSolid(playerCoverBox, playerCoverDmg, blastOrigin);
         playSfx('cover_block');
@@ -8033,6 +8307,10 @@ export default function BattleRoyaleGame() {
     let bombArmed = false;
 
     function primaryAction() {
+      if (character === 'antenna') {
+        antennaAction();
+        return;
+      }
       if (character !== 'barrage') {
         turretAction();
         return;
@@ -8085,11 +8363,22 @@ export default function BattleRoyaleGame() {
     }
 
     function applyCharacter() {
-      if (primaryNameEl) primaryNameEl.textContent = character === 'barrage' ? 'Bombard' : 'Turret';
+      if (primaryNameEl)
+        primaryNameEl.textContent = character === 'barrage' ? 'Bombard' : character === 'antenna' ? 'Antenna' : 'Turret';
       bombArmed = false;
       disarmGrenade();
       turretEl?.classList.remove('armed');
       turretKey = '';
+      antKey = '';
+      if (character !== 'antenna') {
+        removeAntenna(true);
+        setMapOpen(false);
+      }
+      // Swapping characters in the menu refits vitals (Antenna: 100 life)
+      life = lifeMax();
+      shield = shieldMax();
+      sinceHurt = 99;
+      vitalsShown = '';
       refreshGrenades();
     }
 
@@ -8218,11 +8507,16 @@ export default function BattleRoyaleGame() {
     }
 
     // ----------------------------------------------------
-    // Turret Tracker
+    // Turret & Antenna screen-space trackers: a diamond mark
+    // floats over the deployable, or pins to the nearest screen
+    // edge with an arrow when it is out of view.
     // ----------------------------------------------------
     const trackerEl = $('tracker');
     const trackerDirEl = $('trackerDir');
     const trackerTagEl = $('trackerTag');
+    const antTrackerEl = $('antTracker');
+    const antTrackerDirEl = $('antTrackerDir');
+    const antTrackerTagEl = $('antTrackerTag');
     const TRACK_INSET = 64;
     const trackTop = new THREE.Vector3();
     const trackV = new THREE.Vector3();
@@ -8230,14 +8524,17 @@ export default function BattleRoyaleGame() {
     const trackRight = new THREE.Vector3();
     const trackUp = new THREE.Vector3();
 
-    function updateTracker() {
-      if (!turret || turret.carried || !trackerEl) {
-        if (trackerEl) trackerEl.hidden = true;
-        return;
-      }
-      trackerEl.hidden = false;
-      const p = turret.group.position;
-      trackTop.set(p.x, p.y + 1.2, p.z);
+    function trackMark(
+      el: HTMLElement | null,
+      dirEl: HTMLElement | null,
+      tagEl: HTMLElement | null,
+      p: THREE.Vector3,
+      topOffset: number,
+      text: (dist: number) => string
+    ) {
+      if (!el) return;
+      el.hidden = false;
+      trackTop.set(p.x, p.y + topOffset, p.z);
       const dist = trackTop.distanceTo(camera.position);
       trackFwd.set(0, 0, -1).applyQuaternion(camera.quaternion);
       trackRight.set(1, 0, 0).applyQuaternion(camera.quaternion);
@@ -8268,7 +8565,7 @@ export default function BattleRoyaleGame() {
       }
 
       if (onScreen) {
-        trackerEl.dataset.state = 'on';
+        el.dataset.state = 'on';
       } else {
         const L = Math.hypot(dx, dy) || 1;
         dx /= L;
@@ -8278,19 +8575,284 @@ export default function BattleRoyaleGame() {
         const t = Math.min(tx, ty);
         sx = W / 2 + dx * t;
         sy = H / 2 + dy * t;
-        trackerEl.dataset.state = 'edge';
-        if (trackerDirEl) trackerDirEl.style.transform = `rotate(${(Math.atan2(dy, dx) * 180) / Math.PI + 90}deg)`;
+        el.dataset.state = 'edge';
+        if (dirEl) dirEl.style.transform = `rotate(${(Math.atan2(dy, dx) * 180) / Math.PI + 90}deg)`;
       }
-      trackerEl.style.transform = `translate(${sx.toFixed(1)}px, ${sy.toFixed(1)}px)`;
-      const text = 'Turret ' + Math.round(dist) + ' m';
-      if (trackerTagEl && trackerTagEl.textContent !== text) trackerTagEl.textContent = text;
+      el.style.transform = `translate(${sx.toFixed(1)}px, ${sy.toFixed(1)}px)`;
+      const txt = text(Math.round(dist));
+      if (tagEl && tagEl.textContent !== txt) tagEl.textContent = txt;
     }
+
+    function updateTracker() {
+      if (!turret || turret.carried) {
+        if (trackerEl) trackerEl.hidden = true;
+        return;
+      }
+      trackMark(trackerEl, trackerDirEl, trackerTagEl, turret.group.position, 1.2, (d) => 'Turret ' + d + ' m');
+    }
+
+    function updateAntTracker() {
+      if (!antenna) {
+        if (antTrackerEl) antTrackerEl.hidden = true;
+        return;
+      }
+      trackMark(antTrackerEl, antTrackerDirEl, antTrackerTagEl, antenna.group.position, 1.6, (d) =>
+        'Antenna ' + d + ' m · ' + Math.max(0, Math.ceil(antenna.hp)) + ' HP'
+      );
+    }
+
+    // ----------------------------------------------------
+    // Antenna passive: round minimap + simplified tactical
+    // map. Terrain is sampled once per map into an offscreen
+    // canvas; the minimap crops a moving window around the
+    // player, the overlay shows the whole island with
+    // landmark labels. Enemy blips appear on both only
+    // while the scanner mast is live.
+    // ----------------------------------------------------
+    const minimapEl = $('minimap');
+    const minimapCvs = $('minimapCanvas') as HTMLCanvasElement | null;
+    const minimapCtx = minimapCvs ? minimapCvs.getContext('2d') : null;
+    const mapOverlayEl = $('mapOverlay');
+    const mapCvs = $('mapCanvas') as HTMLCanvasElement | null;
+    const mapCtx = mapCvs ? mapCvs.getContext('2d') : null;
+    const mapStatusEl = $('mapStatus');
+    const mapCloseEl = $('mapClose');
+    let mapOpen = false;
+    const MINIMAP_R = 130; // metres of half-view around the player
+    const MAP_MARK_COLORS: Record<string, string> = {
+      'c-pier': '#67e8f9',
+      'c-yard': '#fbbf24',
+      'c-crane': '#f97316',
+      'c-whse': '#a3e635',
+      'c-dock': '#38bdf8',
+      'c-light': '#fde047',
+      'c-vill': '#f472b6',
+      'c-farm': '#84cc16',
+      'c-fuel': '#ef4444',
+      'c-site': '#fb923c',
+      'c-camp': '#22d3ee',
+      'c-mast': '#e879f9',
+      'c-ruin': '#a8a29e',
+      'c-outp': '#facc15',
+      'c-tow': '#60a5fa',
+    };
+    const mapMarkColor = (cls: string) => MAP_MARK_COLORS[cls] || '#cbd5e1';
+    const mapTerrain = typeof document !== 'undefined' ? document.createElement('canvas') : null;
+    let mapTerrainKey = '';
+
+    function ensureTerrainCanvas() {
+      if (!mapTerrain) return;
+      const key = (terrainOn ? 'H' : 'R') + '|' + terrainSeed;
+      if (key === mapTerrainKey) return;
+      mapTerrainKey = key;
+      const N = 144;
+      const half = mapHalf + 60;
+      const S = 720;
+      mapTerrain.width = S;
+      mapTerrain.height = S;
+      const c = mapTerrain.getContext('2d');
+      if (!c) return;
+      const cell = S / N;
+      for (let i = 0; i < N; i++) {
+        for (let j = 0; j < N; j++) {
+          const x = -half + ((i + 0.5) / N) * 2 * half;
+          const z = -half + ((j + 0.5) / N) * 2 * half;
+          const h = terrainOn ? terrainHeight(x, z) : groundAt(x, z);
+          let col = '#618e54';
+          if (h < WATER_Y) {
+            const d = THREE.MathUtils.clamp((WATER_Y - h) / 6, 0, 1);
+            col = 'rgb(' + Math.round(30 - 10 * d) + ',' + Math.round(84 - 30 * d) + ',' + Math.round(126 - 38 * d) + ')';
+          } else if (h < BEACH_Y + 0.15) col = '#d3c493';
+          else if (h < 14) col = '#618e54';
+          else if (h < 32) col = '#7c9350';
+          else if (h < 58) col = '#8b8471';
+          else col = '#e8edf1';
+          c.fillStyle = col;
+          c.fillRect(i * cell, j * cell, cell + 1, cell + 1);
+        }
+      }
+    }
+
+    function drawBlip(ctx: CanvasRenderingContext2D, x: number, y: number, r: number, fill: string) {
+      ctx.beginPath();
+      ctx.arc(x, y, r, 0, Math.PI * 2);
+      ctx.fillStyle = fill;
+      ctx.fill();
+      ctx.lineWidth = Math.max(1.2, r * 0.3);
+      ctx.strokeStyle = 'rgba(8, 12, 18, 0.85)';
+      ctx.stroke();
+    }
+
+    function drawDiamond(ctx: CanvasRenderingContext2D, x: number, y: number, s: number) {
+      ctx.save();
+      ctx.translate(x, y);
+      ctx.rotate(Math.PI / 4);
+      ctx.fillStyle = '#67e8f9';
+      ctx.fillRect(-s, -s, s * 2, s * 2);
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = 'rgba(8, 12, 18, 0.85)';
+      ctx.strokeRect(-s, -s, s * 2, s * 2);
+      ctx.restore();
+    }
+
+    function drawPlayerArrow(ctx: CanvasRenderingContext2D, x: number, y: number, s: number) {
+      ctx.save();
+      ctx.translate(x, y);
+      ctx.rotate(-yaw); // yaw 0 faces north (up); bearing = -yaw
+      ctx.beginPath();
+      ctx.moveTo(0, -s);
+      ctx.lineTo(s * 0.62, s * 0.92);
+      ctx.lineTo(0, s * 0.48);
+      ctx.lineTo(-s * 0.62, s * 0.92);
+      ctx.closePath();
+      ctx.fillStyle = '#ffffff';
+      ctx.fill();
+      ctx.lineWidth = 2.5;
+      ctx.strokeStyle = '#0b0f15';
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    function updateMinimapVisibility() {
+      if (!minimapEl) return;
+      const show = character === 'antenna' && running();
+      if (minimapEl.hidden === show) minimapEl.hidden = !show;
+    }
+
+    function renderMinimap() {
+      updateMinimapVisibility();
+      if (!minimapEl || minimapEl.hidden || !minimapCtx || !minimapCvs || !mapTerrain) return;
+      ensureTerrainCanvas();
+      const ctx = minimapCtx;
+      const S = minimapCvs.width;
+      const R = S / 2;
+      const p = camera.position;
+      ctx.clearRect(0, 0, S, S);
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(R, R, R - 3, 0, Math.PI * 2);
+      ctx.clip();
+      const half = mapHalf + 60;
+      const worldPerPx = (2 * half) / mapTerrain.width;
+      const crop = (MINIMAP_R * 2) / worldPerPx;
+      const cx = (p.x + half) / worldPerPx;
+      const cy = (p.z + half) / worldPerPx;
+      ctx.drawImage(mapTerrain, cx - crop / 2, cy - crop / 2, crop, crop, 3, 3, S - 6, S - 6);
+      const toX = (wx: number) => R + ((wx - p.x) / MINIMAP_R) * (R - 6);
+      const toY = (wz: number) => R + ((wz - p.z) / MINIMAP_R) * (R - 6);
+      for (const m of harborMarks) {
+        if (Math.abs(m.x - p.x) > MINIMAP_R || Math.abs(m.z - p.z) > MINIMAP_R) continue;
+        drawBlip(ctx, toX(m.x), toY(m.z), 4, mapMarkColor(m.cls));
+      }
+      if (antenna) {
+        for (const d of dummies) {
+          if (d.state !== 'up') continue;
+          drawBlip(ctx, toX(d.group.position.x), toY(d.group.position.z), 6.5, '#ff5c6b');
+        }
+        drawDiamond(ctx, toX(antenna.group.position.x), toY(antenna.group.position.z), 5.5);
+      }
+      drawPlayerArrow(ctx, R, R, 12);
+      ctx.restore();
+      if (antenna) {
+        // radar sweep while the scan is live
+        const t = (antenna.t * 0.8) % 1;
+        ctx.beginPath();
+        ctx.arc(R, R, (R - 3) * t, 0, Math.PI * 2);
+        ctx.strokeStyle = 'rgba(103, 232, 249, ' + (0.5 * (1 - t)).toFixed(3) + ')';
+        ctx.lineWidth = 3;
+        ctx.stroke();
+      }
+    }
+
+    function renderBigMap() {
+      if (!mapCtx || !mapCvs || !mapTerrain) return;
+      ensureTerrainCanvas();
+      const ctx = mapCtx;
+      const S = mapCvs.width;
+      const half = mapHalf + 60;
+      ctx.clearRect(0, 0, S, S);
+      ctx.drawImage(mapTerrain, 0, 0, mapTerrain.width, mapTerrain.height, 0, 0, S, S);
+      const toX = (wx: number) => ((wx + half) / (2 * half)) * S;
+      const toY = (wz: number) => ((wz + half) / (2 * half)) * S;
+      // survey grid
+      ctx.strokeStyle = 'rgba(245, 247, 250, 0.08)';
+      ctx.lineWidth = 1;
+      for (let g = -500; g <= half; g += 500) {
+        if (g < -half) continue;
+        ctx.beginPath();
+        ctx.moveTo(toX(g), 0);
+        ctx.lineTo(toX(g), S);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(0, toY(g));
+        ctx.lineTo(S, toY(g));
+        ctx.stroke();
+      }
+      ctx.font = '600 13px Barlow, Arial, sans-serif';
+      ctx.textBaseline = 'middle';
+      ctx.shadowColor = 'rgba(0, 0, 0, 0.9)';
+      ctx.shadowBlur = 4;
+      let flip = 0;
+      for (const m of harborMarks) {
+        const x = toX(m.x);
+        const y = toY(m.z);
+        drawBlip(ctx, x, y, 4.5, mapMarkColor(m.cls));
+        ctx.fillStyle = 'rgba(245, 247, 250, 0.95)';
+        ctx.fillText(m.label, x + 8, y + (flip++ % 2 ? -11 : 12));
+      }
+      if (antenna) {
+        for (const d of dummies) {
+          if (d.state !== 'up') continue;
+          drawBlip(ctx, toX(d.group.position.x), toY(d.group.position.z), 6.5, '#ff5c6b');
+        }
+        const ax = toX(antenna.group.position.x);
+        const ay = toY(antenna.group.position.z);
+        drawDiamond(ctx, ax, ay, 7);
+        ctx.fillStyle = '#67e8f9';
+        ctx.fillText('ANT', ax + 12, ay);
+      }
+      ctx.shadowBlur = 0;
+      drawPlayerArrow(ctx, toX(camera.position.x), toY(camera.position.z), 14);
+    }
+
+    function setMapOpen(open: boolean) {
+      if (mapOpen === open) return;
+      mapOpen = open;
+      if (mapOverlayEl) mapOverlayEl.hidden = !open;
+    }
+
+    function updateMapHud() {
+      if (!mapStatusEl) return;
+      const txt = antenna
+        ? 'Scan ' + Math.ceil(antenna.left) + ' s · ' + Math.max(0, Math.ceil(antenna.hp)) + ' HP'
+        : 'Scan offline · deploy with E';
+      if (mapStatusEl.textContent !== txt) mapStatusEl.textContent = txt;
+      mapStatusEl.classList.toggle('on', !!antenna);
+    }
+
+    function renderAntennaHud() {
+      renderMinimap();
+      if (mapOpen) {
+        renderBigMap();
+        updateMapHud();
+      }
+    }
+
+    minimapEl?.addEventListener('click', () => {
+      if (character === 'antenna' && running() && !mapOpen) setMapOpen(true);
+    });
+    mapCloseEl?.addEventListener('click', () => setMapOpen(false));
+    mapOverlayEl?.addEventListener('click', (e) => {
+      if (e.target === mapOverlayEl) setMapOpen(false);
+    });
 
     // ----------------------------------------------------
     // Dummy Update & Basic AI
     // ----------------------------------------------------
     function updateDummy(d: DummyObject, dt: number) {
       poseFigure(d, dt);
+      // Harbor patrols ride the streamed terrain mesh (range floor is flat)
+      if (terrainOn) d.group.position.y = Math.max(groundAt(d.group.position.x, d.group.position.z), WATER_Y - 0.05);
       d.flash = Math.max(0, d.flash - dt);
       const glow = d.flash > 0 ? 0.8 : 0;
       for (const p of d.parts) (p.material as any).emissive?.setRGB(glow, 0, 0);
@@ -8341,6 +8903,33 @@ export default function BattleRoyaleGame() {
       if (!d.ai) d.group.rotation.y = Math.atan2(px, pz);
       d.fireT = Math.max(0, d.fireT - dt);
       const dist = Math.hypot(px, pz);
+
+      // Deployed scanners are priority targets: a shooter closer to the
+      // antenna than to the player opens fire on the mast instead
+      if (antenna && d.fireT <= 0) {
+        const ap = antenna.group.position;
+        const aDist = Math.hypot(ap.x - d.group.position.x, ap.z - d.group.position.z);
+        if (aDist < dist && aDist <= ENEMY_RANGE) {
+          if (d.muzzle) d.muzzle.getWorldPosition(shotFrom);
+          else shotFrom.copy(d.group.position).add(FIG.gun);
+          shotTo.set(ap.x, ap.y + 1.5, ap.z);
+          shotDir.subVectors(shotTo, shotFrom);
+          const aLen = shotDir.length();
+          lineRay.set(shotFrom, shotDir.normalize());
+          lineRay.far = Math.max(0.5, aLen - 0.5); // stop short of the mast itself
+          const aBlocked =
+            lineRay.intersectObjects(shootable, false).some((h) => !h.object.userData.antenna) ||
+            smokeDist(shotFrom, shotDir, aLen) < Infinity;
+          lineRay.far = Infinity;
+          if (!aBlocked) {
+            d.fireT = (d.ai ? AI.delay : ENEMY_DELAY) + Math.random() * 0.3;
+            d.shots += 1;
+            tracer(shotFrom.clone(), shotTo, 0xff5c6b);
+            damageAntenna(ANT_SHOT_DMG, shotTo);
+            return;
+          }
+        }
+      }
 
       if (d.muzzle) {
         d.muzzle.getWorldPosition(shotFrom);
@@ -8455,6 +9044,8 @@ export default function BattleRoyaleGame() {
     function aiFree(x: number, z: number, self: DummyObject | null) {
       if (Math.abs(x) > mapHalf - 4 || Math.abs(z) > mapHalf - 4) return false;
       if (nearPool(x, z, 2)) return false;
+      // Harbor patrols stay ashore: wading into the sea is off-limits
+      if (terrainOn && terrainHeight(x, z) < WATER_Y + 0.25) return false;
       for (const b of solids) {
         if ((b.bottom ?? 0) > 1.9) continue;
         if (Math.abs(x - b.x) < b.hx + 0.6 && Math.abs(z - b.z) < b.hz + 0.6) return false;
@@ -8781,6 +9372,7 @@ export default function BattleRoyaleGame() {
         updateShooter(d, dt);
       }
       updateTurret(dt);
+      updateAntenna(dt);
       updateGrenades(dt);
       updateVitals();
     }
@@ -8795,7 +9387,8 @@ export default function BattleRoyaleGame() {
 
     function frame() {
       const dt = Math.min(clock.getDelta(), 0.05);
-      if (running()) {
+      // The tactical map pauses the world but never the HUD renders
+      if (running() && !mapOpen) {
         try {
           update(dt);
         } catch (err) {
@@ -8810,6 +9403,8 @@ export default function BattleRoyaleGame() {
       applyView();
       updateCompass();
       updateTracker();
+      updateAntTracker();
+      renderAntennaHud();
       followSun();
 
       camera.layers.set(0);
@@ -8862,6 +9457,13 @@ export default function BattleRoyaleGame() {
             N 0&deg;
           </span>
         </div>
+      </div>
+
+      {/* Antenna minimap (passive — tap it or M for the tactical map) */}
+      <div className="hud minimap" id="minimap" hidden aria-label="Minimap — open the tactical map">
+        <canvas id="minimapCanvas" width={352} height={352} />
+        <span className="minimap-n">N</span>
+        <kbd className="minimap-key">M</kbd>
       </div>
 
       {/* Top HUD: Downs and credits */}
@@ -8932,8 +9534,8 @@ export default function BattleRoyaleGame() {
       {/* Control Hints (desktop) */}
       <div className="hud hint">
         WASD move &middot; Shift sprint &middot; Space jump &middot; C crouch/slide &middot; Z/X roll &middot; R reload
-        &middot; 1/2/Q weapon slots &middot; E turret/bombard &middot; G grenade (hold to pick) &middot; Right click aim/call
-        &middot; B inventory &middot; Esc pause
+        &middot; 1/2/Q weapon slots &middot; E turret/bombard/antenna &middot; G grenade (hold to pick) &middot; Right click
+        aim/call &middot; M map (Antenna) &middot; B inventory &middot; Esc pause
       </div>
 
       {/* Crosshair & Hitmarker */}
@@ -9070,6 +9672,15 @@ export default function BattleRoyaleGame() {
         </div>
         <span className="tracker-mark" />
         <span className="tracker-tag" id="trackerTag" />
+      </div>
+
+      {/* Antenna Tracker */}
+      <div className="tracker ant" id="antTracker" hidden>
+        <div className="tracker-dir" id="antTrackerDir">
+          <span className="tracker-arrow" />
+        </div>
+        <span className="tracker-mark" />
+        <span className="tracker-tag" id="antTrackerTag" />
       </div>
 
       {/* Main Menu Lobby */}
@@ -9357,6 +9968,73 @@ export default function BattleRoyaleGame() {
                 {/* Amber Visor Forward Projection */}
                 <ellipse cx="100" cy="40" rx="18" ry="6" fill="#f59e0b" opacity="0.4" className="pulse-amber" />
               </g>
+
+              {/* ================= ANTENNA (Rear View Facing Ahead) ================= */}
+              <g className="char-back-view char-back-antenna">
+                {/* Recon Boots */}
+                <path d="M 62 270 L 82 270 L 86 312 L 56 312 Z" fill="#0f172a" stroke="#334155" strokeWidth="2" />
+                <path d="M 118 270 L 138 270 L 144 312 L 114 312 Z" fill="#0f172a" stroke="#334155" strokeWidth="2" />
+                {/* Slim Recon Legs */}
+                <path d="M 70 200 L 90 200 L 87 272 L 67 272 Z" fill="#1e293b" stroke="#334155" strokeWidth="2" />
+                <path d="M 110 200 L 130 200 L 133 272 L 113 272 Z" fill="#1e293b" stroke="#334155" strokeWidth="2" />
+                {/* Thigh Scanner Holster */}
+                <rect x="130" y="212" width="12" height="20" rx="3" fill="#0f172a" stroke="#67e8f9" strokeWidth="1.5" />
+
+                {/* Recon Belt with Data Cells */}
+                <rect x="62" y="185" width="76" height="16" rx="4" fill="#0f172a" stroke="#475569" strokeWidth="2" />
+                <rect x="72" y="188" width="16" height="10" rx="2" fill="#155e75" />
+                <rect x="112" y="188" width="16" height="10" rx="2" fill="#155e75" />
+
+                {/* Recon Carrier Vest */}
+                <path d="M 56 90 L 144 90 L 134 186 L 66 186 Z" fill="#1e293b" stroke="#334155" strokeWidth="2.5" />
+                {/* Signal Pouches */}
+                <rect x="66" y="128" width="14" height="16" rx="3" fill="#0f172a" stroke="#67e8f9" strokeWidth="1" />
+                <rect x="120" y="128" width="14" height="16" rx="3" fill="#0f172a" stroke="#67e8f9" strokeWidth="1" />
+                {/* Spine Data Conduit */}
+                <rect x="96" y="98" width="8" height="76" rx="4" fill="#0f172a" stroke="#67e8f9" strokeWidth="1.5" />
+                <circle cx="100" cy="112" r="2.5" fill="#67e8f9" className="pulse-cyan" />
+                <circle cx="100" cy="132" r="2.5" fill="#67e8f9" className="pulse-cyan" />
+                <circle cx="100" cy="152" r="2.5" fill="#67e8f9" className="pulse-cyan" />
+
+                {/* Backpack Scanner Mast Unit (Deployable Antenna Rig, Folded Flat) */}
+                <g transform="translate(100, 96)">
+                  {/* Tripod Mount Plate */}
+                  <path d="M -20 12 L 20 12 L 14 0 L -14 0 Z" fill="#0f172a" stroke="#475569" strokeWidth="2" />
+                  {/* Telescoping Mast */}
+                  <rect x="-4" y="-76" width="8" height="76" rx="3" fill="#334155" stroke="#67e8f9" strokeWidth="1.5" />
+                  <rect x="-3" y="-76" width="6" height="26" rx="2" fill="#67e8f9" opacity="0.45" />
+                  {/* Dipole Crossbars (clear the helmet line) */}
+                  <rect x="-10" y="-70" width="20" height="4" rx="2" fill="#475569" stroke="#67e8f9" strokeWidth="1" />
+                  <rect x="-20" y="-62" width="40" height="5" rx="2" fill="#475569" stroke="#67e8f9" strokeWidth="1" />
+                  {/* Mast Tip Beacon */}
+                  <circle cx="0" cy="-78" r="4.5" fill="#67e8f9" className="pulse-cyan" />
+                  {/* Broadcast Arcs Above the Tip */}
+                  <path d="M -28 -84 Q 0 -104 28 -84" fill="none" stroke="#67e8f9" strokeWidth="2.5" className="pulse-cyan" />
+                  <path d="M -16 -88 Q 0 -102 16 -88" fill="none" stroke="#67e8f9" strokeWidth="2" className="pulse-cyan" />
+                  {/* Side Feed Cable */}
+                  <path d="M 16 4 Q 34 20 26 42" fill="none" stroke="#67e8f9" strokeWidth="2" className="pulse-cyan" />
+                </g>
+
+                {/* Shoulders (Slim Recon Pauldrons) */}
+                <path d="M 40 94 L 64 90 L 60 132 L 38 124 Z" fill="#334155" stroke="#1e293b" strokeWidth="2" />
+                <path d="M 160 94 L 136 90 L 140 132 L 162 124 Z" fill="#334155" stroke="#1e293b" strokeWidth="2" />
+
+                {/* Recon Helmet (Rear View) */}
+                <ellipse cx="100" cy="62" rx="23" ry="25" fill="#1e293b" stroke="#334155" strokeWidth="2.5" />
+                {/* Helmet Signal Grid */}
+                <line x1="84" y1="52" x2="116" y2="52" stroke="#67e8f9" strokeWidth="1" opacity="0.6" />
+                <line x1="82" y1="60" x2="118" y2="60" stroke="#67e8f9" strokeWidth="1" opacity="0.6" />
+                <line x1="84" y1="68" x2="116" y2="68" stroke="#67e8f9" strokeWidth="1" opacity="0.6" />
+                {/* Twin Comms Whips */}
+                <line x1="86" y1="58" x2="80" y2="34" stroke="#94a3b8" strokeWidth="2" />
+                <line x1="114" y1="58" x2="120" y2="34" stroke="#94a3b8" strokeWidth="2" />
+                <circle cx="80" cy="34" r="2" fill="#67e8f9" className="pulse-cyan" />
+                <circle cx="120" cy="34" r="2" fill="#67e8f9" className="pulse-cyan" />
+                {/* Neck Shield */}
+                <path d="M 88 78 L 112 78 L 108 92 L 92 92 Z" fill="#0f172a" stroke="#334155" strokeWidth="1.5" />
+                {/* Forward Visor Glow */}
+                <ellipse cx="100" cy="40" rx="18" ry="6" fill="#67e8f9" opacity="0.35" className="pulse-cyan" />
+              </g>
             </svg>
 
             {/* Glowing Deployment Pedestal */}
@@ -9407,6 +10085,23 @@ export default function BattleRoyaleGame() {
                   <div className="char-info">
                     <span className="char-name">Barrage</span>
                     <span className="char-role">Artillery Bombardment</span>
+                  </div>
+                </button>
+                <button className="char" type="button" role="radio" aria-checked="false" data-char="antenna">
+                  <svg className="char-art" viewBox="0 0 96 96" aria-hidden="true">
+                    <ellipse className="ic-base" cx="48" cy="77" rx="32" ry="9" />
+                    <ellipse className="ic-ring" cx="48" cy="75" rx="27" ry="6.5" />
+                    <rect className="ic-barrel" x="46" y="24" width="4" height="50" rx="2" />
+                    <rect className="ic-body" x="36" y="62" width="24" height="10" rx="3" />
+                    <rect className="ic-body" x="32" y="36" width="32" height="4" rx="2" />
+                    <rect className="ic-body" x="38" y="45" width="20" height="4" rx="2" />
+                    <circle className="ic-glow" cx="48" cy="19" r="6" />
+                    <path className="ic-ring-warn" d="M30 30 A 24 24 0 0 1 66 30" />
+                    <path className="ic-ring-warn" d="M37 36 A 16 16 0 0 1 59 36" />
+                  </svg>
+                  <div className="char-info">
+                    <span className="char-name">Antenna</span>
+                    <span className="char-role">Recon — minimap + enemy scan, 100 life</span>
                   </div>
                 </button>
               </div>
@@ -9483,7 +10178,7 @@ export default function BattleRoyaleGame() {
             <li>Dummies have a shield too: it takes hits first, then life, and it recharges</li>
             <li>Cyan shield cores refill your shield and give 200 XP</li>
             <li>
-              Levels 2 and 4 raise shield to 304 and 456. Levels 3 and 5 upgrade the turret / bombardment
+              Levels 2 and 4 raise shield to 304 and 456. Levels 3 and 5 upgrade the turret / bombardment / antenna
             </li>
             <li><kbd>E</kbd> summons a turret. Reload with light ammo or pick up and relocate</li>
             <li>The red dummy shoots back. Teal dummies patrol, spot you, and take cover</li>
@@ -9493,6 +10188,12 @@ export default function BattleRoyaleGame() {
             </li>
             <li><kbd>B</kbd> opens the inventory: weapons, ammo, grenades, and dummy settings</li>
             <li>Barrage: <kbd>E</kbd> arms bombardment, right click calls it. Grenade pack clusters on death</li>
+            <li>
+              <b>Antenna</b> runs on 100 life. Passive minimap (top right): tap it or press <kbd>M</kbd> for the
+              simplified tactical map. <kbd>E</kbd> plants a 300 HP scanner for 60 s — every enemy shows on map
+              and minimap until it powers down or gets shot out. Enemy shooters prioritise it when it is closer
+              than you
+            </li>
           </ul>
           <ul className="controls touch-only">
             <li>Left stick to move. Push fully forward to run</li>
@@ -9504,9 +10205,45 @@ export default function BattleRoyaleGame() {
             <li>Wade into the sea: you slow down, then swim. Hold crouch to dive, tap jump to stroke up</li>
             <li>The top compass shows the nearest landmarks with distances — edge-pinned chips show which way to turn. Follow the port chips (PIER, YARD, DOCK, LIGHT) for the best loot</li>
             <li>Tap INVENTORY to purchase weapons, ammo and customize dummies</li>
+            <li>Antenna recon: tap the round minimap (top right) for the full map. Tap ANTENNA to start the 60 s enemy scan — it has 300 HP, so guard it</li>
           </ul>
           <button className="btn" id="btn" type="button">
             Click to resume
+          </button>
+        </div>
+      </div>
+
+      {/* Tactical map overlay (Antenna character) */}
+      <div className="overlay map-overlay" id="mapOverlay" role="dialog" aria-modal="true" aria-labelledby="mapTitle" hidden>
+        <div className="card map-card">
+          <div className="map-head">
+            <div>
+              <div className="eyebrow">Recon</div>
+              <h1 id="mapTitle">Tactical map</h1>
+            </div>
+            <div className="map-status" id="mapStatus">
+              Scan offline
+            </div>
+          </div>
+          <div className="map-wrap">
+            <canvas id="mapCanvas" width={900} height={900} aria-label="Simplified map of the island" />
+          </div>
+          <div className="map-legend">
+            <span>
+              <i className="lg lg-you" /> You
+            </span>
+            <span>
+              <i className="lg lg-ant" /> Antenna
+            </span>
+            <span>
+              <i className="lg lg-enemy" /> Enemy (while scanning)
+            </span>
+            <span>
+              <i className="lg lg-mark" /> Landmark
+            </span>
+          </div>
+          <button className="btn" id="mapClose" type="button">
+            Close map
           </button>
         </div>
       </div>
