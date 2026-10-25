@@ -530,7 +530,7 @@ export default function BattleRoyaleGame() {
     const TILE_SNOW = new THREE.Color(0xeef3f6);
     const TILE_SAND = new THREE.Color(0xd8c48f);
     const TILE_DEEP = new THREE.Color(0x2f5d70);
-    const tiles = new Map<string, { mesh: THREE.Mesh; cx: number; cz: number; veg?: THREE.Mesh | null; vegSolids?: SolidBox[] }>();
+    const tiles = new Map<string, { mesh: THREE.Mesh; cx: number; cz: number; veg?: THREE.Mesh | null; vegSolids?: SolidBox[]; vegTreeVox?: VoxelBox[] }>();
 
     const seaMesh = new THREE.Mesh(
       new THREE.PlaneGeometry(2 * (HARBOR_HALF + TERRAIN_MARGIN), 2 * (HARBOR_HALF + TERRAIN_MARGIN)),
@@ -633,7 +633,8 @@ export default function BattleRoyaleGame() {
       scene.add(mesh);
       // Tile-local vegetation: one merged, vertex-colored mesh plus the
       // trunk/boulder collision boxes, seeded per tile so a revisited
-      // tile regrows the exact same stand.
+      // tile regrows the exact same stand. Woody plants are voxelized
+      // trees — destructible, and they drop wood when chewed apart.
       const veg = terrainOn ? buildVegTile(tx, tz) : null;
       if (veg?.mesh) scene.add(veg.mesh);
       tiles.set(tx + ',' + tz, {
@@ -642,10 +643,11 @@ export default function BattleRoyaleGame() {
         cz: (tz + 0.5) * TILE,
         veg: veg?.mesh ?? null,
         vegSolids: veg?.solidRefs ?? [],
+        vegTreeVox: veg?.treeVox ?? [],
       });
     }
 
-    function disposeTile(t: { mesh: THREE.Mesh; veg?: THREE.Mesh | null; vegSolids?: SolidBox[] }) {
+    function disposeTile(t: { mesh: THREE.Mesh; veg?: THREE.Mesh | null; vegSolids?: SolidBox[]; vegTreeVox?: VoxelBox[] }) {
       scene.remove(t.mesh);
       t.mesh.geometry.dispose();
       if (t.veg) {
@@ -657,6 +659,38 @@ export default function BattleRoyaleGame() {
         if (i >= 0) solids.splice(i, 1);
         i = vegSolids.indexOf(s);
         if (i >= 0) vegSolids.splice(i, 1);
+      }
+      // Voxelized trees stream out with their tile: pull the voxel
+      // boxes, placeholders, chunky instanced meshes and any rebuilt
+      // column solids out of the global registries.
+      for (const v of t.vegTreeVox ?? []) {
+        if (v.inst) {
+          v.group.remove(v.inst);
+          const si = shootable.indexOf(v.inst);
+          if (si >= 0) shootable.splice(si, 1);
+          v.inst.geometry.dispose();
+          (v.inst.material as THREE.Material).dispose();
+          v.inst.dispose();
+          v.inst = null;
+        }
+        v.mesh.parent?.remove(v.mesh);
+        const ms = shootable.indexOf(v.mesh);
+        if (ms >= 0) shootable.splice(ms, 1);
+        (v.mesh as THREE.Mesh).geometry.dispose();
+        for (const r of v.solidRefs) {
+          const i = solids.indexOf(r);
+          if (i >= 0) solids.splice(i, 1);
+        }
+        v.solidRefs.length = 0;
+        if (v.barGroup) {
+          disposeBar(v.barGroup);
+          v.barGroup = null;
+          v.barFill = null;
+          v.barTimer = 0;
+        }
+        const vi = voxBoxes.indexOf(v);
+        if (vi >= 0) voxBoxes.splice(vi, 1);
+        v.gone = true;
       }
     }
 
@@ -712,6 +746,152 @@ export default function BattleRoyaleGame() {
     let vegLib: Record<string, VegDef> | null = null;
     const vegSolids: SolidBox[] = [];
     const vegMat = new THREE.MeshLambertMaterial({ vertexColors: true });
+
+    // ----------------------------------------------------
+    // VOXELIZED TREES. Woody plants are chunky BOX-built shapes
+    // (trunk box + stacked canopy boxes) that stamp into the tile's
+    // merged mesh like every other plant, but each tree also
+    // registers a destructible voxel lattice spanning its crown
+    // (invisible box placeholder — the raycast target). The first
+    // bullet or blast swaps the merged stamp for the chunky voxel
+    // reveal (per-voxel brown / green palette) and every voxel
+    // knocked loose grants wood for building.
+    // ----------------------------------------------------
+    interface TreePart {
+      x: number;
+      y: number;
+      z: number;
+      w: number;
+      h: number;
+      d: number;
+      c: number;
+      rx?: number;
+      ry?: number;
+    }
+    interface TreeShape {
+      parts: TreePart[]; // trunk FIRST — palette tests in order
+      trunkR: number; // movement collision half-width at s=1
+      trunkTop: number; // collision top (metres of trunk) at s=1
+      vox: number; // lattice cell size
+      ex: number; // crown half-extent x/z at s=1 (grid override)
+      top: number; // crown top at s=1 (above the stamp base)
+    }
+    const TREE_WOOD = 2; // wood per destroyed tree voxel
+    let treeVoxMat: THREE.MeshLambertMaterial | null = null;
+    const TREE_SHAPES: Record<string, TreeShape> = {
+      pine: {
+        parts: [
+          { x: 0, y: 1.1, z: 0, w: 0.36, h: 2.2, d: 0.36, c: 0x6b4a2f },
+          { x: 0, y: 2.15, z: 0, w: 2.0, h: 1.0, d: 2.0, c: 0x2f6b35 },
+          { x: 0, y: 3.1, z: 0, w: 1.4, h: 0.9, d: 1.4, c: 0x35743c },
+          { x: 0, y: 3.95, z: 0, w: 0.85, h: 0.8, d: 0.85, c: 0x3d7d43 },
+        ],
+        trunkR: 0.34, trunkTop: 1.9, vox: 0.62, ex: 1.0, top: 4.35,
+      },
+      spruce: {
+        parts: [
+          { x: 0, y: 0.8, z: 0, w: 0.3, h: 1.6, d: 0.3, c: 0x5d4030 },
+          { x: 0, y: 1.85, z: 0, w: 1.7, h: 0.85, d: 1.7, c: 0x2a5f3a },
+          { x: 0, y: 2.7, z: 0, w: 1.15, h: 0.8, d: 1.15, c: 0x2f6a40 },
+          { x: 0, y: 3.5, z: 0, w: 0.7, h: 0.75, d: 0.7, c: 0x356f45 },
+          { x: 0, y: 4.15, z: 0, w: 0.35, h: 0.6, d: 0.35, c: 0x3b744a },
+        ],
+        trunkR: 0.3, trunkTop: 1.7, vox: 0.62, ex: 0.85, top: 4.45,
+      },
+      broadleaf: {
+        parts: [
+          { x: 0, y: 1.15, z: 0, w: 0.4, h: 2.3, d: 0.4, c: 0x7a5638 },
+          { x: 0, y: 3.2, z: 0, w: 2.6, h: 1.7, d: 2.6, c: 0x4f8a3d },
+          { x: 1.1, y: 2.6, z: 0.4, w: 1.2, h: 1.0, d: 1.2, c: 0x457f38 },
+          { x: -1.0, y: 2.75, z: -0.7, w: 1.1, h: 0.9, d: 1.1, c: 0x558f41 },
+        ],
+        trunkR: 0.42, trunkTop: 2.1, vox: 0.62, ex: 1.35, top: 4.05,
+      },
+      kapok: {
+        parts: [
+          { x: 0, y: 2.15, z: 0, w: 0.55, h: 4.3, d: 0.55, c: 0x8a6242 },
+          { x: 0, y: 4.9, z: 0, w: 3.4, h: 1.5, d: 3.4, c: 0x2f7d33 },
+          { x: 1.6, y: 4.4, z: 0.8, w: 1.6, h: 1.1, d: 1.6, c: 0x357f38 },
+          { x: -1.5, y: 4.5, z: -1.0, w: 1.5, h: 1.0, d: 1.5, c: 0x2a7230 },
+        ],
+        trunkR: 0.5, trunkTop: 3.4, vox: 0.7, ex: 1.8, top: 5.65,
+      },
+      palm: {
+        parts: [
+          { x: 0.28, y: 2.2, z: 0.12, w: 0.34, h: 4.4, d: 0.34, c: 0x8a6a45, rx: 0.12 },
+          { x: 1.05, y: 4.42, z: 0.12, w: 1.7, h: 0.12, d: 0.6, c: 0x3f8f3f, ry: 0.55 },
+          { x: -0.85, y: 4.42, z: 0.55, w: 1.7, h: 0.12, d: 0.6, c: 0x35833a, ry: 2.15 },
+          { x: -0.5, y: 4.3, z: -0.9, w: 1.7, h: 0.12, d: 0.6, c: 0x3f8f3f, ry: 3.75 },
+          { x: 0.45, y: 4.52, z: -0.8, w: 1.4, h: 0.12, d: 0.55, c: 0x35833a, ry: 5.2 },
+          { x: 0.2, y: 4.5, z: 0.9, w: 1.2, h: 0.12, d: 0.5, c: 0x3f8f3f, ry: 1.3 },
+          { x: 0.35, y: 4.15, z: 0.4, w: 0.24, h: 0.24, d: 0.24, c: 0x5d4a2f },
+          { x: -0.05, y: 4.1, z: 0.75, w: 0.22, h: 0.22, d: 0.22, c: 0x6b5433 },
+        ],
+        trunkR: 0.38, trunkTop: 2.6, vox: 0.66, ex: 1.35, top: 4.6,
+      },
+      acacia: {
+        parts: [
+          { x: 0.1, y: 1.0, z: 0, w: 0.34, h: 2.0, d: 0.34, c: 0x7a5a3a, rx: 0.12 },
+          { x: 0.3, y: 2.85, z: 0, w: 3.4, h: 0.8, d: 3.4, c: 0x7d8f4a },
+          { x: 0.3, y: 2.3, z: 0, w: 2.0, h: 0.55, d: 2.0, c: 0x74873f },
+        ],
+        trunkR: 0.36, trunkTop: 1.9, vox: 0.62, ex: 1.75, top: 3.3,
+      },
+      deadtree: {
+        parts: [
+          { x: 0, y: 1.3, z: 0, w: 0.3, h: 2.6, d: 0.3, c: 0x8a7a66, rx: 0.06 },
+          { x: 0.55, y: 2.35, z: 0.15, w: 1.3, h: 0.14, d: 0.14, c: 0x8a7a66, ry: 0.2 },
+          { x: -0.45, y: 2.15, z: 0.2, w: 1.1, h: 0.13, d: 0.13, c: 0x84745f, ry: -0.5 },
+          { x: 0.1, y: 2.6, z: -0.3, w: 0.9, h: 0.12, d: 0.12, c: 0x84745f, ry: 1.2 },
+          { x: 0.05, y: 2.95, z: 0, w: 0.18, h: 0.9, d: 0.18, c: 0x8a7a66 },
+        ],
+        trunkR: 0.3, trunkTop: 2.2, vox: 0.62, ex: 0.85, top: 3.4,
+      },
+    };
+
+    interface StampRec {
+      def: VegDef;
+      x: number;
+      y: number;
+      z: number;
+      yaw: number;
+      s: number;
+      tint: number;
+      vox: VoxelBox | null; // set when this stamp is a destructible tree
+      skip?: boolean; // tree voxelized — stamp leaves the merged mesh
+    }
+    interface VegTileRec {
+      mesh: THREE.Mesh | null;
+      stamps: StampRec[];
+    }
+
+    // A tree took its first hit: drop its stamp from the tile's merged
+    // mesh so the chunky voxel reveal is the only visual left.
+    function removeTreeStamp(v: VoxelBox) {
+      const rec = v.vegTile;
+      if (!rec || !rec.mesh) return;
+      let dirty = false;
+      for (const st of rec.stamps) {
+        if (st.vox === v && !st.skip) {
+          st.skip = true;
+          dirty = true;
+        }
+      }
+      if (!dirty) return;
+      const P: number[] = [];
+      const N: number[] = [];
+      const C: number[] = [];
+      for (const st of rec.stamps) {
+        if (st.skip) continue;
+        stampVeg(st.def, st.x, st.y, st.z, st.yaw, st.s, st.tint, P, N, C);
+      }
+      rec.mesh.geometry.dispose();
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(P), 3));
+      geo.setAttribute('normal', new THREE.BufferAttribute(new Float32Array(N), 3));
+      geo.setAttribute('color', new THREE.BufferAttribute(new Float32Array(C), 3));
+      rec.mesh.geometry = geo;
+    }
 
     function vegMat4(x: number, y: number, z: number, rx = 0, ry = 0, sx = 1, sy = 1, sz = 1) {
       return new THREE.Matrix4().compose(
@@ -779,65 +959,20 @@ export default function BattleRoyaleGame() {
         sz = 1
       ) => ({ geo, mat: vegMat4(x, y, z, rx, ry, sx, sy, sz), color });
 
-      // Forest pine: trunk + three stacked canopy cones
-      lib.pine = vegMerge([
-        P(new THREE.CylinderGeometry(0.14, 0.2, 2.1, 6), 0, 1.05, 0, 0x6b4a2f),
-        P(new THREE.ConeGeometry(1.35, 2.4, 7), 0, 2.7, 0, 0x2f6b35),
-        P(new THREE.ConeGeometry(1.0, 2.0, 7), 0, 3.9, 0, 0x35743c),
-        P(new THREE.ConeGeometry(0.62, 1.7, 7), 0, 5.1, 0, 0x3d7d43),
-      ]);
-      // Mountain spruce: narrower, darker, one extra tier
-      lib.spruce = vegMerge([
-        P(new THREE.CylinderGeometry(0.12, 0.18, 1.5, 6), 0, 0.75, 0, 0x5d4030),
-        P(new THREE.ConeGeometry(1.15, 2.1, 7), 0, 2.2, 0, 0x2a5f3a),
-        P(new THREE.ConeGeometry(0.85, 1.9, 7), 0, 3.4, 0, 0x2f6a40),
-        P(new THREE.ConeGeometry(0.55, 1.7, 7), 0, 4.5, 0, 0x356f45),
-        P(new THREE.ConeGeometry(0.3, 1.3, 7), 0, 5.5, 0, 0x3b744a),
-      ]);
-      // Broadleaf: forest standard + grassland stray
-      lib.broadleaf = vegMerge([
-        P(new THREE.CylinderGeometry(0.16, 0.26, 2.2, 6), 0, 1.1, 0, 0x7a5638),
-        P(new THREE.SphereGeometry(1.5, 6, 5), 0, 3.3, 0, 0x4f8a3d, 0, 0, 1.25, 0.95, 1.25),
-        P(new THREE.SphereGeometry(1.0, 6, 5), 0.9, 2.7, 0.5, 0x457f38),
-        P(new THREE.SphereGeometry(0.9, 6, 5), -0.8, 2.9, -0.6, 0x558f41),
-      ]);
-      // Jungle kapok: tall trunk, wide flat crown
-      lib.kapok = vegMerge([
-        P(new THREE.CylinderGeometry(0.22, 0.4, 4.4, 6), 0, 2.2, 0, 0x8a6242),
-        P(new THREE.SphereGeometry(2.3, 6, 5), 0, 5.3, 0, 0x2f7d33, 0, 0, 1.3, 0.8, 1.3),
-        P(new THREE.SphereGeometry(1.3, 6, 5), 1.5, 4.7, 0.8, 0x357f38),
-        P(new THREE.SphereGeometry(1.2, 6, 5), -1.4, 4.9, -0.9, 0x2a7230),
-      ]);
-      // Jungle palm: leaning trunk + drooping fronds + coconuts
-      {
-        const parts: Array<{ geo: THREE.BufferGeometry; mat: THREE.Matrix4; color: number }> = [
-          P(new THREE.CylinderGeometry(0.13, 0.2, 4.6, 6), 0, 2.3, 0, 0x8a6a45, 0.16),
-        ];
-        for (let k = 0; k < 6; k++) {
-          const a = (k / 6) * Math.PI * 2;
-          const fr = new THREE.ConeGeometry(0.42, 3.0, 4);
-          fr.translate(0, 1.5, 0); // pivot at frond base
-          fr.rotateZ(-1.75); // droop outward
-          fr.rotateY(a); // fan around the trunk top
-          parts.push({ geo: fr, mat: vegMat4(0, 4.4, 0.72), color: k % 2 ? 0x3f8f3f : 0x35833a });
-        }
-        parts.push(P(new THREE.SphereGeometry(0.18, 5, 4), 0.2, 4.35, 0.8, 0x5d4a2f));
-        parts.push(P(new THREE.SphereGeometry(0.16, 5, 4), -0.15, 4.3, 0.6, 0x6b5433));
-        lib.palm = vegMerge(parts);
+      // Woody plants are VOXEL TREES: chunky box-built silhouettes
+      // generated from TREE_SHAPES (see the voxelized-trees block
+      // above). The same shape data drives the per-voxel brown/green
+      // palette, so the merged stamp and the damaged-chunky reveal
+      // match part for part.
+      for (const [name, shape] of Object.entries(TREE_SHAPES)) {
+        lib[name] = vegMerge(
+          shape.parts.map((p) => P(new THREE.BoxGeometry(p.w, p.h, p.d), p.x, p.y, p.z, p.c, p.rx ?? 0, p.ry ?? 0))
+        );
       }
-      // Grassland acacia: short lean trunk + flat wide crown
-      lib.acacia = vegMerge([
-        P(new THREE.CylinderGeometry(0.14, 0.24, 2.0, 6), 0, 1.0, 0, 0x7a5a3a, 0.12),
-        P(new THREE.ConeGeometry(2.5, 1.2, 8), 0.2, 3.0, 0, 0x7d8f4a, 0, 0, 1.15, 1, 1.15),
-        P(new THREE.SphereGeometry(1.5, 6, 5), 0.2, 2.55, 0, 0x74873f, 0, 0, 1.2, 0.5, 1.2),
-      ]);
-      // Dead tree: lake shores
-      lib.deadtree = vegMerge([
-        P(new THREE.CylinderGeometry(0.12, 0.22, 2.6, 5), 0, 1.3, 0, 0x8a7a66, 0.06),
-        P(new THREE.CylinderGeometry(0.05, 0.09, 1.4, 4), 0.32, 2.5, 0, 0x8a7a66, 0, 0.9),
-        P(new THREE.CylinderGeometry(0.05, 0.09, 1.2, 4), -0.28, 2.35, 0.2, 0x84745f, 0.85, 0.4),
-        P(new THREE.CylinderGeometry(0.04, 0.08, 1.0, 4), 0.05, 2.9, -0.25, 0x84745f, 0.4, 0),
-      ]);
+      if (!treeVoxMat) {
+        treeVoxMat = new THREE.MeshLambertMaterial({ color: 0x6b4a2f });
+        voxHpMap.set(treeVoxMat, 26); // a couple of bullets per chunk
+      }
       // Bushes: lush jungle/forest vs dry savanna
       const bushShape = (a: number, b: number, c: number) =>
         vegMerge([
@@ -922,10 +1057,14 @@ export default function BattleRoyaleGame() {
     const VEG_MAX_INST = 66; // instance cap per tile
     const VEG_MAX_VERTS = 22000; // vertex budget per tile
 
-    function buildVegTile(tx: number, tz: number): { mesh: THREE.Mesh | null; solidRefs: SolidBox[] } {
+    function buildVegTile(tx: number, tz: number): { mesh: THREE.Mesh | null; solidRefs: SolidBox[]; stamps: StampRec[]; treeVox: VoxelBox[] } {
       const solidRefs: SolidBox[] = [];
+      const stamps: StampRec[] = [];
+      const treeVox: VoxelBox[] = [];
+      const tileRec: VegTileRec = { mesh: null, stamps };
       if (!vegLib) buildVegLib();
       const lib = vegLib!;
+      const tvm = treeVoxMat!;
       const x0 = tx * TILE;
       const z0 = tz * TILE;
       const rnd = mulberry32((terrainSeed ^ (tx * 73856093) ^ (tz * 19349663)) >>> 0);
@@ -950,6 +1089,15 @@ export default function BattleRoyaleGame() {
           }
         }
         if (pad) continue;
+        // War decorations own their clearings too — no tank growing a
+        // pine through its turret.
+        for (const w of warZones) {
+          if (Math.hypot(vx - w.x, vz - w.z) < w.r + 2) {
+            pad = true;
+            break;
+          }
+        }
+        if (pad) continue;
         // Roads stay clear — no trees or boulders mid-track, so the
         // transition routes read as walked corridors, not noise
         const npv = nearPath(vx, vz);
@@ -959,8 +1107,9 @@ export default function BattleRoyaleGame() {
         const pick = rnd();
         let def: VegDef | null = null;
         let s = 1;
-        let trunkR = 0; // > 0 registers trunk collision
+        let trunkR = 0; // > 0 registers a destructible voxel tree
         let trunkTop = 0;
+        let treeName: string | null = null;
         let boulder = false;
         if (VW.mw >= 0.04 && VW.mw >= VW.lw && VW.mw >= VW.jw && VW.mw >= VW.fw && VW.mw >= VW.gw) {
           // Mountain: boulders all the way up, spruces only below the
@@ -980,6 +1129,7 @@ export default function BattleRoyaleGame() {
                 def = lib.spruce;
                 trunkR = 0.3;
                 trunkTop = 1.7;
+                treeName = 'spruce';
               } else if (pick < 0.62) def = lib.rock;
               else if (pick < 0.74) {
                 def = lib.rockBig;
@@ -1006,6 +1156,7 @@ export default function BattleRoyaleGame() {
               def = lib.deadtree;
               trunkR = 0.3;
               trunkTop = 2.2;
+              treeName = 'deadtree';
             } else if (pick < 0.62) def = lib.bush;
             else if (pick < 0.9) def = lib.tuft;
             else continue;
@@ -1018,10 +1169,12 @@ export default function BattleRoyaleGame() {
             def = lib.kapok;
             trunkR = 0.5;
             trunkTop = 3.4;
+            treeName = 'kapok';
           } else if (pick < 0.5) {
             def = lib.palm;
             trunkR = 0.38;
             trunkTop = 2.6;
+            treeName = 'palm';
           } else if (pick < 0.74) def = lib.fern;
           else if (pick < 0.92) def = lib.bush;
           else def = lib.tuft;
@@ -1033,10 +1186,12 @@ export default function BattleRoyaleGame() {
             def = lib.pine;
             trunkR = 0.34;
             trunkTop = 1.9;
+            treeName = 'pine';
           } else if (pick < 0.76) {
             def = lib.broadleaf;
             trunkR = 0.42;
             trunkTop = 2.1;
+            treeName = 'broadleaf';
           } else if (pick < 0.92) def = lib.bush;
           else def = lib.tuft;
           s = 0.85 + rnd() * 0.55;
@@ -1049,6 +1204,7 @@ export default function BattleRoyaleGame() {
             def = lib.acacia;
             trunkR = 0.36;
             trunkTop = 1.9;
+            treeName = 'acacia';
           } else if (pick < 0.74) def = lib.rock;
           else continue;
           s = 0.9 + rnd() * 0.5;
@@ -1056,14 +1212,49 @@ export default function BattleRoyaleGame() {
         if (!def) continue;
         const yaw = rnd() * Math.PI * 2;
         const tint = 0.86 + rnd() * 0.26;
+        const rec: StampRec = { def, x: vx, y: h - 0.06, z: vz, yaw, s, tint, vox: null };
+        stamps.push(rec);
         stampVeg(def, vx, h - 0.06, vz, yaw, s, tint, P, N, C);
         verts += def.pos.length / 3;
         inst++;
-        if (trunkR) {
-          const sb: SolidBox = { x: vx, z: vz, hx: trunkR * s, hz: trunkR * s, bottom: h - 1.2, top: h + trunkTop * s };
+        if (trunkR && treeName) {
+          // VOXELIZED TREE: trunk-only movement collision (forests
+          // stay walkable), but a destructible lattice spanning the
+          // whole crown. Bullets and blasts chew chunks out of it —
+          // every voxel knocked loose grants wood. The invisible box
+          // placeholder is the raycast target; on the first hit the
+          // merged stamp above is swapped for the chunky voxels.
+          const shape = TREE_SHAPES[treeName];
+          const base = h - 0.06;
+          const sb: SolidBox = {
+            x: vx,
+            z: vz,
+            hx: Math.max(0.32, trunkR * s * 1.12),
+            hz: Math.max(0.32, trunkR * s * 1.12),
+            bottom: h - 1.2,
+            top: h + trunkTop * s,
+            group: scene,
+          };
           solids.push(sb);
-          vegSolids.push(sb);
           solidRefs.push(sb);
+          const gx = Math.max(0.45, shape.ex * s);
+          const gz = Math.max(0.45, shape.ex * s);
+          const gTop = base + shape.top * s;
+          const gBot = h - 0.9;
+          const ph = new THREE.Mesh(new THREE.BoxGeometry(gx * 2, gTop - gBot, gz * 2), tvm);
+          ph.position.set(vx, (gTop + gBot) / 2, vz);
+          ph.visible = false;
+          scene.add(ph);
+          shootable.push(ph);
+          registerDestructible(sb, ph, tvm, shape.vox, {
+            grid: { hx: gx, hz: gz, top: gTop, bottom: gBot },
+            pal: buildTreePal(shape, vx, base, vz, yaw, s, gx, gz, gTop, gBot, shape.vox),
+            gain: TREE_WOOD,
+            vegTile: tileRec,
+          });
+          const tv = ph.userData.vox as VoxelBox;
+          rec.vox = tv;
+          treeVox.push(tv);
         }
         if (boulder) {
           const sb: SolidBox = { x: vx, z: vz, hx: 1.75 * s, hz: 1.5 * s, bottom: h - 1.5, top: h + 1.15 * s };
@@ -1072,7 +1263,7 @@ export default function BattleRoyaleGame() {
           solidRefs.push(sb);
         }
       }
-      if (!inst) return { mesh: null, solidRefs };
+      if (!inst) return { mesh: null, solidRefs, stamps, treeVox };
       const geo = new THREE.BufferGeometry();
       geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(P), 3));
       geo.setAttribute('normal', new THREE.BufferAttribute(new Float32Array(N), 3));
@@ -1080,13 +1271,78 @@ export default function BattleRoyaleGame() {
       const mesh = new THREE.Mesh(geo, vegMat);
       mesh.castShadow = true;
       mesh.receiveShadow = false;
-      return { mesh, solidRefs };
+      tileRec.mesh = mesh;
+      return { mesh, solidRefs, stamps, treeVox };
     }
 
-    // Vegetation blocks bullets: nearest trunk / boulder along a shot
-    // segment. Trees aren't destructible, but they soak rounds (wood
-    // thunk) and — because they live in `solids` — grenade LOS, so a
-    // fat tree is real cover.
+    // Per-voxel colour palette for a voxelized tree: rotate each voxel
+    // centre into the tree's local space and test it against the shape
+    // parts in order (trunk first) — brown trunk column, green crown.
+    function buildTreePal(
+      shape: TreeShape,
+      tx: number,
+      ty: number,
+      tz: number,
+      yaw: number,
+      s: number,
+      ghx: number,
+      ghz: number,
+      gTop: number,
+      gBot: number,
+      vs: number
+    ): Float32Array {
+      const nx = Math.max(1, Math.min(VOX_MAX_DIM, Math.round((ghx * 2) / vs)));
+      const ny = Math.max(1, Math.min(VOX_MAX_DIM, Math.round((gTop - gBot) / vs)));
+      const nz = Math.max(1, Math.min(VOX_MAX_DIM, Math.round((ghz * 2) / vs)));
+      const sx = (ghx * 2) / nx;
+      const sy = (gTop - gBot) / ny;
+      const sz = (ghz * 2) / nz;
+      const x0 = tx - ghx;
+      const y0 = gBot;
+      const z0 = tz - ghz;
+      const pal = new Float32Array(nx * ny * nz * 3);
+      const cs = Math.cos(yaw);
+      const sn = Math.sin(yaw);
+      const tc = new THREE.Color();
+      const trunkC = new THREE.Color(shape.parts[0].c);
+      for (let k = 0; k < nz; k++) {
+        for (let j = 0; j < ny; j++) {
+          for (let i = 0; i < nx; i++) {
+            const idx = i + nx * (j + ny * k);
+            const wx = x0 + (i + 0.5) * sx;
+            const wy = y0 + (j + 0.5) * sy;
+            const wz = z0 + (k + 0.5) * sz;
+            const dx = wx - tx;
+            const dz = wz - tz;
+            const lx = (cs * dx + sn * dz) / s;
+            const lz = (-sn * dx + cs * dz) / s;
+            const ly = (wy - ty) / s;
+            tc.copy(trunkC);
+            for (const part of shape.parts) {
+              if (
+                Math.abs(lx - part.x) <= part.w / 2 + 0.02 &&
+                Math.abs(lz - part.z) <= part.d / 2 + 0.02 &&
+                ly >= part.y - part.h / 2 - 0.02 &&
+                ly <= part.y + part.h / 2 + 0.02
+              ) {
+                tc.setHex(part.c);
+                break;
+              }
+            }
+            pal[idx * 3] = tc.r;
+            pal[idx * 3 + 1] = tc.g;
+            pal[idx * 3 + 2] = tc.b;
+          }
+        }
+      }
+      return pal;
+    }
+
+    // Vegetation blocks bullets: nearest boulder along a shot segment
+    // soaks the round (rock thunk). Voxelized TREES are no longer in
+    // here — they are destructible shootables now, so bullets CHIP
+    // them for wood instead of soaking. Boulders still block grenade
+    // LOS via `solids`, so rocky cover is real cover.
     function vegCut(o: THREE.Vector3, dir: THREE.Vector3, maxDist: number): number {
       let best = Infinity;
       const ex = o.x + dir.x * maxDist;
@@ -1121,6 +1377,9 @@ export default function BattleRoyaleGame() {
       top: number;
       bottom?: number;
       group?: THREE.Object3D;
+      // Player-built ramp steps carry this so the look-straight-up
+      // build gesture knows the player is standing on a staircase.
+      stair?: boolean;
     }
     const solids: SolidBox[] = [];
     const shootable: THREE.Object3D[] = [];
@@ -1135,6 +1394,27 @@ export default function BattleRoyaleGame() {
     const VOX_MAX_DIM = 96;
     const voxHpMap = new WeakMap<THREE.Material, number>();
     const voxBoxes: VoxelBox[] = [];
+
+    // ----------------------------------------------------
+    // Wood economy — voxelized trees are the harvest, wooden build
+    // pieces spend it. Enforced in terrain modes (Harbor) only:
+    // the Test Range stays a free-build sandbox with no trees.
+    // ----------------------------------------------------
+    let woodRes = 60;
+    const PIECE_COST: Record<string, number> = { wall: 10, door: 12, floor: 10, ramp: 10, ladder: 15 };
+
+    function refreshWood() {
+      const el = $('woodCount');
+      if (el) el.textContent = String(Math.floor(woodRes));
+      const plate = $('woodPlate');
+      if (plate) plate.hidden = !terrainOn;
+    }
+
+    function grantWood(n: number, at?: THREE.Vector3) {
+      woodRes += n;
+      if (at && damagePopups.length < 22) showDamagePopup('+' + n + ' wood', at, '#e0a860');
+      refreshWood();
+    }
     const voxFlashGeo = new THREE.SphereGeometry(1, 12, 8);
     const voxTmpM = new THREE.Matrix4();
     const voxTmpC = new THREE.Color();
@@ -1175,14 +1455,34 @@ export default function BattleRoyaleGame() {
       barFill: THREE.Mesh | null;
       barTimer: number;
       collapsed: boolean;
+      // Voxelized trees: per-voxel base colours (brown trunk, green
+      // canopy) so the chunky reveal reads as a tree, wood granted per
+      // destroyed voxel, and the owning veg tile so the merged-mesh
+      // stamp can be swapped out the moment the tree voxelizes.
+      pal: Float32Array | null;
+      gain: number;
+      vegTile: VegTileRec | null;
     }
 
-    function registerDestructible(b: SolidBox, mesh: THREE.Mesh, mat: THREE.Material, customVoxSize?: number) {
-      const bottom = b.bottom ?? 0;
+    function registerDestructible(
+      b: SolidBox,
+      mesh: THREE.Mesh,
+      mat: THREE.Material,
+      customVoxSize?: number,
+      opts?: { grid?: { hx: number; hz: number; top: number; bottom: number }; pal?: Float32Array | null; gain?: number; vegTile?: VegTileRec | null }
+    ) {
+      // `grid` overrides the voxel lattice extents without touching the
+      // collision solid — voxelized trees span trunk + canopy while
+      // movement collision stays a slim trunk.
+      const g = opts?.grid;
+      const ghx = g ? g.hx : b.hx;
+      const ghz = g ? g.hz : b.hz;
+      const gTop = g ? g.top : b.top;
+      const bottom = g ? g.bottom : b.bottom ?? 0;
       const vs = customVoxSize ?? VOX_SIZE;
-      const nx = Math.max(1, Math.min(VOX_MAX_DIM, Math.round((b.hx * 2) / vs)));
-      const ny = Math.max(1, Math.min(VOX_MAX_DIM, Math.round((b.top - bottom) / vs)));
-      const nz = Math.max(1, Math.min(VOX_MAX_DIM, Math.round((b.hz * 2) / vs)));
+      const nx = Math.max(1, Math.min(VOX_MAX_DIM, Math.round((ghx * 2) / vs)));
+      const ny = Math.max(1, Math.min(VOX_MAX_DIM, Math.round((gTop - bottom) / vs)));
+      const nz = Math.max(1, Math.min(VOX_MAX_DIM, Math.round((ghz * 2) / vs)));
       const total = nx * ny * nz;
       const voxHp = voxHpMap.get(mat) ?? 100;
       const order = new Int32Array(total);
@@ -1198,12 +1498,12 @@ export default function BattleRoyaleGame() {
         nx,
         ny,
         nz,
-        sx: (b.hx * 2) / nx,
-        sy: (b.top - bottom) / ny,
-        sz: (b.hz * 2) / nz,
-        x0: b.x - b.hx,
+        sx: (ghx * 2) / nx,
+        sy: (gTop - bottom) / ny,
+        sz: (ghz * 2) / nz,
+        x0: b.x - ghx,
         y0: bottom,
-        z0: b.z - b.hz,
+        z0: b.z - ghz,
         hp: new Float32Array(total).fill(voxHp),
         alive: new Uint8Array(total).fill(1),
         order,
@@ -1221,6 +1521,9 @@ export default function BattleRoyaleGame() {
         barFill: null,
         barTimer: 0,
         collapsed: false,
+        pal: opts?.pal ?? null,
+        gain: opts?.gain ?? 0,
+        vegTile: opts?.vegTile ?? null,
       };
       mesh.userData.vox = v;
       voxBoxes.push(v);
@@ -1250,10 +1553,15 @@ export default function BattleRoyaleGame() {
       voxTmpQ.identity();
       voxTmpS.set(v.sx * 1.0, v.sy * 1.0, v.sz * 1.0);
       for (let s = 0; s < v.aliveCount; s++) {
-        voxCenter(v, v.order[s], voxTmpP);
+        const idx = v.order[s];
+        voxCenter(v, idx, voxTmpP);
         voxTmpM.compose(voxTmpP, voxTmpQ, voxTmpS);
         inst.setMatrixAt(s, voxTmpM);
-        inst.setColorAt(s, voxTmpC.copy(v.color).multiplyScalar(0.86 + Math.random() * 0.28));
+        // Voxelized trees carry a per-voxel palette (brown trunk vs
+        // green canopy) so the chunky reveal still reads as a tree.
+        if (v.pal) voxTmpC.setRGB(v.pal[idx * 3], v.pal[idx * 3 + 1], v.pal[idx * 3 + 2]).multiplyScalar(0.86 + Math.random() * 0.28);
+        else voxTmpC.copy(v.color).multiplyScalar(0.86 + Math.random() * 0.28);
+        inst.setColorAt(s, voxTmpC);
       }
       inst.count = v.aliveCount;
       inst.instanceMatrix.needsUpdate = true;
@@ -1264,6 +1572,9 @@ export default function BattleRoyaleGame() {
       if (si >= 0) shootable.splice(si, 1);
       v.inst = inst;
       rebuildSolids(v);
+      // First hit on a voxelized TREE: swap its merged-mesh stamp for
+      // the chunky voxel reveal so the two visuals never overlap.
+      if (v.vegTile) removeTreeStamp(v);
     }
 
     function killVoxel(v: VoxelBox, slot: number, chips: number) {
@@ -1290,6 +1601,10 @@ export default function BattleRoyaleGame() {
       v.deadSinceBuild++;
       voxCenter(v, idx, voxTmpP);
       spawnDebris(voxTmpP.x, voxTmpP.y, voxTmpP.z, v.color, chips);
+      // Harvest: voxelized trees drop wood for building with every
+      // chunk knocked loose (bullets chip, blasts carve, collapses pay
+      // out the whole remaining crown).
+      if (v.gain) grantWood(v.gain, voxTmpP);
       if (v.aliveCount === 0) {
         v.gone = true;
         v.group.remove(inst);
@@ -1585,8 +1900,11 @@ export default function BattleRoyaleGame() {
 
     function resetVox() {
       resetBuildables();
-      // Player-built voxel pieces (floors / ramps / door panels) live in the
-      // scene rather than the world group, so clear their meshes here too.
+      // Player-built voxel pieces (walls / floors / ramps / door panels)
+      // live in the scene rather than the world group, so clear their
+      // meshes — and the staircase-stacking registry — here too.
+      stairPieces.length = 0;
+      stairRamps.length = 0;
       for (const m of playerBuiltVox) {
         m.parent?.remove(m);
         m.geometry.dispose();
@@ -2020,97 +2338,35 @@ export default function BattleRoyaleGame() {
       effects.push({ kind: 'shock', mesh: ring, t: 0, life: 0.35, radius: Math.max(b.w, b.d) * 1.5 });
     }
 
-    // Fortnite Wooden Wall Construction
-    function buildFortniteWall(x: number, y: number, z: number, angleY: number): THREE.Group {
-      const g = new THREE.Group();
-      const woodMat = new THREE.MeshLambertMaterial({ color: 0x925f32 });
-      const woodBeamMat = new THREE.MeshLambertMaterial({ color: 0x734823 });
-
-      // Left & Right corner posts
-      const postGeo = new THREE.BoxGeometry(0.24, 2.6, 0.24);
-      const leftPost = new THREE.Mesh(postGeo, woodBeamMat);
-      leftPost.position.set(-1.48, 1.3, 0);
-      leftPost.castShadow = true;
-      leftPost.receiveShadow = true;
-      g.add(leftPost);
-
-      const rightPost = new THREE.Mesh(postGeo, woodBeamMat);
-      rightPost.position.set(1.48, 1.3, 0);
-      rightPost.castShadow = true;
-      rightPost.receiveShadow = true;
-      g.add(rightPost);
-
-      // Top header beam
-      const headerGeo = new THREE.BoxGeometry(3.2, 0.22, 0.24);
-      const header = new THREE.Mesh(headerGeo, woodBeamMat);
-      header.position.set(0, 2.5, 0);
-      header.castShadow = true;
-      header.receiveShadow = true;
-      g.add(header);
-
-      // Bottom sill beam
-      const sillGeo = new THREE.BoxGeometry(3.2, 0.18, 0.24);
-      const sill = new THREE.Mesh(sillGeo, woodBeamMat);
-      sill.position.set(0, 0.1, 0);
-      sill.castShadow = true;
-      sill.receiveShadow = true;
-      g.add(sill);
-
-      // 4 horizontal wood planks
-      const plankGeo = new THREE.BoxGeometry(2.76, 0.46, 0.14);
-      for (let p = 0; p < 4; p++) {
-        const plank = new THREE.Mesh(plankGeo, woodMat);
-        plank.position.set(p % 2 === 0 ? 0.02 : -0.02, 0.45 + p * 0.52, p % 2 === 0 ? 0.02 : -0.02);
-        plank.castShadow = true;
-        plank.receiveShadow = true;
-        g.add(plank);
+    // Fortnite Wooden Wall Construction — fully VOXEL now: the wall is
+    // nine solid wood boxes (2 posts, sill, header, mid-beam, 4 planks),
+    // each registered into the voxel grid, so bullets chip chunks out
+    // of it and grenades carve holes straight through your cover. The
+    // whole-object wallDests path is retired for player walls. Walls
+    // snap to the nearest cardinal so every panel's voxel lattice
+    // matches its visual exactly (grid-style building).
+    function buildFortniteWall(x: number, y: number, z: number, angleY: number) {
+      const ca = Math.cos(angleY);
+      const sa = Math.sin(angleY);
+      const latX = ca; // wall runs along this lateral axis
+      const latZ = -sa;
+      const o = { silent: true, vox: 0.32 };
+      // corner posts
+      for (const side of [-1, 1]) {
+        addVoxSolid(x + latX * 1.48 * side, y, y + 2.6, z + latZ * 1.48 * side, 0.24, 0.24, bmBuildBeam, angleY, o);
       }
-
-      // Diagonal cross brace (Fortnite wood style)
-      const braceGeo = new THREE.BoxGeometry(3.4, 0.15, 0.16);
-      const brace = new THREE.Mesh(braceGeo, woodBeamMat);
-      brace.position.set(0, 1.3, 0.08);
-      brace.rotation.z = Math.atan2(2.4, 2.8);
-      brace.castShadow = true;
-      brace.receiveShadow = true;
-      g.add(brace);
-
-      g.position.set(x, y, z);
-      g.rotation.y = angleY;
-      scene.add(g);
-
-      // Calculate AABB for solid collision
-      const cosA = Math.abs(Math.cos(angleY));
-      const sinA = Math.abs(Math.sin(angleY));
-      const hx = 1.6 * cosA + 0.2 * sinA;
-      const hz = 1.6 * sinA + 0.2 * cosA;
-
-      const solid: SolidBox = {
-        x,
-        z,
-        hx: Math.max(0.4, hx),
-        hz: Math.max(0.4, hz),
-        top: y + 2.6,
-        bottom: y,
-      };
-      solids.push(solid);
-      g.traverse((c) => {
-        if (c instanceof THREE.Mesh) shootable.push(c);
-      });
-
-      registerWallDest({
-        id: 'wall_' + Math.random().toString(36).slice(2, 7),
-        mesh: g,
-        solid,
-        hp: 250,
-        maxHp: 250,
-        kind: 'wood',
-        color: 0x925f32,
-        bounds: { x, y: y + 1.3, z, w: 3.2, h: 2.6, d: 0.4 },
-      });
-
+      // sill + header + mid-beam (replaces the old diagonal brace —
+      // chunky voxel walls are stack-built, not braced)
+      addVoxSolid(x, y, y + 0.18, z, 3.2, 0.24, bmBuildBeam, angleY, o);
+      addVoxSolid(x, y + 2.38, y + 2.6, z, 3.2, 0.24, bmBuildBeam, angleY, o);
+      addVoxSolid(x, y + 1.21, y + 1.36, z, 3.2, 0.16, bmBuildBeam, angleY, o);
+      // 4 horizontal wood planks
+      for (let p = 0; p < 4; p++) {
+        const y0 = y + 0.22 + p * 0.52;
+        const jx = p % 2 === 0 ? 0.02 : -0.02;
+        addVoxSolid(x + jx * latX, y0, y0 + 0.46, z + jx * latZ, 2.76, 0.14, bmBuildWood, angleY, o);
+      }
       playSfx('build');
-      return g;
     }
 
     // Build Mode State & Hologram Blueprint Preview
@@ -2148,8 +2404,10 @@ export default function BattleRoyaleGame() {
         const p = BUILD_PIECES[buildPieceIdx];
         showMessage(
           p.kind === 'auto'
-            ? '🎯 Auto build: look up = ladder · look forward = wall · look down on the ground = ramp · look down from a ramp / structure = platform. [LEFT CLICK / TAP AIM] place · [Wheel / T / double-tap WALL] pick manually · [V / RIGHT CLICK] cancel'
-            : p.icon + ' ' + p.label + ': [LEFT CLICK / TAP AIM] place (' + p.hp + ' HP) · [Wheel / T / double-tap WALL] cycle piece · [V / RIGHT CLICK] cancel',
+            ? '🎯 Auto build: look up = ladder · look straight up ON a staircase = another staircase on top · look forward = wall · look down on the ground = ramp · look down from a ramp / structure = platform. [LEFT CLICK / TAP AIM] place' +
+                (terrainOn ? ' · 🪵 ' + (PIECE_COST[resolvedBuildKind()] ?? 10) + ' wood' : '')
+            : p.icon + ' ' + p.label + ': [LEFT CLICK / TAP AIM] place (' + p.hp + ' HP voxel)' +
+                (terrainOn ? ' · 🪵 ' + (PIECE_COST[p.kind] ?? 10) + ' wood' : '') + ' · [Wheel / T / double-tap WALL] cycle piece · [V / RIGHT CLICK] cancel',
           p.kind === 'auto' ? 5 : 3.2
         );
         setPreviewGeometry(resolvedBuildKind());
@@ -2192,14 +2450,48 @@ export default function BattleRoyaleGame() {
 
     // Aim-directed building (mobile-first): the default Auto piece reads your
     // pitch and footing so ONE button covers every structure mid-fight —
+    //   look straight up ON a staircase -> another staircase stacks on top
     //   look up                     -> Ladder (bolt one onto any wall)
     //   look forward               -> Wall
     //   look down, on the ground   -> Ramp (run up it)
     //   look down, elevated / air  -> Floor platform (on a ramp, container,
     //                                 roof, or mid-air to bridge a gap)
+    const STAIR_STACK_PITCH = 1.25; // ~72° up — the straight-up zone (pitch clamps at 1.5)
+
+    // One built staircase: its step boxes + voxel lattices (so a gutted
+    // stair stops counting) and where the NEXT one continues from.
+    interface RampRec {
+      boxes: SolidBox[];
+      voxes: VoxelBox[];
+      angleY: number;
+      endX: number;
+      endZ: number;
+      topEnd: number;
+    }
+    const stairRamps: RampRec[] = [];
+
+    // Standing on a built staircase step? Returns the ramp record (its
+    // end + top continue the next staircase seamlessly) or null.
+    function onStaircase(): RampRec | null {
+      const feetY = camera.position.y - eyeH;
+      for (const rec of stairRamps) {
+        for (let i = 0; i < rec.boxes.length; i++) {
+          const v = rec.voxes[i];
+          if (!v || v.gone) continue;
+          const b = rec.boxes[i];
+          if (Math.abs(feetY - b.top) > 0.55) continue;
+          if (Math.abs(camera.position.x - b.x) > b.hx + 0.5) continue;
+          if (Math.abs(camera.position.z - b.z) > b.hz + 0.5) continue;
+          return rec;
+        }
+      }
+      return null;
+    }
+
     function resolvedBuildKind() {
       const cur = BUILD_PIECES[buildPieceIdx].kind;
       if (cur !== 'auto') return cur;
+      if (pitch > STAIR_STACK_PITCH && onStaircase()) return 'ramp'; // stack another staircase
       if (pitch > 0.5) return 'ladder';
       if (pitch > -0.45) return 'wall';
       const feetY = camera.position.y - eyeH;
@@ -2231,8 +2523,8 @@ export default function BattleRoyaleGame() {
       const stateEl = $('buildWallState');
       if (stateEl)
         stateEl.textContent = auto
-          ? p.hp + ' HP · aim decides: up = ladder · down = ramp / platform · forward = wall'
-          : p.hp + ' HP · wheel / T cycles piece';
+          ? 'Voxel ' + p.hp + ' HP' + (terrainOn ? ' · 🪵' + (PIECE_COST[resolvedBuildKind()] ?? 10) : '') + ' · up = ladder · straight-up on stairs = stack · forward = wall · down = ramp / floor'
+          : 'Voxel ' + p.hp + ' HP' + (terrainOn ? ' · 🪵' + (PIECE_COST[p.kind] ?? 10) : '') + ' · wheel / T cycles piece';
       const tIcon = $('buildPieceIcon');
       if (tIcon) tIcon.textContent = p.icon;
       const tLabel = $('buildPieceLabel');
@@ -2246,7 +2538,7 @@ export default function BattleRoyaleGame() {
         setPreviewGeometry(resolvedBuildKind());
         updateBuildHud();
         if (buildMode)
-          showMessage('🎯 Auto piece: your aim decides — up = ladder, forward = wall, down on the ground = ramp, down from a ramp / structure = platform', 2.4);
+          showMessage('🎯 Auto piece: your aim decides — up = ladder, straight-up on a staircase = stack another, forward = wall, down on the ground = ramp, down from a ramp / structure = platform', 2.4);
         return;
       }
       setPreviewGeometry(p.kind);
@@ -2254,11 +2546,25 @@ export default function BattleRoyaleGame() {
       if (buildMode) showMessage(p.icon + ' ' + p.label + ' selected (' + p.hp + ' HP) — aim & click to place', 1.8);
     }
 
-    // Player-built voxel piece (floor / ramp / door panel): a plain solid
-    // box mesh with its own AABB, registered into the voxel grid so
-    // bullets chip it and blasts carve chunks out of it.
+    // Player-built voxel piece (floor / ramp / door panel / wall plank):
+    // a plain solid box mesh with its own AABB, registered into the
+    // voxel grid so bullets chip it and blasts carve chunks out of it.
+    // `opts.tag = 'stair'` marks ramp steps so the look-straight-up
+    // stacking gesture can find them; `opts.silent` batches the build
+    // SFX for multi-piece builds; `opts.vox` picks a chunkier lattice.
     const playerBuiltVox: THREE.Mesh[] = [];
-    function addVoxSolid(x: number, y0: number, y1: number, z: number, w: number, d: number, mat: THREE.Material, angleY = 0) {
+    const stairPieces: Array<{ sb: SolidBox; vox: VoxelBox }> = [];
+    function addVoxSolid(
+      x: number,
+      y0: number,
+      y1: number,
+      z: number,
+      w: number,
+      d: number,
+      mat: THREE.Material,
+      angleY = 0,
+      opts?: { silent?: boolean; vox?: number; tag?: 'stair' }
+    ) {
       const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, y1 - y0, d), mat);
       mesh.position.set(x, (y0 + y1) / 2, z);
       mesh.rotation.y = angleY;
@@ -2275,38 +2581,51 @@ export default function BattleRoyaleGame() {
         top: y1,
         bottom: y0,
         group: scene,
+        stair: opts?.tag === 'stair',
       };
       solids.push(sb);
       shootable.push(mesh);
-      registerDestructible(sb, mesh, mat);
+      registerDestructible(sb, mesh, mat, opts?.vox);
       playerBuiltVox.push(mesh);
-      playSfx('build');
+      if (opts?.tag === 'stair' && mesh.userData.vox) stairPieces.push({ sb, vox: mesh.userData.vox });
+      if (!opts?.silent) playSfx('build');
       return mesh;
     }
 
     // Door wall: solid side panels with a passable 1.3 m gap + a header
-    // beam above it. Cover you can shoot and run through.
+    // beam above it. Cover you can shoot and run through — all voxel.
     function buildFortniteDoor(x: number, y: number, z: number, angleY: number) {
       const ca = Math.cos(angleY);
       const sa = Math.sin(angleY);
       const off = 1.125;
+      const o = { silent: true, vox: 0.32 };
       for (const side of [-1, 1]) {
-        addVoxSolid(x + ca * off * side, y, y + 2.45, z - sa * off * side, 0.95, 0.2, bmWood, angleY);
+        addVoxSolid(x + ca * off * side, y, y + 2.45, z - sa * off * side, 0.95, 0.2, bmBuildWood, angleY, o);
       }
-      addVoxSolid(x, y + 2.3, y + 2.6, z, 1.3, 0.2, bmWood, angleY);
+      addVoxSolid(x, y + 2.3, y + 2.6, z, 1.3, 0.2, bmBuildBeam, angleY, o);
+      playSfx('build');
     }
 
-    // Ramp: three axis-aligned steps of 0.35 m rise (<= step-up height),
-    // so sprinting up it just works with the stairs logic.
+    // Ramp (staircase): three axis-aligned steps of 0.35 m rise (<=
+    // step-up height), so sprinting up it just works with the stairs
+    // logic. Each ramp records its run so the look-straight-up gesture
+    // can chain the next staircase seamlessly onto this one's end.
     function buildFortniteRamp(x: number, z: number, angleY: number, feetY: number) {
       const dir = Math.abs(Math.sin(angleY)) > Math.abs(Math.cos(angleY))
         ? { x: Math.sign(Math.sin(angleY)) || 1, z: 0 }
         : { x: 0, z: Math.sign(Math.cos(angleY)) || 1 };
       const base = Math.max(feetY, groundAt(x, z) + 0.02);
+      const rec: RampRec = { boxes: [], voxes: [], angleY, endX: x + dir.x * 2.7, endZ: z + dir.z * 2.7, topEnd: base + 1.05 };
       for (let i = 0; i < 3; i++) {
         const top = base + 0.35 * (i + 1);
-        addVoxSolid(x + dir.x * 0.9 * i, top - 0.4, top, z + dir.z * 0.9 * i, dir.x ? 0.9 : 3, dir.z ? 0.9 : 3, bmPlank);
+        const m = addVoxSolid(x + dir.x * 0.9 * i, top - 0.4, top, z + dir.z * 0.9 * i, dir.x ? 0.9 : 3, dir.z ? 0.9 : 3, bmPlank, 0, { tag: 'stair' });
+        const v = m.userData.vox as VoxelBox | undefined;
+        if (v) {
+          rec.voxes.push(v);
+          rec.boxes.push(v.solidRefs[0]);
+        }
       }
+      stairRamps.push(rec);
     }
 
     // Ladder: a 45-degree rung ladder you walk straight up — rungs
@@ -2320,7 +2639,7 @@ export default function BattleRoyaleGame() {
       const sa = Math.sin(angleY);
       for (let i = 0; i < 16; i++) {
         const off = i % 2 === 0 ? -0.34 : 0.34;
-        addVoxSolid(x + sa * 0.42 * i + ca * off, base + i * 0.42, base + (i + 1) * 0.42, z + ca * 0.42 * i - sa * off, 0.85, 0.5, bmPlank, angleY);
+        addVoxSolid(x + sa * 0.42 * i + ca * off, base + i * 0.42, base + (i + 1) * 0.42, z + ca * 0.42 * i - sa * off, 0.85, 0.5, bmPlank, angleY, { silent: i > 0 });
       }
     }
 
@@ -2333,14 +2652,31 @@ export default function BattleRoyaleGame() {
       const placeDist = 2.8;
       const px = camera.position.x + forward.x * placeDist;
       const pz = camera.position.z + forward.z * placeDist;
-      const angle = Math.atan2(forward.x, forward.z);
+      const rawAngle = Math.atan2(forward.x, forward.z);
       const feetY = camera.position.y - eyeH;
       const kind = resolvedBuildKind();
       const piece = pieceFor(kind);
+      // Wooden pieces cost wood in terrain modes (Harbor): the harvest
+      // loop — chop trees, build cover. The Test Range stays free.
+      if (terrainOn) {
+        const cost = PIECE_COST[kind] ?? 10;
+        if (woodRes < cost) {
+          showMessage('🪵 Not enough wood (' + Math.floor(woodRes) + '/' + cost + ') — shoot or blast trees to harvest more!', 2.6);
+          return;
+        }
+        woodRes -= cost;
+        refreshWood();
+      }
+      // Walls + doors snap to the nearest cardinal (grid-style) so
+      // every voxel panel's lattice matches its visual exactly.
+      const snapCard = (a: number) => Math.round(a / (Math.PI / 2)) * (Math.PI / 2);
+      const angle = kind === 'wall' || kind === 'door' ? snapCard(rawAngle) : rawAngle;
+      const rampUnderfoot = onStaircase();
+      const stacking = kind === 'ramp' && pitch > STAIR_STACK_PITCH && !!rampUnderfoot;
 
       if (kind === 'wall') {
         buildFortniteWall(px, groundAt(px, pz), pz, angle);
-        showMessage('🧱 Wall deployed! (' + piece.hp + ' HP) Take cover from gunfire & grenades!', 2.5);
+        showMessage('🧱 Wall deployed! (' + piece.hp + ' HP, voxel) Take cover — bullets chip it, grenades carve it!', 2.5);
       } else if (kind === 'door') {
         buildFortniteDoor(px, groundAt(px, pz), pz, angle);
         showMessage('🚪 Door wall up! Cover with a doorway you control!', 2.5);
@@ -2351,6 +2687,11 @@ export default function BattleRoyaleGame() {
       } else if (kind === 'ladder') {
         buildFortniteLadder(px, pz, angle, feetY);
         showMessage('🪜 Ladder placed! Walk in and keep moving — you climb it like a stair!', 2.5);
+      } else if (stacking && rampUnderfoot) {
+        // Continue THIS staircase: the next one starts where it ends, at
+        // its top — walk straight up the chain into the sky.
+        buildFortniteRamp(rampUnderfoot.endX, rampUnderfoot.endZ, rampUnderfoot.angleY, rampUnderfoot.topEnd);
+        showMessage('📐 Another staircase stacks on top — keep climbing!', 2.5);
       } else {
         buildFortniteRamp(px, pz, angle, feetY);
         showMessage('📐 Ramp placed! Run up onto roofs and containers!', 2.5);
@@ -2448,7 +2789,10 @@ export default function BattleRoyaleGame() {
           const py = groundAt(px, pz);
           previewMesh.position.set(px, py + 1.3, pz);
         }
-        previewMesh.rotation.y = Math.atan2(forward.x, forward.z);
+        previewMesh.rotation.y =
+          kind === 'wall' || kind === 'door'
+            ? Math.round(Math.atan2(forward.x, forward.z) / (Math.PI / 2)) * (Math.PI / 2) // match the grid-snapped build
+            : Math.atan2(forward.x, forward.z);
       }
     }
 
@@ -3656,12 +4000,17 @@ export default function BattleRoyaleGame() {
 
     const bmPlank = new THREE.MeshLambertMaterial({ color: 0x8a6a3f });
     const bmPlankDark = new THREE.MeshLambertMaterial({ color: 0x6d5230 });
+    // Player-built wall / door wood (voxel walls, beams + planks)
+    const bmBuildWood = new THREE.MeshLambertMaterial({ color: 0x925f32 });
+    const bmBuildBeam = new THREE.MeshLambertMaterial({ color: 0x734823 });
     const bmContainerRed = new THREE.MeshLambertMaterial({ color: 0x9c3b30 });
     const bmContainerBlue = new THREE.MeshLambertMaterial({ color: 0x2d5f8a });
     const bmContainerGreen = new THREE.MeshLambertMaterial({ color: 0x3e7a4a });
     const bmContainerOrange = new THREE.MeshLambertMaterial({ color: 0xb06a28 });
     voxHpMap.set(bmPlank, 70);
     voxHpMap.set(bmPlankDark, 90);
+    voxHpMap.set(bmBuildWood, 40);
+    voxHpMap.set(bmBuildBeam, 55);
     voxHpMap.set(bmContainerRed, 230);
     voxHpMap.set(bmContainerBlue, 230);
     voxHpMap.set(bmContainerGreen, 230);
@@ -4863,6 +5212,307 @@ export default function BattleRoyaleGame() {
       }
     }
 
+    // ----------------------------------------------------
+    // WAR DECORATIONS — battlefield dressing scattered across the
+    // whole island, deliberately NOT tied to any POI: tanks, troop
+    // trucks, helicopters, artillery pieces, sandbag emplacements,
+    // fallen skeletons and ammo-crate stacks. Seeded per map; the
+    // heavy pieces are voxel-destructible scenery (bullets chip,
+    // grenades gut them), the skeletons are quiet set dressing.
+    // ----------------------------------------------------
+    interface WarProp {
+      kind: string;
+      x: number;
+      z: number;
+      group: THREE.Group;
+    }
+    const warProps: WarProp[] = [];
+    const warZones: Array<{ x: number; z: number; r: number }> = [];
+    const bmArmyGreen = new THREE.MeshLambertMaterial({ color: 0x4a5240 });
+    const bmArmyDark = new THREE.MeshLambertMaterial({ color: 0x333a2e });
+    const bmArmyRust = new THREE.MeshLambertMaterial({ color: 0x6e5138 });
+    const bmSandbag = new THREE.MeshLambertMaterial({ color: 0x9c8a5e });
+    const bmBone = new THREE.MeshLambertMaterial({ color: 0xd8d3c4 });
+    voxHpMap.set(bmArmyGreen, 60); // scenery-grade: a grenade visibly chunks a wreck
+    voxHpMap.set(bmArmyDark, 70);
+    voxHpMap.set(bmArmyRust, 50);
+    voxHpMap.set(bmSandbag, 40);
+    voxHpMap.set(bmBone, 40);
+
+    // One rotated, voxel-destructible box of a war prop. Local (lx, lz)
+    // around the prop origin, heights above the ground; the AABB grows
+    // to cover the yaw like every built piece does.
+    function warBox(
+      g: THREE.Group,
+      ox: number,
+      oz: number,
+      gy: number,
+      lx: number,
+      y0: number,
+      y1: number,
+      lz: number,
+      w: number,
+      d: number,
+      mat: THREE.Material,
+      yaw: number,
+      voxSize = 0.55
+    ) {
+      const ca = Math.cos(yaw);
+      const sa = Math.sin(yaw);
+      const x = ox + lx * ca - lz * sa;
+      const z = oz + lx * sa + lz * ca;
+      const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, y1 - y0, d), mat);
+      mesh.position.set(x, gy + (y0 + y1) / 2, z);
+      mesh.rotation.y = yaw;
+      mesh.castShadow = true;
+      mesh.receiveShadow = true;
+      g.add(mesh);
+      const sb: SolidBox = {
+        x,
+        z,
+        hx: Math.max(0.1, (w / 2) * Math.abs(ca) + (d / 2) * Math.abs(sa)),
+        hz: Math.max(0.1, (w / 2) * Math.abs(sa) + (d / 2) * Math.abs(ca)),
+        top: gy + y1,
+        bottom: gy + y0,
+        group: g,
+      };
+      solids.push(sb);
+      shootable.push(mesh);
+      registerDestructible(sb, mesh, mat, voxSize);
+    }
+
+    // Main battle tank: twin tracks, hull, stepped glacis, turret,
+    // gun + muzzle brake, rear stowage. (War-prop tank — the port's
+    // fuel-tank "buildTank" is a different builder.)
+    function buildWarTank(g: THREE.Group, ox: number, oz: number, gy: number, yaw: number) {
+      for (const side of [-1, 1]) {
+        warBox(g, ox, oz, gy, 0, 0, 0.92, side * 1.28, 6.2, 0.95, bmArmyDark, yaw, 0.6);
+      }
+      warBox(g, ox, oz, gy, 0, 0.85, 1.75, 0, 5.4, 2.4, bmArmyGreen, yaw, 0.6);
+      warBox(g, ox, oz, gy, 2.95, 0.85, 1.45, 0, 0.7, 2.2, bmArmyGreen, yaw, 0.55);
+      warBox(g, ox, oz, gy, -0.45, 1.75, 2.45, 0, 2.5, 1.9, bmArmyGreen, yaw, 0.6);
+      warBox(g, ox, oz, gy, -0.85, 2.45, 2.75, 0.35, 0.6, 0.6, bmArmyDark, yaw, 0.5);
+      warBox(g, ox, oz, gy, 2.35, 2.0, 2.16, 0, 2.9, 0.22, bmArmyDark, yaw, 0.5);
+      warBox(g, ox, oz, gy, 3.9, 1.98, 2.18, 0, 0.36, 0.3, bmArmyDark, yaw, 0.45);
+      warBox(g, ox, oz, gy, -2.75, 1.78, 2.42, 0, 0.9, 1.9, bmArmyRust, yaw, 0.5);
+    }
+
+    // Troop truck: 6 wheels, chassis, cab, canvas cargo tilt.
+    function buildWarTruck(g: THREE.Group, ox: number, oz: number, gy: number, yaw: number) {
+      for (const side of [-1, 1]) {
+        for (const wx of [-2.0, -0.4, 2.2]) {
+          warBox(g, ox, oz, gy, wx, -0.05, 0.75, side * 1.15, 1.1, 0.7, bmArmyDark, yaw, 0.5);
+        }
+      }
+      warBox(g, ox, oz, gy, 0, 0.6, 1.05, 0, 5.6, 2.1, bmArmyDark, yaw, 0.55);
+      warBox(g, ox, oz, gy, 1.85, 1.05, 2.3, 0, 1.5, 1.95, bmArmyGreen, yaw, 0.55);
+      warBox(g, ox, oz, gy, 2.58, 1.7, 2.15, 0, 0.12, 1.7, bmArmyDark, yaw, 0.45);
+      warBox(g, ox, oz, gy, -0.95, 1.05, 2.75, 0, 3.6, 2.15, bmArmyGreen, yaw, 0.55);
+      warBox(g, ox, oz, gy, -0.95, 2.75, 2.95, 0, 3.2, 1.8, bmArmyGreen, yaw, 0.5);
+    }
+
+    // Gunship helicopter: skids, tail boom + fin, fuselage, glass
+    // band, rotor mast with crossed blades, stub weapon wings.
+    function buildHelicopter(g: THREE.Group, ox: number, oz: number, gy: number, yaw: number) {
+      for (const side of [-1, 1]) {
+        warBox(g, ox, oz, gy, 0, 0.15, 0.5, side * 1.05, 3.6, 0.18, bmArmyDark, yaw, 0.5);
+        for (const sx of [-1.2, 1.2]) {
+          warBox(g, ox, oz, gy, sx, 0.5, 0.78, side * 1.05, 0.16, 0.16, bmArmyDark, yaw, 0.4);
+        }
+      }
+      warBox(g, ox, oz, gy, -3.3, 0.9, 1.3, 0, 4.4, 0.5, bmArmyGreen, yaw, 0.6);
+      warBox(g, ox, oz, gy, -5.15, 1.2, 2.1, 0, 0.5, 0.16, bmArmyGreen, yaw, 0.5);
+      warBox(g, ox, oz, gy, -5.05, 1.25, 2.35, 0, 0.16, 1.3, bmArmyDark, yaw, 0.4);
+      warBox(g, ox, oz, gy, 0.6, 0.75, 2.05, 0, 3.3, 1.7, bmArmyGreen, yaw, 0.6);
+      warBox(g, ox, oz, gy, 2.1, 1.25, 1.95, 0, 0.5, 1.5, bmArmyDark, yaw, 0.5);
+      warBox(g, ox, oz, gy, 0.5, 2.05, 2.5, 0, 0.35, 0.35, bmArmyDark, yaw, 0.4);
+      for (const a of [yaw, yaw + Math.PI / 2]) {
+        warBox(g, ox, oz, gy, 0.5, 2.5, 2.62, 0, 7.4, 0.34, bmArmyDark, a, 0.5);
+      }
+      for (const side of [-1, 1]) {
+        warBox(g, ox, oz, gy, 0.9, 1.7, 1.95, side * 1.35, 0.5, 0.3, bmArmyGreen, yaw, 0.45);
+      }
+    }
+
+    // Field artillery: split trail, wheels, gun shield, stepped barrel.
+    function buildArtillery(g: THREE.Group, ox: number, oz: number, gy: number, yaw: number) {
+      for (const side of [-1, 1]) {
+        warBox(g, ox, oz, gy, -2.2, 0.35, 0.85, side * 0.8, 3.2, 0.45, bmArmyDark, yaw, 0.45);
+        warBox(g, ox, oz, gy, 0, -0.35, 0.75, side * 1.45, 1.3, 0.75, bmArmyDark, yaw, 0.45);
+      }
+      warBox(g, ox, oz, gy, 0, 0.45, 0.8, 0, 1.0, 2.6, bmArmyDark, yaw, 0.45);
+      warBox(g, ox, oz, gy, 0.75, 0.8, 1.85, 0, 0.22, 2.3, bmArmyGreen, yaw, 0.45);
+      warBox(g, ox, oz, gy, 1.6, 1.15, 1.5, 0, 1.7, 0.3, bmArmyDark, yaw, 0.45);
+      warBox(g, ox, oz, gy, 2.4, 1.42, 1.72, 0, 1.5, 0.26, bmArmyDark, yaw, 0.45);
+      warBox(g, ox, oz, gy, 3.6, 1.66, 1.86, 0, 1.3, 0.22, bmArmyDark, yaw, 0.4);
+      warBox(g, ox, oz, gy, 4.2, 1.66, 1.86, 0, 0.34, 0.34, bmArmyDark, yaw, 0.4);
+    }
+
+    // Sandbag emplacement: a staggered L of khaki bags.
+    function buildSandbags(g: THREE.Group, ox: number, oz: number, gy: number, yaw: number, rnd: () => number) {
+      const bag = (lx: number, y0: number, y1: number, lz: number) =>
+        warBox(g, ox, oz, gy, lx + (rnd() - 0.5) * 0.12, y0, y1, lz + (rnd() - 0.5) * 0.12, 0.92, 0.55, bmSandbag, yaw, 0.45);
+      for (let i = 0; i < 5; i++) {
+        const lx = -2 + i;
+        bag(lx, 0, 0.4, 0);
+        if (i < 4) bag(lx + 0.5, 0.4, 0.78, 0);
+        if (i < 3) bag(lx + 0.25, 0.78, 1.12, 0);
+      }
+      for (let j = 1; j <= 3; j++) {
+        bag(-2, 0, 0.4, j);
+        if (j < 3) bag(-2, 0.4, 0.78, j + 0.5);
+      }
+    }
+
+    // Fallen soldier: a flat skeleton laid out on the ground — skull,
+    // spine, ribs, pelvis, splayed arms and legs, one merged quiet
+    // mesh (no collision, no damage, just a story).
+    function buildSkeleton(g: THREE.Group, ox: number, oz: number, gy: number, yaw: number) {
+      const parts: Array<{ geo: THREE.BufferGeometry; mat: THREE.Matrix4; color: number }> = [];
+      const P = (geo: THREE.BufferGeometry, x: number, y: number, z: number, color: number, ry = 0) => ({
+        geo,
+        mat: vegMat4(x, y, z, 0, ry),
+        color,
+      });
+      const bone = 0xd8d3c4;
+      const boneD = 0xc9c2b0;
+      parts.push(P(new THREE.BoxGeometry(0.3, 0.3, 0.3), 1.05, 0.16, 0, bone));
+      parts.push(P(new THREE.BoxGeometry(0.2, 0.1, 0.18), 1.05, 0.03, 0.02, boneD));
+      for (let i = 0; i < 4; i++) parts.push(P(new THREE.BoxGeometry(0.34, 0.12, 0.2), 0.55 - i * 0.34, 0.12, 0, boneD));
+      for (let i = 0; i < 3; i++) parts.push(P(new THREE.BoxGeometry(0.3, 0.16, 0.5), 0.45 - i * 0.32, 0.14, 0, bone));
+      parts.push(P(new THREE.BoxGeometry(0.36, 0.14, 0.34), -0.75, 0.1, 0, boneD));
+      parts.push(P(new THREE.BoxGeometry(0.14, 0.12, 0.8), 0.35, 0.1, 0.42, bone, 0.5));
+      parts.push(P(new THREE.BoxGeometry(0.14, 0.12, 0.75), 0.3, 0.1, -0.4, bone, -0.7));
+      parts.push(P(new THREE.BoxGeometry(0.9, 0.13, 0.15), -1.25, 0.09, 0.18, bone, 0.25));
+      parts.push(P(new THREE.BoxGeometry(0.85, 0.13, 0.15), -1.2, 0.09, -0.2, bone, -0.15));
+      parts.push(P(new THREE.BoxGeometry(0.14, 0.24, 0.4), -1.7, 0.1, 0.14, boneD, 0.2));
+      parts.push(P(new THREE.BoxGeometry(0.14, 0.24, 0.38), -1.62, 0.1, -0.18, boneD, -0.1));
+      const def = vegMerge(parts);
+      const P2: number[] = [];
+      const N2: number[] = [];
+      const C2: number[] = [];
+      stampVeg(def, ox, gy - 0.04, oz, yaw, 1, 1, P2, N2, C2);
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(P2), 3));
+      geo.setAttribute('normal', new THREE.BufferAttribute(new Float32Array(N2), 3));
+      geo.setAttribute('color', new THREE.BufferAttribute(new Float32Array(C2), 3));
+      const mesh = new THREE.Mesh(geo, vegMat);
+      mesh.castShadow = true;
+      g.add(mesh);
+    }
+
+    // Ammo crate stack: 4-6 olive crates, jittered.
+    function buildAmmoCrates(g: THREE.Group, ox: number, oz: number, gy: number, yaw: number, rnd: () => number) {
+      const n = 4 + Math.floor(rnd() * 3);
+      let i = 0;
+      for (let row = 0; row < 3 && i < n; row++) {
+        for (let col = 0; col < 2 && i < n; col++) {
+          warBox(
+            g,
+            ox,
+            oz,
+            gy,
+            (col - 0.5) * 1.0 + (rnd() - 0.5) * 0.15,
+            row * 0.62,
+            row * 0.62 + 0.58,
+            (rnd() - 0.5) * 0.5,
+            1.0,
+            0.72,
+            bmArmyGreen,
+            yaw + (rnd() - 0.5) * 0.3,
+            0.45
+          );
+          i++;
+        }
+      }
+    }
+
+    const WAR_PROP_PLAN: Array<{ kind: string; n: number; r: number }> = [
+      { kind: 'tank', n: 8, r: 6 },
+      { kind: 'truck', n: 10, r: 5.5 },
+      { kind: 'helicopter', n: 5, r: 7 },
+      { kind: 'artillery', n: 5, r: 5 },
+      { kind: 'sandbags', n: 10, r: 4 },
+      { kind: 'skeleton', n: 18, r: 2 },
+      { kind: 'ammo', n: 8, r: 3 },
+    ];
+
+    function generateWarProps() {
+      const rnd = mulberry32((terrainSeed ^ 0x5e17a11) >>> 0);
+      for (const plan of WAR_PROP_PLAN) {
+        for (let i = 0; i < plan.n; i++) {
+          for (let t = 0; t < 90; t++) {
+            const x = (rnd() * 2 - 1) * (HARBOR_HALF - 80);
+            const z = (rnd() * 2 - 1) * (HARBOR_HALF - 80);
+            if (Math.hypot(x - HARBOR_SPAWN.x, z - HARBOR_SPAWN.z) < 45) continue; // spawn stays clean
+            if (seaDist(x, z) > -60) continue; // inland of the beach band
+            if (harborAnchor && Math.hypot(x - harborAnchor.x, z - harborAnchor.z) < portClearR + 40) continue; // port owns the coast
+            if (flatZones.some((f) => Math.hypot(x - f.x, z - f.z) < f.r + 14)) continue; // never on a POI pad
+            if (warZones.some((w) => Math.hypot(x - w.x, z - w.z) < w.r + 18)) continue; // spread out
+            const gy = terrainHeight(x, z);
+            if (gy < WATER_Y + 0.8) continue;
+            const spread = Math.max(
+              Math.abs(terrainHeight(x + 4, z) - gy),
+              Math.abs(terrainHeight(x - 4, z) - gy),
+              Math.abs(terrainHeight(x, z + 4) - gy),
+              Math.abs(terrainHeight(x, z - 4) - gy)
+            );
+            if (spread > 4.5) continue; // heavy props sit on flat-enough ground
+            const yaw = rnd() * Math.PI * 2;
+            const g = new THREE.Group();
+            scene.add(g);
+            if (plan.kind === 'tank') buildWarTank(g, x, z, gy, yaw);
+            else if (plan.kind === 'truck') buildWarTruck(g, x, z, gy, yaw);
+            else if (plan.kind === 'helicopter') buildHelicopter(g, x, z, gy, yaw);
+            else if (plan.kind === 'artillery') buildArtillery(g, x, z, gy, yaw);
+            else if (plan.kind === 'sandbags') buildSandbags(g, x, z, gy, yaw, rnd);
+            else if (plan.kind === 'ammo') buildAmmoCrates(g, x, z, gy, yaw, rnd);
+            else if (plan.kind === 'skeleton') buildSkeleton(g, x, z, gy, yaw);
+            warProps.push({ kind: plan.kind, x, z, group: g });
+            warZones.push({ x, z, r: plan.r });
+            break;
+          }
+        }
+      }
+    }
+
+    function clearWarProps() {
+      for (const p of warProps) {
+        const g = p.group;
+        for (let i = voxBoxes.length - 1; i >= 0; i--) {
+          const v = voxBoxes[i];
+          if (v.group !== g) continue;
+          if (v.inst) {
+            v.group.remove(v.inst);
+            const si = shootable.indexOf(v.inst);
+            if (si >= 0) shootable.splice(si, 1);
+            v.inst.geometry.dispose();
+            (v.inst.material as THREE.Material).dispose();
+            v.inst.dispose();
+            v.inst = null;
+          }
+          if (v.barGroup) {
+            disposeBar(v.barGroup);
+            v.barGroup = null;
+            v.barFill = null;
+          }
+          voxBoxes.splice(i, 1);
+        }
+        for (let i = shootable.length - 1; i >= 0; i--) {
+          if ((shootable[i] as THREE.Object3D).parent === g) shootable.splice(i, 1);
+        }
+        for (let i = solids.length - 1; i >= 0; i--) {
+          if (solids[i].group === g) solids.splice(i, 1);
+        }
+        g.traverse((o: any) => {
+          if (o.isMesh) o.geometry?.dispose?.();
+        });
+        scene.remove(g);
+      }
+      warProps.length = 0;
+      warZones.length = 0;
+    }
+
     // Loot spawner shared by POIs and the port (poiId -1 = port).
     function poiLoot(kinds: string[], cx: number, cz: number, radius: number, gy: number, poiId: number, rnd: () => number) {
       for (const kind of kinds) {
@@ -5176,6 +5826,7 @@ export default function BattleRoyaleGame() {
       for (const p of pois) dismantlePoi(p);
       pois.length = 0;
       flatZones.length = 0;
+      clearWarProps(); // scattered war dressing belongs to the map too
       // POI pickups (incl. the port's, id -1) live in the scene
       for (let i = pickups.length - 1; i >= 0; i--) {
         if ((pickups[i].group.userData as any).poi !== undefined) {
@@ -5233,6 +5884,9 @@ export default function BattleRoyaleGame() {
       planHarbor();
       generatePois();
       generatePaths(); // road network paints onto the tiles as they stream
+      generateWarProps(); // scattered battlefield dressing, clear of POIs
+      woodRes = 60; // fresh harvest purse per match
+      refreshWood();
       streamTerrain(true);
       // Harbor infrastructure: pier over the sea, container yard,
       // warehouses, crane, customs office, fuel tanks, dry dock,
@@ -5263,31 +5917,42 @@ export default function BattleRoyaleGame() {
     const HARBOR_PATROLS = 8;
     function spawnHarborPatrols() {
       let placed = 0;
-      for (let t = 0; placed < HARBOR_PATROLS && t < 600; t++) {
-        const a = Math.random() * Math.PI * 2;
-        const r = 55 + Math.random() * 130;
-        const x = HARBOR_SPAWN.x + Math.cos(a) * r;
-        const z = HARBOR_SPAWN.z + Math.sin(a) * r;
-        if (terrainHeight(x, z) < WATER_Y + 0.5) continue; // land only
-        // never inside the port platform itself — patrols belong on
-        // the island, not wedged between warehouse walls
-        if (
-          portPlan &&
-          x > portPlan.cx - portPlan.L / 2 - 12 &&
-          x < portPlan.cx + portPlan.L / 2 + 12 &&
-          z > portPlan.cz - portPlan.D / 2 - 12 &&
-          z < portPlan.cz + portPlan.D / 2 + 12
-        )
-          continue;
-        if (!aiFree(x, z, null)) continue;
-        if (dummies.some((o) => Math.hypot(o.group.position.x - x, o.group.position.z - z) < 30)) continue;
-        const d = spawnDummy(x, z, true, true);
-        // The flat range world group is hidden in Harbor: patrols live
-        // on the scene and ride the streamed terrain mesh.
-        world.remove(d.group);
-        scene.add(d.group);
-        d.group.position.set(x, Math.max(groundAt(x, z), WATER_Y), z);
-        placed += 1;
+      // Ring pass 1 (55-185 m) keeps patrols near the action, but on some
+      // seeds the port platform + sea swallow the whole ring — pass 2
+      // escalates outward (200-460 m) so the island is never empty.
+      for (const [r0, r1, tries] of [
+        [55, 185, 600],
+        [200, 460, 900],
+      ] as const) {
+        for (let t = 0; placed < HARBOR_PATROLS && t < tries; t++) {
+          const a = Math.random() * Math.PI * 2;
+          const r = r0 + Math.random() * (r1 - r0);
+          const x = HARBOR_SPAWN.x + Math.cos(a) * r;
+          const z = HARBOR_SPAWN.z + Math.sin(a) * r;
+          if (terrainHeight(x, z) < WATER_Y + 0.5) continue; // land only
+          // never inside the port platform itself — patrols belong on
+          // the island, not wedged between warehouse walls
+          if (
+            portPlan &&
+            x > portPlan.cx - portPlan.L / 2 - 12 &&
+            x < portPlan.cx + portPlan.L / 2 + 12 &&
+            z > portPlan.cz - portPlan.D / 2 - 12 &&
+            z < portPlan.cz + portPlan.D / 2 + 12
+          )
+            continue;
+          if (!aiFree(x, z, null)) continue;
+          // never inside a war decoration — no patrol wedged in a tank hull
+          if (warZones.some((w) => Math.hypot(x - w.x, z - w.z) < w.r + 2)) continue;
+          if (dummies.some((o) => Math.hypot(o.group.position.x - x, o.group.position.z - z) < 30)) continue;
+          const d = spawnDummy(x, z, true, true);
+          // The flat range world group is hidden in Harbor: patrols live
+          // on the scene and ride the streamed terrain mesh.
+          world.remove(d.group);
+          scene.add(d.group);
+          d.group.position.set(x, Math.max(groundAt(x, z), WATER_Y), z);
+          placed += 1;
+        }
+        if (placed >= HARBOR_PATROLS) break;
       }
     }
 
@@ -5499,6 +6164,7 @@ export default function BattleRoyaleGame() {
     function startGame() {
       if (selectedMode === 'harbor') enterHarbor();
       else if (selectedMode !== 'range') return;
+      else refreshWood(); // Test Range: free builds — hide the wood plate
       if (menuEl) menuEl.hidden = true;
       canvas?.requestPointerLock?.()?.catch?.(() => {});
     }
@@ -5663,6 +6329,114 @@ export default function BattleRoyaleGame() {
             pathAt: (x: number, z: number) => {
               const np = nearPath(x, z);
               return np ? { d: +np.d.toFixed(1), w: +np.w.toFixed(1), kind: np.kind } : null;
+            },
+            wood: () => Math.floor(woodRes),
+            addWood: (n: number) => {
+              woodRes = Math.max(0, woodRes + n);
+              refreshWood();
+              return Math.floor(woodRes);
+            },
+            // Replay the patrol-placement predicates and report why each
+            // candidate fails (e2e diagnostics for empty patrol spawns).
+            patrolProbe: () => {
+              const why = { sea: 0, port: 0, ai: 0, war: 0, close: 0, ok: 0 };
+              let firstOk: { x: number; z: number } | null = null;
+              for (let t = 0; t < 600; t++) {
+                const a = Math.random() * Math.PI * 2;
+                const r = 55 + Math.random() * 130;
+                const x = HARBOR_SPAWN.x + Math.cos(a) * r;
+                const z = HARBOR_SPAWN.z + Math.sin(a) * r;
+                if (terrainHeight(x, z) < WATER_Y + 0.5) {
+                  why.sea++;
+                  continue;
+                }
+                if (
+                  portPlan &&
+                  x > portPlan.cx - portPlan.L / 2 - 12 &&
+                  x < portPlan.cx + portPlan.L / 2 + 12 &&
+                  z > portPlan.cz - portPlan.D / 2 - 12 &&
+                  z < portPlan.cz + portPlan.D / 2 + 12
+                ) {
+                  why.port++;
+                  continue;
+                }
+                if (!aiFree(x, z, null)) {
+                  why.ai++;
+                  continue;
+                }
+                if (warZones.some((w) => Math.hypot(x - w.x, z - w.z) < w.r + 2)) {
+                  why.war++;
+                  continue;
+                }
+                if (dummies.some((o) => Math.hypot(o.group.position.x - x, o.group.position.z - z) < 30)) {
+                  why.close++;
+                  continue;
+                }
+                why.ok++;
+                if (!firstOk) firstOk = { x: +x.toFixed(1), z: +z.toFixed(1) };
+              }
+              return { why, firstOk, spawn: { x: +HARBOR_SPAWN.x.toFixed(0), z: +HARBOR_SPAWN.z.toFixed(0) }, live: dummies.length };
+            },
+            warProps: () => {
+              const byKind: Record<string, number> = {};
+              for (const p of warProps) byKind[p.kind] = (byKind[p.kind] || 0) + 1;
+              return {
+                total: warProps.length,
+                byKind,
+                sample: warProps.slice(0, 6).map((p) => ({ kind: p.kind, x: +p.x.toFixed(0), z: +p.z.toFixed(0), boxes: p.group.children.length })),
+                inWater: warProps.filter((p) => terrainHeight(p.x, p.z) < WATER_Y).length,
+                onPoi: warProps.filter((p) => flatZones.some((f) => Math.hypot(p.x - f.x, p.z - f.z) < f.r)).length,
+              };
+            },
+            // Nearest destructible tree lattices — harvest e2e teleports
+            // next to one and shootPoints its trunk.
+            trees: (n = 12) => {
+              const list = voxBoxes
+                .filter((v) => v.gain > 0)
+                .map((v) => {
+                  const cx = v.x0 + (v.nx * v.sx) / 2;
+                  const cz = v.z0 + (v.nz * v.sz) / 2;
+                  return {
+                    x: +cx.toFixed(1),
+                    z: +cz.toFixed(1),
+                    base: +v.y0.toFixed(1),
+                    top: +(v.y0 + v.ny * v.sy).toFixed(1),
+                    alive: v.aliveCount,
+                    total: v.total,
+                    inst: !!v.inst,
+                    gone: v.gone,
+                    d: Math.round(Math.hypot(cx - camera.position.x, cz - camera.position.z)),
+                  };
+                })
+                .sort((a, b) => a.d - b.d);
+              return { count: list.length, nearest: list.slice(0, n) };
+            },
+            // Atomic e2e: aim at a world point, run the full shoot()
+            // cut pipeline and — when the line is clean — fire for real.
+            // Used to prove bullets chip voxel trees / war props.
+            shootPoint: (x: number, y: number, z: number) => {
+              const dx = x - camera.position.x;
+              const dz = z - camera.position.z;
+              const dist = Math.max(2, Math.hypot(dx, dz));
+              yaw = Math.atan2(-dx, -dz);
+              pitch = Math.atan2(y - camera.position.y, dist);
+              applyView();
+              raycaster.setFromCamera(centre, camera);
+              const hit = raycaster.intersectObjects(nearShootable(170), false)[0];
+              if (!hit) return { saw: false, vox: false, fired: false, reason: 'no-hit' };
+              const vox = !!hit.object.userData.vox;
+              if (shotCut(raycaster.ray, hit.distance) < hit.distance) return { saw: true, vox, fired: false, reason: 'structure' };
+              if (vegCut(raycaster.ray.origin, raycaster.ray.direction, hit.distance) < hit.distance) return { saw: true, vox, fired: false, reason: 'veg' };
+              if (smokeDist(raycaster.ray.origin, raycaster.ray.direction, hit.distance) < Infinity) return { saw: true, vox, fired: false, reason: 'smoke' };
+              const w = current;
+              const can = !!w && w.loaded > 0 && cooldown <= 0 && reloadT <= 0 && !roll && !buildMode && !gArmed && !bombArmed;
+              shoot();
+              return { saw: true, vox, fired: can, d: +hit.distance.toFixed(1) };
+            },
+            // Debug grenade: carve trees / walls / props without the throw
+            blastAt: (x: number, z: number, r = 7, dmg = 120, y?: number) => {
+              explode(x, z, r, dmg, 0, undefined, undefined, y);
+              return true;
             },
             dummiesInfo: () =>
               dummies.map((d) => ({
@@ -10180,6 +10954,16 @@ export default function BattleRoyaleGame() {
         </div>
       </div>
 
+      {/* Wood purse — harvested from voxelized trees, spent on builds */}
+      <div className="hud gplate woodplate" id="woodPlate" hidden>
+        <div className="t-name">
+          Wood <span id="woodCount">60</span>
+        </div>
+        <div className="t-state" id="woodHint">
+          chop trees to build
+        </div>
+      </div>
+
       {/* Fortnite Build Plate (Desktop) */}
       <button
         type="button"
@@ -10769,8 +11553,17 @@ export default function BattleRoyaleGame() {
               Dust, mud and gravel transition routes stitch the port gate to every POI — follow the tan / brown corridors through the biomes instead of bushwhacking, and watch for them on the tactical map
             </li>
             <li>
-              <kbd>V</kbd> opens build mode. The default <b>Auto</b> piece reads your aim: look <b>up</b> = <b>Ladder</b>, look <b>down on the ground</b> = <b>Ramp</b>, look <b>forward</b> = <b>Wall</b>, look <b>down while on a ramp / roof / container</b> (or mid-air) = <b>Platform</b>. <kbd>T</kbd> or the mouse wheel cycles manual pieces — <b>Wall</b>, <b>Door Wall</b>, <b>Floor</b>, <b>Ramp</b>, <b>Ladder</b>; <kbd>Left click</kbd> places. Wall and Door
-              stop gunfire and blasts until they shatter; Floors bridge water; Ramps run you onto roofs; Ladders climb any wall — walk into them and keep moving
+              <b>Every tree is voxelized.</b> Shoot or blast a trunk and the crown chews away into chunky wood voxels — each one knocked loose pays <b>wood</b> into your purse (top left of the build plate). Grenades carve whole handfuls at once
+            </li>
+            <li>
+              <b>Wooden builds cost wood</b> in Harbor — wall 10, door 12, floor 10, ramp 10, ladder 15. You start with 60; chop trees to keep building
+            </li>
+            <li>
+              <b>War leftovers litter the island</b> — tanks, troop trucks, helicopters, artillery, sandbag lines and fallen soldiers, deliberately far from any POI. The heavy wrecks are destructible cover: chip them, grenade them
+            </li>
+            <li>
+              <kbd>V</kbd> opens build mode. The default <b>Auto</b> piece reads your aim: look <b>straight up while standing on a staircase</b> = <b>another staircase stacks on top</b> (chain them into the sky!), look <b>up</b> = <b>Ladder</b>, look <b>down on the ground</b> = <b>Ramp</b>, look <b>forward</b> = <b>Wall</b>, look <b>down while on a ramp / roof / container</b> (or mid-air) = <b>Platform</b>. <kbd>T</kbd> or the mouse wheel cycles manual pieces — <b>Wall</b>, <b>Door Wall</b>, <b>Floor</b>, <b>Ramp</b>, <b>Ladder</b>; <kbd>Left click</kbd> places. Walls and Doors
+              are voxel now — bullets chip chunks out of them and grenades carve holes straight through; Floors bridge water; Ramps run you onto roofs; Ladders climb any wall — walk into them and keep moving
             </li>
             <li>Bullets lose power with range: SMG past 20 m, SK past 60 m, sniper past 200 m</li>
             <li>Shield takes hits first, then life. It recharges after 6 s without damage</li>
@@ -10801,8 +11594,10 @@ export default function BattleRoyaleGame() {
             <li>Tap slider to jump. Slide left/right to roll, down to crouch — while running it slides</li>
             <li>Tap GRENADE to arm, tap AIM to throw. Hold GRENADE and slide up to pick kind</li>
             <li>
-              Tap WALL to arm build mode, then tap AIM to place. Auto reads your aim — look up = ladder, look down on the ground = ramp, look forward = wall, look down from a ramp / roof = platform. Double-tap WALL to cycle pieces manually
+              Tap WALL to arm build mode, then tap AIM to place. Auto reads your aim — look straight up on a staircase = another staircase on top, look up = ladder, look down on the ground = ramp, look forward = wall, look down from a ramp / roof = platform. Double-tap WALL to cycle pieces manually
             </li>
+            <li>Trees are voxelized: shoot or blast them for WOOD — the fuel for every wooden build (the plate under the minimap shows your purse)</li>
+            <li>War wrecks — tanks, trucks, helicopters, skeletons — dot the island away from the POIs. They are destructible cover</li>
             <li>Wade into the sea: you slow down, then swim. Hold crouch to dive, tap jump to stroke up</li>
             <li>The top compass shows the nearest landmarks with distances — edge-pinned chips show which way to turn. Follow the port chips (PIER, YARD, DOCK, LIGHT) for the best loot</li>
             <li>Dust, mud and gravel routes run between the port gate and every POI — follow the tan / brown corridors instead of bushwhacking</li>

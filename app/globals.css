@@ -1510,6 +1510,28 @@ body.touch .gplate { display: none; }
   letter-spacing: 0.04em;
 }
 
+/* ---------- Wood purse (build material) ---------- */
+/* Stacks above the grenade plate on desktop; pinned below the minimap
+   on touch (the grenade plate itself is desktop-only). */
+.woodplate {
+  bottom: 150px;
+  min-width: 118px;
+  border-left: 3px solid #b5813f;
+}
+
+.woodplate .t-state {
+  color: #d9a05b;
+}
+
+body.touch .woodplate {
+  display: grid;
+  left: auto;
+  right: calc(16px + env(safe-area-inset-right, 0px));
+  bottom: auto;
+  top: 296px;
+  min-width: 92px;
+}
+
 .smoke-fx {
   position: fixed;
   inset: 0;
