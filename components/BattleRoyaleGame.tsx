@@ -1532,7 +1532,13 @@ export default function BattleRoyaleGame() {
 
     function refreshWood() {
       const el = $('woodCount');
-      if (el) el.textContent = String(Math.floor(woodRes));
+      if (el) {
+        const txt = String(Math.floor(woodRes));
+        if (el.textContent !== txt) {
+          el.textContent = txt;
+          popEl(el);
+        }
+      }
       const plate = $('woodPlate');
       if (plate) plate.hidden = !terrainOn;
     }
@@ -7128,6 +7134,7 @@ export default function BattleRoyaleGame() {
         if (b.disabled) return;
         selectedMode = b.dataset.mode || 'range';
         pickOne(modeBtns, b);
+        popPick(b);
         updateLobbyScene(selectedMode, character);
       })
     );
@@ -7135,6 +7142,7 @@ export default function BattleRoyaleGame() {
     charBtns.forEach((b) =>
       b.addEventListener('click', () => {
         pickOne(charBtns, b);
+        popPick(b);
         character = b.dataset.char || 'bulwark';
         applyCharacter();
         updateLobbyScene(selectedMode, character);
@@ -7143,12 +7151,82 @@ export default function BattleRoyaleGame() {
 
     updateLobbyScene(selectedMode, character);
 
+    // ------------------------------------------------------------------
+    // Fullscreen — the upper-left button (visible over menu AND HUD)
+    // plus an automatic request the moment Deploy is tapped.
+    // ------------------------------------------------------------------
+    const fsBtn = $('fsBtn') as HTMLButtonElement | null;
+
+    function syncFsBtn() {
+      const on = !!document.fullscreenElement;
+      fsBtn?.classList.toggle('is-fs', on);
+      fsBtn?.setAttribute('aria-pressed', String(on));
+    }
+
+    function toggleFullscreen() {
+      if (document.fullscreenElement) {
+        document.exitFullscreen?.()?.catch?.(() => {});
+      } else {
+        document.documentElement.requestFullscreen?.()?.catch?.(() => {});
+      }
+    }
+
+    fsBtn?.addEventListener('click', toggleFullscreen);
+    document.addEventListener('fullscreenchange', syncFsBtn);
+    syncFsBtn();
+    // No Fullscreen API at all (iOS Safari) — hide the dead button
+    if (fsBtn && typeof document.documentElement.requestFullscreen !== 'function') fsBtn.hidden = true;
+
+    // ------------------------------------------------------------------
+    // Collapsible side menus — Operators (left) / Deployment (right)
+    // ------------------------------------------------------------------
+    const sideMenus: Array<[string, string]> = [
+      ['charMenuHead', 'charMenu'],
+      ['modeMenuHead', 'modeMenu'],
+    ];
+    for (const [headId, panelId] of sideMenus) {
+      const head = $(headId) as HTMLButtonElement | null;
+      const panel = $(panelId);
+      head?.addEventListener('click', () => {
+        const collapsed = panel?.classList.toggle('collapsed');
+        head.setAttribute('aria-expanded', String(!collapsed));
+      });
+    }
+
+    // Tiny re-triggerable pop for HUD numbers that just changed
+    function popEl(el: HTMLElement | null | undefined) {
+      if (!el) return;
+      el.classList.remove('pop');
+      void el.offsetWidth;
+      el.classList.add('pop');
+    }
+
+    // Selection pop on the clicked character / mode card
+    function popPick(b: HTMLButtonElement) {
+      b.classList.remove('picked');
+      void b.offsetWidth;
+      b.classList.add('picked');
+    }
+
+    let deploying = false;
     function startGame() {
+      if (deploying) return; // the exit animation is already carrying us out
       if (selectedMode === 'harbor') enterHarbor();
       else if (selectedMode !== 'range') return;
       else refreshWood(); // Test Range: free builds — hide the wood plate
-      if (menuEl) menuEl.hidden = true;
-      canvas?.requestPointerLock?.()?.catch?.(() => {});
+      deploying = true;
+      // Deploy = battle: claim the whole screen. The click is the user
+      // gesture browsers demand; autostart boots simply skip the request.
+      if (!document.fullscreenElement) {
+        document.documentElement.requestFullscreen?.()?.catch?.(() => {});
+      }
+      menuEl?.classList.add('deploying');
+      window.setTimeout(() => {
+        if (menuEl) menuEl.hidden = true;
+        document.body.classList.add('playing');
+        canvas?.requestPointerLock?.()?.catch?.(() => {});
+        deploying = false;
+      }, 480);
     }
 
     playBtn?.addEventListener('click', startGame);
@@ -8381,6 +8459,10 @@ export default function BattleRoyaleGame() {
       if (text === lastStatus || !statusEl) return;
       statusEl.textContent = text;
       lastStatus = text;
+      // Fresh line — slide it in
+      statusEl.classList.remove('status-in');
+      void statusEl.offsetWidth;
+      statusEl.classList.add('status-in');
     }
 
     function startReload() {
@@ -8422,7 +8504,8 @@ export default function BattleRoyaleGame() {
       if (!hitmark) return;
       hitmark.classList.add('show');
       clearTimeout(hitTimer);
-      hitTimer = setTimeout(() => hitmark.classList.remove('show'), 120);
+      // 240 ms lets the scale-pop finish before the fade
+      hitTimer = setTimeout(() => hitmark.classList.remove('show'), 240);
     }
 
     function hitDummy(d: DummyObject, dmg: number, pen = 0, from?: { x: number; y: number; z: number }) {
@@ -8446,9 +8529,15 @@ export default function BattleRoyaleGame() {
     function dummyDown(d: DummyObject) {
       d.state = 'falling';
       downs += 1;
-      if (downsEl) downsEl.textContent = String(downs);
+      if (downsEl) {
+        downsEl.textContent = String(downs);
+        popEl(downsEl);
+      }
       credits += DOWN_CREDITS;
-      if (creditsEl) creditsEl.textContent = String(credits);
+      if (creditsEl) {
+        creditsEl.textContent = String(credits);
+        popEl(creditsEl);
+      }
     }
 
     function burnDummy(d: DummyObject, dmg: number, pen = 0, from?: { x: number; y: number; z: number }) {
@@ -8705,6 +8794,8 @@ export default function BattleRoyaleGame() {
       const aimed = aiming() && !!w && !buildMode;
       const prompt = pickOffer && !touchDevice ? `F to pick up ${WEAPONS[pickOffer.kind]?.name || ''}` : '';
       setStatus(msgT > 0 ? msgText : reloading ? 'Reloading' : prompt || (buildMode ? 'Build Mode' : aimed ? 'Aiming' : w ? '' : 'Unarmed'));
+      // The ammo count breathes while a reload is in flight
+      document.body.classList.toggle('reloading', reloading);
 
       aimT = THREE.MathUtils.lerp(aimT, aimed && !reloading ? 1 : 0, 1 - Math.exp(-14 * dt));
       scopeT = THREE.MathUtils.lerp(scopeT, aimed && !reloading && w?.scope ? 1 : 0, 1 - Math.exp(-10 * dt));
@@ -9802,6 +9893,8 @@ export default function BattleRoyaleGame() {
     }
 
     let vitalsShown = '';
+    const lifeRowEl = $('lifeRow');
+    const levelRowEl = $('levelRow');
     function updateVitals() {
       const cap = shieldMax();
       const sf = Math.max(0, Math.min(1, shield / cap));
@@ -9820,6 +9913,8 @@ export default function BattleRoyaleGame() {
       if (lifeFill) lifeFill.style.transform = 'scaleX(' + Math.max(0, life / lifeMax()).toFixed(4) + ')';
       shieldRow?.classList.toggle('regen', regenerating);
       shieldRow?.classList.toggle('sun', !playerDown && playerSunlitWhy === 'sun');
+      // Low life — the bar beats red so the drop is impossible to miss
+      lifeRowEl?.classList.toggle('low', life < lifeMax() * 0.3);
       if (shieldFx) {
         shieldFx.style.setProperty('--sh', sf.toFixed(3));
         shieldFx.classList.toggle('regen', regenerating);
@@ -9969,6 +10064,10 @@ export default function BattleRoyaleGame() {
       const msg =
         character === 'barrage' && up.bomb ? up.bomb.text : character === 'antenna' && up.ant ? up.ant.text : up.text;
       showMessage('Level ' + l + ': ' + msg, 2.5);
+      // The whole Level row flashes gold
+      levelRowEl?.classList.remove('levelup');
+      void levelRowEl?.offsetWidth;
+      levelRowEl?.classList.add('levelup');
     }
 
     // ----------------------------------------------------
@@ -10125,7 +10224,13 @@ export default function BattleRoyaleGame() {
       const cost = top ? 1 : LEVEL_COST[playerLevel - 1];
       if (levelNumEl) levelNumEl.textContent = String(playerLevel);
       if (xpNumEl) xpNumEl.textContent = top ? 'MAX' : xp + ' / ' + cost + ' XP';
-      if (xpFillEl) xpFillEl.style.transform = 'scaleX(' + (top ? 1 : Math.min(1, xp / cost)).toFixed(4) + ')';
+      if (xpFillEl) {
+        xpFillEl.style.transform = 'scaleX(' + (top ? 1 : Math.min(1, xp / cost)).toFixed(4) + ')';
+        // The bar gleams whenever progress actually moved
+        xpFillEl.classList.remove('gain');
+        void xpFillEl.offsetWidth;
+        xpFillEl.classList.add('gain');
+      }
     }
 
     function updateTurretHud() {
@@ -10370,7 +10475,13 @@ export default function BattleRoyaleGame() {
           : n + ' left · ' + gTotal() + (cap === Infinity ? ' carried' : ' of ' + cap + ' carried');
       }
       if (gBtnName) gBtnName.textContent = GREN[kind].name;
-      if (gBtnCount) gBtnCount.textContent = gArmed ? 'Armed' : String(n);
+      if (gBtnCount) {
+        const txt = gArmed ? 'Armed' : String(n);
+        if (gBtnCount.textContent !== txt) {
+          gBtnCount.textContent = txt;
+          popEl(gBtnCount);
+        }
+      }
       gBtnEl?.classList.toggle('empty', n <= 0);
       gBtnEl?.classList.toggle('armed', gArmed);
       refreshPicker();
@@ -11094,7 +11205,11 @@ export default function BattleRoyaleGame() {
     function returnToMenu() {
       if (inventoryEl) inventoryEl.hidden = true;
       if (overlay) overlay.hidden = true;
-      if (menuEl) menuEl.hidden = false;
+      document.body.classList.remove('playing');
+      if (menuEl) {
+        menuEl.hidden = false;
+        menuEl.classList.remove('deploying');
+      }
       if (buildMode) toggleBuildWall(false);
       document.exitPointerLock?.();
       keys.clear();
@@ -12433,6 +12548,16 @@ export default function BattleRoyaleGame() {
 
   return (
     <div ref={containerRef} className="relative w-full h-full overflow-hidden select-none touch-none">
+      {/* Fullscreen toggle — pinned upper-left, lives above both the menu
+          and the in-game HUD. Deploy also auto-requests fullscreen. */}
+      <button type="button" className="fs-btn" id="fsBtn" aria-label="Toggle fullscreen" aria-pressed="false" title="Fullscreen (Deploy also enters it)">
+        <svg className="fs-expand" viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+        <svg className="fs-shrink" viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+      </button>
       <canvas id="game" ref={canvasRef} aria-label="First-person view" />
       <div className="shield-fx" id="shieldFx" aria-hidden="true" />
       <div className="hurt-fx" id="hurtFx" aria-hidden="true" />
@@ -12487,7 +12612,7 @@ export default function BattleRoyaleGame() {
             <span className="fill shield-fill" id="shieldFill" />
           </div>
         </div>
-        <div className="vital">
+        <div className="vital" id="lifeRow">
           <div className="vital-head">
             <span className="vital-name">Life</span>
             <span className="vital-num" id="lifeNum">
@@ -12498,7 +12623,7 @@ export default function BattleRoyaleGame() {
             <span className="fill life-fill" id="lifeFill" />
           </div>
         </div>
-        <div className="vital">
+        <div className="vital" id="levelRow">
           <div className="vital-head">
             <span className="vital-name">
               Level <span id="levelNum">1</span>
@@ -13054,12 +13179,26 @@ export default function BattleRoyaleGame() {
             <h1 id="menuTitle">Battle Royale FPS</h1>
           </div>
           <div className="menu-body">
-            {/* Character Selection (Glass Buttons) */}
-            <section className="menu-side" aria-labelledby="charLabel">
-              <h2 className="menu-label" id="charLabel">
-                Operator Selection
-              </h2>
-              <div className="chars" role="radiogroup" aria-labelledby="charLabel">
+            {/* LEFT RAIL MENU — Operator selection (collapsible glass side menu) */}
+            <aside className="side-menu side-left" id="charMenu">
+              <button className="side-head" id="charMenuHead" type="button" aria-expanded="true" aria-controls="charMenuBody">
+                <svg className="side-ico" viewBox="0 0 24 24" aria-hidden="true">
+                  <circle cx="12" cy="8" r="4" fill="none" stroke="currentColor" strokeWidth="2.2" />
+                  <path d="M5 20a7 7 0 0 1 14 0" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" />
+                </svg>
+                <span className="side-title">Operators</span>
+                <svg className="side-chev" viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M9 5l7 7-7 7" fill="none" stroke="currentColor" strokeWidth="2.6" strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
+              </button>
+              <div className="side-wrap">
+                <div className="side-body" id="charMenuBody">
+                  {/* Character Selection (Glass Buttons) */}
+                  <section className="menu-side" aria-labelledby="charLabel">
+                    <h2 className="menu-label" id="charLabel">
+                      Operator Selection
+                    </h2>
+                    <div className="chars" role="radiogroup" aria-labelledby="charLabel">
                 <button className="char" type="button" role="radio" aria-checked="true" data-char="bulwark">
                   <svg className="char-art" viewBox="0 0 96 96" aria-hidden="true">
                     <ellipse className="ic-base" cx="48" cy="77" rx="32" ry="9" />
@@ -13104,15 +13243,32 @@ export default function BattleRoyaleGame() {
                     <span className="char-role">Recon — minimap + enemy scan, 100 life</span>
                   </div>
                 </button>
+                    </div>
+                  </section>
+                </div>
               </div>
-            </section>
+            </aside>
 
-            {/* Mode Selection (Glass Buttons) & Big Glass Play CTA */}
-            <section className="menu-main" aria-labelledby="modeLabel">
-              <h2 className="menu-label" id="modeLabel">
-                Environment / Map
-              </h2>
-              <div className="modes" role="radiogroup" aria-labelledby="modeLabel">
+            {/* RIGHT RAIL MENU — Mode selection + Deploy (collapsible glass side menu) */}
+            <aside className="side-menu side-right" id="modeMenu">
+              <button className="side-head" id="modeMenuHead" type="button" aria-expanded="true" aria-controls="modeMenuBody">
+                <svg className="side-ico" viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M12 21s-7-5.1-7-11a7 7 0 0 1 14 0c0 5.9-7 11-7 11Z" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinejoin="round" />
+                  <circle cx="12" cy="10" r="2.6" fill="none" stroke="currentColor" strokeWidth="2.2" />
+                </svg>
+                <span className="side-title">Deployment</span>
+                <svg className="side-chev" viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M9 5l7 7-7 7" fill="none" stroke="currentColor" strokeWidth="2.6" strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
+              </button>
+              <div className="side-wrap">
+                <div className="side-body" id="modeMenuBody">
+                  {/* Mode Selection (Glass Buttons) & Big Glass Play CTA */}
+                  <section className="menu-main" aria-labelledby="modeLabel">
+                    <h2 className="menu-label" id="modeLabel">
+                      Environment / Map
+                    </h2>
+                    <div className="modes" role="radiogroup" aria-labelledby="modeLabel">
                 <button className="mode" type="button" role="radio" aria-checked="true" data-mode="range">
                   <span className="mode-name">Test range</span>
                   <span className="mode-tag">Proving Ground</span>
@@ -13125,12 +13281,17 @@ export default function BattleRoyaleGame() {
                   <span className="mode-name">Quarry</span>
                   <span className="mode-tag">Locked</span>
                 </button>
+                    </div>
+                    <button className="btn play" id="play" type="button">
+                      Deploy
+                    </button>
+                  </section>
+                </div>
               </div>
-              <button className="btn play" id="play" type="button">
-                Deploy
-              </button>
-            </section>
+            </aside>
           </div>
+          {/* Deploy flash — a full-screen burst as the menu launches away */}
+          <div className="deploy-fx" aria-hidden="true" />
         </div>
       </div>
 

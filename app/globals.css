@@ -1027,7 +1027,6 @@ body:not(.touch) .touch-only, body.touch .keys-only { display: none; }
   justify-content: flex-end;
   pointer-events: none;
   z-index: 2;
-  animation: hero-breathe 4s ease-in-out infinite;
 }
 
 .lobby-pedestal {
@@ -1071,6 +1070,9 @@ body:not(.touch) .touch-only, body.touch .keys-only { display: none; }
   height: 430px;
   filter: drop-shadow(0 15px 30px rgba(0, 0, 0, 0.75));
   margin-bottom: 24px;
+  /* The breathe lives on the FIGURE, not the stage — the stage keeps its
+     translateX(-50%) centering transform untouched by keyframes */
+  animation: hero-breathe 4s ease-in-out infinite;
 }
 
 .char-back-view {
@@ -1112,6 +1114,8 @@ body:not(.touch) .touch-only, body.touch .keys-only { display: none; }
 .menu-head {
   pointer-events: auto;
   align-self: flex-start;
+  /* Leaves the upper-left corner clear for the fullscreen button */
+  margin-left: 48px;
   background: rgba(15, 23, 42, 0.45);
   backdrop-filter: blur(18px) saturate(180%);
   -webkit-backdrop-filter: blur(18px) saturate(180%);
@@ -1215,6 +1219,7 @@ body:not(.touch) .touch-only, body.touch .keys-only { display: none; }
   border-radius: 12px;
   background: rgba(255, 255, 255, 0.08);
   border: 1px solid rgba(255, 255, 255, 0.15);
+  transition: transform 0.25s cubic-bezier(0.16, 1, 0.3, 1), filter 0.25s;
 }
 
 .char-info {
@@ -1363,12 +1368,372 @@ body:not(.touch) .touch-only, body.touch .keys-only { display: none; }
 .ic-warn { fill: var(--accent); }
 .ic-ring-warn { fill: none; stroke: var(--accent); stroke-width: 2.5; }
 
+/* ==================================================================
+   MOTION PASS — fullscreen button, collapsible side menus, entrance /
+   exit choreography and live HUD feedback. Everything animates with
+   transform / opacity / filter / box-shadow only (compositor-friendly);
+   elements that need their base transform keep it OUT of keyframes.
+   ================================================================== */
+
+/* --- Fullscreen toggle (upper-left, above menu AND HUD) --- */
+.fs-btn {
+  position: fixed;
+  top: calc(14px + env(safe-area-inset-top, 0px));
+  left: calc(14px + env(safe-area-inset-left, 0px));
+  z-index: 300;
+  width: 44px;
+  height: 44px;
+  display: grid;
+  place-items: center;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  background: rgba(10, 16, 26, 0.55);
+  backdrop-filter: blur(14px) saturate(160%);
+  -webkit-backdrop-filter: blur(14px) saturate(160%);
+  color: #cbd5e1;
+  cursor: pointer;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35);
+  transition: transform 0.18s cubic-bezier(0.16, 1, 0.3, 1), border-color 0.18s, color 0.18s, box-shadow 0.18s;
+  animation: drop-in 0.5s cubic-bezier(0.16, 1, 0.3, 1) 0.15s backwards;
+}
+
+.fs-btn:hover {
+  transform: scale(1.09);
+  color: #fff;
+  border-color: rgba(103, 232, 249, 0.6);
+  box-shadow: 0 0 20px rgba(103, 232, 249, 0.35);
+}
+
+.fs-btn:active { transform: scale(0.9); }
+.fs-btn svg { width: 22px; height: 22px; }
+.fs-btn .fs-shrink { display: none; }
+.fs-btn.is-fs .fs-shrink { display: block; }
+.fs-btn.is-fs .fs-expand { display: none; }
+
+/* --- Collapsible side menus (Operators LEFT / Deployment RIGHT) --- */
+.side-menu {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 280px;
+  max-width: 340px;
+  pointer-events: auto;
+}
+
+.side-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 13px 16px;
+  border-radius: 16px;
+  border: 1.5px solid rgba(255, 255, 255, 0.18);
+  background: rgba(15, 23, 42, 0.55);
+  backdrop-filter: blur(18px) saturate(180%);
+  -webkit-backdrop-filter: blur(18px) saturate(180%);
+  color: #f8fafc;
+  cursor: pointer;
+  font-family: var(--font-cursed-title);
+  font-weight: 800;
+  font-size: 1.02rem;
+  line-height: 1;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  box-shadow: inset 0 1px 1px rgba(255, 255, 255, 0.25), 0 8px 24px rgba(0, 0, 0, 0.35);
+  transition: border-color 0.2s, box-shadow 0.2s, background 0.2s;
+}
+
+.side-left .side-head { border-left: 3px solid #67e8f9; }
+.side-right .side-head { border-right: 3px solid #f2a516; }
+.side-left .side-ico { color: #67e8f9; }
+.side-right .side-ico { color: #f2a516; }
+
+.side-head:hover {
+  border-color: rgba(255, 255, 255, 0.42);
+  background: rgba(255, 255, 255, 0.08);
+  box-shadow: 0 0 20px rgba(103, 232, 249, 0.22), inset 0 1px 1px rgba(255, 255, 255, 0.35);
+}
+
+.side-head:active { transform: scale(0.99); }
+.side-ico { width: 20px; height: 20px; flex-shrink: 0; }
+.side-title { flex: 1; text-align: left; }
+
+.side-chev {
+  width: 18px;
+  height: 18px;
+  flex-shrink: 0;
+  color: #94a3b8;
+  transition: transform 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.side-menu.collapsed .side-chev { transform: rotate(-90deg); }
+
+/* grid-rows 1fr -> 0fr: the smooth, content-sized collapse */
+.side-wrap {
+  display: grid;
+  grid-template-rows: 1fr;
+  flex: 1;
+  min-height: 0;
+  transition: grid-template-rows 0.5s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.35s ease 0.08s;
+}
+
+.side-menu.collapsed .side-wrap {
+  grid-template-rows: 0fr;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.side-body {
+  overflow: hidden;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.side-body .menu-side,
+.side-body .menu-main { min-width: 0; max-width: none; }
+.side-body .menu-main { flex: 1; }
+
+/* --- Shared entrance / exit keyframes --- */
+@keyframes drop-in { from { opacity: 0; transform: translateY(-20px); } to { opacity: 1; transform: none; } }
+@keyframes slide-in-left { from { opacity: 0; transform: translateX(-44px); } to { opacity: 1; transform: none; } }
+@keyframes slide-in-right { from { opacity: 0; transform: translateX(44px); } to { opacity: 1; transform: none; } }
+@keyframes rise-in { from { opacity: 0; transform: translateY(30px) scale(0.95); } to { opacity: 1; transform: none; } }
+@keyframes card-stagger { from { opacity: 0; transform: translateY(16px) scale(0.97); } to { opacity: 1; transform: none; } }
+
+/* --- Menu entrance choreography (replays every time the menu opens) --- */
+.menu:not(.deploying) .menu-head { animation: drop-in 0.6s cubic-bezier(0.16, 1, 0.3, 1) backwards; }
+.menu:not(.deploying) .side-menu.side-left { animation: slide-in-left 0.65s cubic-bezier(0.16, 1, 0.3, 1) 0.12s backwards; }
+.menu:not(.deploying) .side-menu.side-right { animation: slide-in-right 0.65s cubic-bezier(0.16, 1, 0.3, 1) 0.2s backwards; }
+
+/* The figure breathes AND rises in — both on the figure, never the stage */
+.menu:not(.deploying) .lobby-character-figure {
+  animation: rise-in 0.8s cubic-bezier(0.16, 1, 0.3, 1) 0.32s backwards,
+    hero-breathe 4s ease-in-out 1.2s infinite;
+}
+
+/* Cards stagger inside their rails */
+.char { animation: card-stagger 0.5s cubic-bezier(0.16, 1, 0.3, 1) backwards; }
+.char:nth-child(1) { animation-delay: 0.24s; }
+.char:nth-child(2) { animation-delay: 0.32s; }
+.char:nth-child(3) { animation-delay: 0.4s; }
+.mode { animation: card-stagger 0.5s cubic-bezier(0.16, 1, 0.3, 1) backwards; }
+.mode:nth-child(1) { animation-delay: 0.32s; }
+.mode:nth-child(2) { animation-delay: 0.38s; }
+.mode:nth-child(3) { animation-delay: 0.44s; }
+
+/* Selected cards glow-pulse (box-shadow only — hover lift stays alive) */
+@keyframes glow-cyan {
+  0%, 100% { box-shadow: 0 0 16px rgba(103, 232, 249, 0.28), inset 0 1px 2px rgba(255, 255, 255, 0.45); }
+  50% { box-shadow: 0 0 32px rgba(103, 232, 249, 0.6), inset 0 1px 2px rgba(255, 255, 255, 0.45); }
+}
+
+@keyframes glow-amber {
+  0%, 100% { box-shadow: 0 0 16px rgba(242, 165, 22, 0.3), inset 0 1px 2px rgba(255, 255, 255, 0.45); }
+  50% { box-shadow: 0 0 32px rgba(242, 165, 22, 0.65), inset 0 1px 2px rgba(255, 255, 255, 0.45); }
+}
+
+.char[aria-checked="true"] {
+  /* delay baked into the shorthand — the shorthand would otherwise reset it */
+  animation: card-stagger 0.5s cubic-bezier(0.16, 1, 0.3, 1) 0.24s backwards,
+    glow-cyan 2.6s ease-in-out 0.8s infinite;
+}
+
+.mode[aria-checked="true"] {
+  animation: card-stagger 0.5s cubic-bezier(0.16, 1, 0.3, 1) 0.32s backwards,
+    glow-amber 2.6s ease-in-out 0.8s infinite;
+}
+
+/* Click feedback — a quick springy pop, glow rides along */
+@keyframes pick-pop {
+  0% { transform: scale(1); }
+  42% { transform: scale(1.05); }
+  100% { transform: scale(1); }
+}
+
+.char.picked {
+  animation: pick-pop 0.34s cubic-bezier(0.34, 1.56, 0.64, 1),
+    glow-cyan 2.6s ease-in-out infinite;
+}
+
+.mode.picked {
+  animation: pick-pop 0.34s cubic-bezier(0.34, 1.56, 0.64, 1),
+    glow-amber 2.6s ease-in-out infinite;
+}
+
+/* Selected operator's portrait gently floats */
+@keyframes float-ico {
+  0%, 100% { transform: translateY(0) rotate(0deg); }
+  50% { transform: translateY(-3px) rotate(-1.5deg); }
+}
+
+.char[aria-checked="true"] .char-art { animation: float-ico 3.2s ease-in-out infinite; }
+.char:not([aria-checked="true"]):hover .char-art { transform: scale(1.08) rotate(-2deg); }
+.char:hover .char-art { filter: brightness(1.25) drop-shadow(0 0 6px rgba(103, 232, 249, 0.6)); }
+
+/* Title glow drift */
+@keyframes title-glow {
+  0%, 100% { text-shadow: 2px 2px 0 rgba(242, 165, 22, 0.8), 0 0 16px rgba(242, 165, 22, 0.35); }
+  50% { text-shadow: 2px 2px 0 rgba(242, 165, 22, 0.9), 0 0 34px rgba(242, 165, 22, 0.65); }
+}
+
+.menu-head h1 { animation: title-glow 4.5s ease-in-out infinite; }
+
+/* Deploy button — staggered entrance, then an endless warm breathe */
+@keyframes deploy-breathe {
+  0%, 100% { box-shadow: 0 0 26px rgba(242, 165, 22, 0.45), inset 0 1px 2px rgba(255, 255, 255, 0.7); }
+  50% { box-shadow: 0 0 48px rgba(242, 165, 22, 0.8), inset 0 1px 3px rgba(255, 255, 255, 0.95); }
+}
+
+.play {
+  animation: card-stagger 0.5s cubic-bezier(0.16, 1, 0.3, 1) 0.5s backwards,
+    deploy-breathe 2.8s ease-in-out 1.05s infinite;
+}
+
+/* --- Deploy exit choreography --- */
+@keyframes head-exit { to { opacity: 0; transform: translateY(-26px); } }
+@keyframes menu-exit-left { to { opacity: 0; transform: translateX(-70px) scale(0.95); } }
+@keyframes menu-exit-right { to { opacity: 0; transform: translateX(70px) scale(0.95); } }
+@keyframes hero-exit { to { opacity: 0; transform: translateY(46px) scale(0.88); } }
+@keyframes fade-out { to { opacity: 0; } }
+@keyframes deploy-flash {
+  0% { opacity: 0; }
+  22% { opacity: 1; }
+  100% { opacity: 0; }
+}
+
+.menu.deploying { pointer-events: none; }
+.menu.deploying .menu-head { animation: head-exit 0.45s cubic-bezier(0.5, 0, 0.75, 0) forwards; }
+.menu.deploying .side-menu.side-left { animation: menu-exit-left 0.5s cubic-bezier(0.5, 0, 0.75, 0) 0.05s forwards; }
+.menu.deploying .side-menu.side-right { animation: menu-exit-right 0.5s cubic-bezier(0.5, 0, 0.75, 0) 0.05s forwards; }
+.menu.deploying .lobby-character-figure { animation: hero-exit 0.5s cubic-bezier(0.5, 0, 0.75, 0) forwards; }
+.menu.deploying .lobby-pedestal,
+.menu.deploying .lobby-char-facing-tag { animation: fade-out 0.4s ease forwards; }
+
+.deploy-fx {
+  position: absolute;
+  inset: 0;
+  z-index: 50;
+  pointer-events: none;
+  opacity: 0;
+  background:
+    radial-gradient(circle at 50% 62%, rgba(242, 165, 22, 0.5) 0%, rgba(255, 226, 150, 0.22) 30%, transparent 68%),
+    linear-gradient(90deg, transparent 46%, rgba(255, 255, 255, 0.16) 50%, transparent 54%);
+}
+
+.menu.deploying .deploy-fx { animation: deploy-flash 0.6s ease-out 0.1s both; }
+
+/* --- HUD entrance on every deploy --- */
+@keyframes hud-l { from { opacity: 0; transform: translateX(-30px); } to { opacity: 1; transform: none; } }
+@keyframes hud-r { from { opacity: 0; transform: translateX(30px); } to { opacity: 1; transform: none; } }
+@keyframes compass-in { from { opacity: 0; transform: translate(-50%, -16px); } to { opacity: 1; transform: translate(-50%, 0); } }
+
+body.playing .hud.downs { animation: hud-l 0.55s cubic-bezier(0.16, 1, 0.3, 1) 0.08s backwards; }
+body.playing .hud.vitals { animation: hud-l 0.55s cubic-bezier(0.16, 1, 0.3, 1) 0.16s backwards; }
+body.playing .hud.build-plate { animation: hud-l 0.55s cubic-bezier(0.16, 1, 0.3, 1) 0.24s backwards; }
+body.playing .hud.gplate { animation: hud-l 0.55s cubic-bezier(0.16, 1, 0.3, 1) 0.3s backwards; }
+body.playing .hud.turret { animation: hud-l 0.55s cubic-bezier(0.16, 1, 0.3, 1) 0.36s backwards; }
+body.playing .hud.hint { animation: hud-r 0.55s cubic-bezier(0.16, 1, 0.3, 1) 0.08s backwards; }
+body.playing .hud.minimap { animation: hud-r 0.55s cubic-bezier(0.16, 1, 0.3, 1) 0.14s backwards; }
+body.playing .slots { animation: hud-r 0.55s cubic-bezier(0.16, 1, 0.3, 1) 0.24s backwards; }
+body.playing .hud.ammo { animation: hud-r 0.55s cubic-bezier(0.16, 1, 0.3, 1) 0.3s backwards; }
+body.playing .hud.compass { animation: compass-in 0.55s cubic-bezier(0.16, 1, 0.3, 1) backwards; }
+
+/* --- Live HUD feedback --- */
+@keyframes pop-scale {
+  0% { transform: scale(1); }
+  45% { transform: scale(1.35); }
+  100% { transform: scale(1); }
+}
+
+.pop {
+  display: inline-block;
+  animation: pop-scale 0.4s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+@keyframes status-in {
+  from { opacity: 0; transform: translateY(7px); }
+  to { opacity: 1; transform: none; }
+}
+
+.status.status-in { animation: status-in 0.28s ease-out; }
+
+/* Low life — the bar beats red */
+@keyframes low-pulse {
+  0%, 100% { box-shadow: 0 0 4px rgba(255, 90, 90, 0.35); }
+  50% { box-shadow: 0 0 16px rgba(255, 90, 90, 0.9); filter: brightness(1.35); }
+}
+
+.vital.low .life-fill { animation: low-pulse 1.05s ease-in-out infinite; }
+.vital.low .vital-num { color: #ff7b7b; }
+
+/* Level up — the whole row flashes */
+@keyframes levelup-flash {
+  0% { filter: brightness(1); }
+  22% { filter: brightness(2); }
+  100% { filter: brightness(1); }
+}
+
+.vital.levelup { animation: levelup-flash 0.9s ease; }
+
+/* XP gain — the bar gleams */
+@keyframes xp-shine {
+  0%, 100% { filter: brightness(1); }
+  30% { filter: brightness(1.9); }
+}
+
+.xp-fill.gain { animation: xp-shine 0.7s ease; }
+
+/* Reload — the ammo count breathes */
+@keyframes reload-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
+body.reloading .ammo .count { animation: reload-pulse 0.9s ease-in-out infinite; }
+
+/* Weapon swap — the fresh slot pops */
+@keyframes slot-pop {
+  0% { transform: scale(1); }
+  45% { transform: scale(1.07); }
+  100% { transform: scale(1); }
+}
+
+.slot.active { animation: slot-pop 0.32s cubic-bezier(0.34, 1.56, 0.64, 1); }
+
+/* Overlays + downed card spring in */
+@keyframes card-in {
+  from { opacity: 0; transform: translateY(20px) scale(0.96); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes fade-in { from { opacity: 0; } }
+@keyframes spring-in {
+  from { opacity: 0; transform: scale(0.82); }
+  to { opacity: 1; transform: none; }
+}
+
+.overlay:not([hidden]) { animation: fade-in 0.25s ease; }
+.overlay:not([hidden]) .card { animation: card-in 0.4s cubic-bezier(0.16, 1, 0.3, 1); }
+.downed:not([hidden]) .downed-card { animation: spring-in 0.5s cubic-bezier(0.34, 1.56, 0.64, 1); }
+
+/* Hitmarker — scales out instead of a flat blink */
+@keyframes hit-pop {
+  0% { transform: scale(0.55); }
+  55% { transform: scale(1.25); }
+  100% { transform: scale(1); }
+}
+
+.hitmark.show {
+  opacity: 1;
+  animation: hit-pop 0.26s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
 @media (max-width: 900px) {
   .menu-body {
     flex-direction: column;
     justify-content: flex-start;
   }
-  .menu-side, .menu-main {
+  .side-menu {
     max-width: 100%;
     width: 100%;
   }
@@ -1398,6 +1763,15 @@ body:not(.touch) .touch-only, body.touch .keys-only { display: none; }
 
 @media (prefers-reduced-motion: reduce) {
   .hitmark, .aim, .slider-knob, .turret { transition: none; }
+  /* The whole motion pass bows out — no entrance / exit / pulse loops */
+  .fs-btn,
+  .menu-head, .menu-head h1, .side-menu, .side-head, .side-chev, .side-wrap,
+  .char, .mode, .play, .deploy-fx, .lobby-character-figure, .lobby-pedestal,
+  .lobby-char-facing-tag, .pop, .status, .vital, .fill, .slot, .overlay,
+  .downed-card, .hud, .crosshair {
+    animation: none !important;
+  }
+  .side-wrap { transition: none !important; }
 }
 
 .gbtn {
