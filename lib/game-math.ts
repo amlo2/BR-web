@@ -284,6 +284,8 @@ export const STRUCTURE_DAMAGE_MULTIPLIER: Record<string, number> = {
   smg: 0.9,     // rapid fire wood shredder
   sniper: 1.8,  // heavy anti-material punch
   betgun: 2.2,  // close-range shotgun destroys wood walls fast
+  pistol: 0.8,  // sidearm chips rather than shreds
+  rpg: 3.0,     // rocket punch (the warhead's explosion uses `blast`)
   blast: 3.5,   // explosive grenade deals massive demolition damage
   fire: 1.2,    // burns through wooden cover
 };

@@ -1902,9 +1902,16 @@ export default function BattleRoyaleGame() {
       resetBuildables();
       // Player-built voxel pieces (walls / floors / ramps / door panels)
       // live in the scene rather than the world group, so clear their
-      // meshes — and the staircase-stacking registry — here too.
+      // meshes — and the staircase-stacking registry — here too. Half-
+      // built ghosts and live rockets go with them.
       stairPieces.length = 0;
       stairRamps.length = 0;
+      cancelPendingBuilds();
+      for (const r of rockets) {
+        scene.remove(r.mesh);
+        r.mesh.traverse((o: any) => o.geometry?.dispose());
+      }
+      rockets.length = 0;
       for (const m of playerBuiltVox) {
         m.parent?.remove(m);
         m.geometry.dispose();
@@ -2645,6 +2652,102 @@ export default function BattleRoyaleGame() {
       }
     }
 
+    // ----------------------------------------------------
+    // TIMED CONSTRUCTION: placing a piece drafts the microbots.
+    // They detach, arc to the site and ASSEMBLE the piece over a
+    // few seconds while a cyan ghost prints upward into the
+    // footprint — the solid voxel piece lands when they finish.
+    // ----------------------------------------------------
+    const BUILD_SECONDS: Record<string, number> = { wall: 3, door: 3, floor: 2.2, ramp: 2.6, ladder: 2 };
+    const BUILD_NAME: Record<string, string> = {
+      wall: 'Wall',
+      door: 'Door Wall',
+      floor: 'Platform',
+      ramp: 'Ramp',
+      ladder: 'Ladder',
+    };
+    let buildSpeedMult = 1; // e2e hook: shrink the timers for the test suites
+
+    interface PendingBuild {
+      kind: string;
+      x: number;
+      z: number;
+      gy: number; // ground under the site (walls / doors)
+      top: number; // platform top (floors)
+      feetY: number; // player feet at placement (ramps / ladders)
+      angle: number;
+      stackOf: RampRec | null; // stair-stack continuation
+      t: number;
+      dur: number;
+      ghost: THREE.Mesh;
+      ghostH: number;
+      baseY: number;
+    }
+    const pendingBuilds: PendingBuild[] = [];
+
+    function ghostDims(kind: string): [number, number, number] {
+      if (kind === 'wall' || kind === 'door') return [4.2, 3, 0.35];
+      if (kind === 'floor') return [3, 0.3, 3];
+      if (kind === 'ladder') return [1.2, 3, 2];
+      return [2.6, 1.2, 3]; // ramp footprint
+    }
+
+    function finishPendingBuild(b: PendingBuild) {
+      const piece = pieceFor(b.kind);
+      if (b.kind === 'wall') {
+        buildFortniteWall(b.x, b.gy, b.z, b.angle);
+        showMessage('🧱 Wall deployed! (' + piece.hp + ' HP, voxel) Take cover — bullets chip it, grenades carve it!', 2.5);
+      } else if (b.kind === 'door') {
+        buildFortniteDoor(b.x, b.gy, b.z, b.angle);
+        showMessage('🚪 Door wall up! Cover with a doorway you control!', 2.5);
+      } else if (b.kind === 'floor') {
+        addVoxSolid(b.x, b.top - 0.28, b.top, b.z, 3, 3, bmPlank);
+        showMessage('🟫 Floor placed! Bridge water or raise a platform!', 2.5);
+      } else if (b.kind === 'ladder') {
+        buildFortniteLadder(b.x, b.z, b.angle, b.feetY);
+        showMessage('🪜 Ladder placed! Walk in and keep moving — you climb it like a stair!', 2.5);
+      } else if (b.stackOf) {
+        buildFortniteRamp(b.stackOf.endX, b.stackOf.endZ, b.stackOf.angleY, b.stackOf.topEnd);
+        showMessage('📐 Another staircase stacks on top — keep climbing!', 2.5);
+      } else {
+        buildFortniteRamp(b.x, b.z, b.angle, b.feetY);
+        showMessage('📐 Ramp placed! Run up onto roofs and containers!', 2.5);
+      }
+    }
+
+    function cancelPendingBuilds() {
+      for (const b of pendingBuilds) {
+        scene.remove(b.ghost);
+        b.ghost.geometry.dispose();
+        (b.ghost.material as THREE.Material).dispose();
+      }
+      pendingBuilds.length = 0;
+    }
+
+    function updatePendingBuilds(dt: number) {
+      if (!running()) {
+        cancelPendingBuilds();
+        return;
+      }
+      for (let i = pendingBuilds.length - 1; i >= 0; i--) {
+        const b = pendingBuilds[i];
+        b.t += dt;
+        const k = Math.min(1, b.t / b.dur);
+        // the piece prints upward out of the ground
+        const sc = 0.12 + 0.88 * k;
+        b.ghost.scale.y = sc;
+        b.ghost.position.y = b.baseY + (b.ghostH * sc) / 2;
+        (b.ghost.material as THREE.MeshLambertMaterial).opacity = 0.24 + 0.12 * Math.sin(b.t * 9);
+        if (k >= 1) {
+          scene.remove(b.ghost);
+          b.ghost.geometry.dispose();
+          (b.ghost.material as THREE.Material).dispose();
+          pendingBuilds.splice(i, 1);
+          finishPendingBuild(b);
+        }
+      }
+    }
+
     function placeWall() {
       if (!buildMode || !running() || playerDown) return;
       const forward = new THREE.Vector3();
@@ -2657,7 +2760,6 @@ export default function BattleRoyaleGame() {
       const rawAngle = Math.atan2(forward.x, forward.z);
       const feetY = camera.position.y - eyeH;
       const kind = resolvedBuildKind();
-      const piece = pieceFor(kind);
       // Wooden pieces cost wood in terrain modes (Harbor): the harvest
       // loop — chop trees, build cover. The Test Range stays free.
       if (terrainOn) {
@@ -2676,34 +2778,64 @@ export default function BattleRoyaleGame() {
       const rampUnderfoot = onStaircase();
       const stacking = kind === 'ramp' && pitch > STAIR_STACK_PITCH && !!rampUnderfoot;
 
-      if (kind === 'wall') {
-        buildFortniteWall(px, groundAt(px, pz), pz, angle);
-        spendShield(PIECE_COST.wall, px, groundAt(px, pz) + 1.1, pz, 1.3);
-        showMessage('🧱 Wall deployed! (' + piece.hp + ' HP, voxel) Take cover — bullets chip it, grenades carve it!', 2.5);
-      } else if (kind === 'door') {
-        buildFortniteDoor(px, groundAt(px, pz), pz, angle);
-        spendShield(PIECE_COST.door, px, groundAt(px, pz) + 1.1, pz, 1.3);
-        showMessage('🚪 Door wall up! Cover with a doorway you control!', 2.5);
+      // Draft the microbots onto the site: they assemble the piece
+      // over BUILD_SECONDS while the ghost grows into it.
+      const gy = groundAt(px, pz);
+      const top = Math.max(feetY, gy + 0.05) + 0.06;
+      const dur = (BUILD_SECONDS[kind] ?? 2.5) * buildSpeedMult;
+      const [gw, gh, gd] = ghostDims(kind);
+      const ghost = new THREE.Mesh(
+        new THREE.BoxGeometry(gw, gh, gd),
+        new THREE.MeshLambertMaterial({ color: 0x67e8f9, transparent: true, opacity: 0.3, depthWrite: false })
+      );
+      let cx = px;
+      let cz = pz;
+      let baseY = gy;
+      let spendY = gy + 1.1;
+      let asmR = 1.3;
+      if (kind === 'wall' || kind === 'door') {
+        baseY = gy;
       } else if (kind === 'floor') {
-        const top = Math.max(feetY, groundAt(px, pz) + 0.05) + 0.06;
-        addVoxSolid(px, top - 0.28, top, pz, 3, 3, bmPlank);
-        spendShield(PIECE_COST.floor, px, top + 0.25, pz, 1.5);
-        showMessage('🟫 Floor placed! Bridge water or raise a platform!', 2.5);
+        baseY = top - 0.3;
+        spendY = top + 0.25;
+        asmR = 1.5;
       } else if (kind === 'ladder') {
-        buildFortniteLadder(px, pz, angle, feetY);
-        spendShield(PIECE_COST.ladder, px, feetY + 1.7, pz, 0.9);
-        showMessage('🪜 Ladder placed! Walk in and keep moving — you climb it like a stair!', 2.5);
+        baseY = feetY;
+        spendY = feetY + 1.7;
+        asmR = 0.9;
       } else if (stacking && rampUnderfoot) {
-        // Continue THIS staircase: the next one starts where it ends, at
-        // its top — walk straight up the chain into the sky.
-        buildFortniteRamp(rampUnderfoot.endX, rampUnderfoot.endZ, rampUnderfoot.angleY, rampUnderfoot.topEnd);
-        spendShield(PIECE_COST.ramp, rampUnderfoot.endX, rampUnderfoot.topEnd + 0.5, rampUnderfoot.endZ, 1.1);
-        showMessage('📐 Another staircase stacks on top — keep climbing!', 2.5);
+        cx = rampUnderfoot.endX;
+        cz = rampUnderfoot.endZ;
+        baseY = rampUnderfoot.topEnd;
+        spendY = rampUnderfoot.topEnd + 0.5;
+        asmR = 1.1;
       } else {
-        buildFortniteRamp(px, pz, angle, feetY);
-        spendShield(PIECE_COST.ramp, px, feetY + 0.55, pz, 1.2);
-        showMessage('📐 Ramp placed! Run up onto roofs and containers!', 2.5);
+        baseY = feetY;
+        spendY = feetY + 0.55;
+        asmR = 1.2;
       }
+      ghost.position.set(cx, baseY + gh / 2, cz);
+      ghost.rotation.y = stacking && rampUnderfoot ? rampUnderfoot.angleY : angle;
+      scene.add(ghost);
+      pendingBuilds.push({
+        kind,
+        x: px,
+        z: pz,
+        gy,
+        top,
+        feetY,
+        angle,
+        stackOf: stacking ? rampUnderfoot : null,
+        t: 0,
+        dur,
+        ghost,
+        ghostH: gh,
+        baseY,
+      });
+      // The builder swarm detaches NOW and stays assembling the site
+      // for the whole construction window.
+      spendShield(PIECE_COST[kind] ?? 10, cx, spendY, cz, asmR, dur);
+      showMessage('🔨 Microbots assembling ' + (BUILD_NAME[kind] || 'piece') + ' — ' + dur.toFixed(1) + 's…', 2);
       toggleBuildWall(false);
     }
 
@@ -2850,7 +2982,7 @@ export default function BattleRoyaleGame() {
     // Microbot Shield Swarm
     // ----------------------------------------------------
     // The shield is not a holographic bubble anymore — it is a swarm
-    // of microbots. One bot flies for every 10 shield points,
+    // of microbots. One small bot flies for every 5 shield points,
     // orbiting its host (the player or a training dummy). Every
     // absorbed shot makes the nearest bot dash INTO the bullet's
     // path and flash — a bot standing in front of the round. Building
@@ -2859,7 +2991,7 @@ export default function BattleRoyaleGame() {
     // assemble the piece and merge into it. In direct sun the swarm
     // recharges at 45 shield per second; under a roof or a tree
     // crown it only gets the legacy 6-second trickle.
-    const SHIELD_PER_BOT = 10;
+    const SHIELD_PER_BOT = 5; // 1 microbot hovers per 5 shield
     const SUN_REGEN = 45; // shield per second in direct sun
     const ABILITY_SHIELD_COST = 25; // turret / antenna deploy drain
     const botEase = (k: number) => 1 - (1 - k) * (1 - k);
@@ -2906,7 +3038,7 @@ export default function BattleRoyaleGame() {
       dead: boolean;
     }
 
-    const MAX_BOTS = 720; // player 46 + every patrol at max shield
+    const MAX_BOTS = 1024; // 1 bot / 5 shield: player 92 at max + every dummy swarm
     const botSlots: BotSlot[] = [];
     for (let i = 0; i < MAX_BOTS; i++) {
       botSlots.push({
@@ -2915,12 +3047,12 @@ export default function BattleRoyaleGame() {
       });
     }
     const botCore = new THREE.InstancedMesh(
-      new THREE.BoxGeometry(0.055, 0.055, 0.055),
+      new THREE.BoxGeometry(0.028, 0.028, 0.028),
       new THREE.MeshBasicMaterial({ color: 0xbdf6ff }),
       MAX_BOTS
     );
     const botHalo = new THREE.InstancedMesh(
-      new THREE.BoxGeometry(0.14, 0.14, 0.14),
+      new THREE.BoxGeometry(0.072, 0.072, 0.072),
       new THREE.MeshBasicMaterial({ color: 0x67e8f9, transparent: true, opacity: 0.3, blending: THREE.AdditiveBlending, depthWrite: false }),
       MAX_BOTS
     );
@@ -3025,7 +3157,7 @@ export default function BattleRoyaleGame() {
       return n;
     }
 
-    // Match the orbiting swarm to the host's shield: 1 bot / 10 shield
+    // Match the orbiting swarm to the host's shield: 1 bot / 5 shield
     function reconcileField(f: BotField, want: number) {
       if (f.dead || want < 0) return;
       const have = idleBotCount(f);
@@ -3102,9 +3234,9 @@ export default function BattleRoyaleGame() {
 
     // Builder swarm: `amount` shield detaches, arcs to the piece and
     // assembles it, then merges into it.
-    function botFieldSpend(f: BotField | null, amount: number, tx: number, ty: number, tz: number, asmR: number) {
+    function botFieldSpend(f: BotField | null, amount: number, tx: number, ty: number, tz: number, asmR: number, holdSec = 0) {
       if (!f || f.dead || amount <= 0) return;
-      const send = Math.min(Math.max(1, Math.round(amount / SHIELD_PER_BOT)), 6);
+      const send = Math.min(Math.max(1, Math.round(amount / SHIELD_PER_BOT)), 8);
       let sent = 0;
       for (const i of f.slots) {
         if (sent >= send) break;
@@ -3115,7 +3247,7 @@ export default function BattleRoyaleGame() {
           kind: 'build',
           t: -sent * 0.05,
           dur: 0.28 + dist * 0.02,
-          hold: 0.55 + Math.random() * 0.2,
+          hold: holdSec > 0 ? holdSec * (0.82 + Math.random() * 0.36) : 0.55 + Math.random() * 0.2,
           back: 0,
           fx: s.x, fy: s.y, fz: s.z, tx, ty, tz,
           lift: 0.8 + Math.min(2, dist * 0.06),
@@ -3126,13 +3258,13 @@ export default function BattleRoyaleGame() {
     }
 
     // Wooden builds + turret / antenna deploys spend the swarm itself
-    function spendShield(amount: number, tx: number, ty: number, tz: number, asmR = 1.4) {
+    function spendShield(amount: number, tx: number, ty: number, tz: number, asmR = 1.4, holdSec = 0) {
       if (amount <= 0) return;
       const spent = Math.min(shield, amount);
       shield -= spent;
       if (spent > 0) {
         if (!playerField) playerField = makeBotField(true, null);
-        botFieldSpend(playerField, spent, tx, ty, tz, asmR);
+        botFieldSpend(playerField, spent, tx, ty, tz, asmR, holdSec);
       }
       if (shield <= 0.01) showMessage('⚡ Swarm spent — step into the sun to recharge (45/s)', 2.4);
     }
@@ -3327,6 +3459,9 @@ export default function BattleRoyaleGame() {
     const wood = new THREE.MeshLambertMaterial({ color: 0x6b4a2e });
     const amber = new THREE.MeshLambertMaterial({ color: 0xf2a516 });
     const steel = new THREE.MeshLambertMaterial({ color: 0xb6bec9 });
+    const gunmetal = new THREE.MeshLambertMaterial({ color: 0x202836 });
+    const poly = new THREE.MeshLambertMaterial({ color: 0x3a4450 });
+    const warhead = new THREE.MeshLambertMaterial({ color: 0x93342f });
 
     function part(g: THREE.Group, geo: THREE.BufferGeometry, mat: THREE.Material, x: number, y: number, z: number, rx = 0) {
       const m = new THREE.Mesh(geo, mat);
@@ -3338,71 +3473,160 @@ export default function BattleRoyaleGame() {
     }
 
     function buildSK(g: THREE.Group) {
-      part(g, new THREE.BoxGeometry(0.075, 0.09, 0.24), metal, 0, 0, -0.12);
-      part(g, new THREE.BoxGeometry(0.03, 0.018, 0.22), dark, 0, 0.054, -0.12);
-      part(g, new THREE.BoxGeometry(0.02, 0.022, 0.02), dark, 0, 0.074, -0.03);
-      part(g, new THREE.BoxGeometry(0.012, 0.054, 0.012), amber, 0, 0.058, -0.56);
-      part(g, new THREE.CylinderGeometry(0.013, 0.013, 0.36, 10), metal, 0, 0.02, -0.42, Math.PI / 2);
-      part(g, new THREE.CylinderGeometry(0.018, 0.018, 0.06, 10), dark, 0, 0.02, -0.63, Math.PI / 2);
-      part(g, new THREE.BoxGeometry(0.068, 0.07, 0.2), wood, 0, -0.005, -0.4);
-      part(g, new THREE.BoxGeometry(0.04, 0.12, 0.06), dark, 0, -0.11, -0.2);
-      part(g, new THREE.BoxGeometry(0.04, 0.12, 0.05), dark, 0, -0.095, -0.05, -0.25);
-      part(g, new THREE.BoxGeometry(0.06, 0.1, 0.22), wood, 0, -0.01, 0.12);
-      part(g, new THREE.BoxGeometry(0.058, 0.11, 0.02), dark, 0, -0.01, 0.24);
-      part(g, new THREE.BoxGeometry(0.01, 0.012, 0.04), dark, 0.042, 0.03, -0.1);
+      // receiver + top rail + charging handle
+      part(g, new THREE.BoxGeometry(0.075, 0.075, 0.3), gunmetal, 0, 0.01, -0.08);
+      part(g, new THREE.BoxGeometry(0.05, 0.016, 0.34), dark, 0, 0.058, -0.1);
+      part(g, new THREE.BoxGeometry(0.03, 0.012, 0.04), steel, 0.046, 0.046, 0.02);
+      // iron sights
+      part(g, new THREE.BoxGeometry(0.014, 0.02, 0.05), dark, 0, 0.072, -0.16);
+      part(g, new THREE.BoxGeometry(0.02, 0.022, 0.02), dark, 0, 0.072, -0.2);
+      part(g, new THREE.BoxGeometry(0.006, 0.026, 0.006), amber, 0, 0.078, -0.2);
+      // gas tube + ventilated handguard
+      part(g, new THREE.CylinderGeometry(0.011, 0.011, 0.2, 10), steel, 0, 0.046, -0.32, Math.PI / 2);
+      part(g, new THREE.BoxGeometry(0.062, 0.062, 0.24), poly, 0, -0.005, -0.34);
+      for (let i = 0; i < 4; i++) part(g, new THREE.BoxGeometry(0.066, 0.01, 0.02), dark, 0, 0.02, -0.26 - i * 0.05);
+      // barrel + slotted muzzle brake
+      part(g, new THREE.CylinderGeometry(0.013, 0.013, 0.34, 10), metal, 0, 0.02, -0.44, Math.PI / 2);
+      part(g, new THREE.CylinderGeometry(0.019, 0.017, 0.07, 10), dark, 0, 0.02, -0.63, Math.PI / 2);
+      part(g, new THREE.BoxGeometry(0.045, 0.012, 0.05), dark, 0, 0.02, -0.63);
+      // curved magazine (two stacked sections)
+      part(g, new THREE.BoxGeometry(0.032, 0.13, 0.055), poly, 0, -0.09, -0.12, 0.18);
+      part(g, new THREE.BoxGeometry(0.032, 0.05, 0.05), poly, 0, -0.16, -0.085, 0.38);
+      // trigger guard + trigger + grip
+      part(g, new THREE.BoxGeometry(0.026, 0.012, 0.07), dark, 0, -0.045, -0.03);
+      part(g, new THREE.BoxGeometry(0.03, 0.008, 0.012), steel, 0, -0.048, -0.045);
+      part(g, new THREE.BoxGeometry(0.036, 0.11, 0.05), poly, 0, -0.085, 0.02, -0.28);
+      // telescoping stock + cheek rest + buttpad
+      part(g, new THREE.BoxGeometry(0.05, 0.055, 0.16), poly, 0, -0.005, 0.14);
+      part(g, new THREE.BoxGeometry(0.03, 0.026, 0.09), dark, 0, 0.038, 0.12);
+      part(g, new THREE.BoxGeometry(0.058, 0.1, 0.05), dark, 0, -0.01, 0.24);
     }
 
     function buildSMG(g: THREE.Group) {
-      part(g, new THREE.BoxGeometry(0.06, 0.07, 0.2), dark, 0, 0, -0.1);
-      part(g, new THREE.BoxGeometry(0.03, 0.02, 0.12), dark, 0, 0.045, -0.12);
-      part(g, new THREE.BoxGeometry(0.016, 0.02, 0.016), dark, 0, 0.065, -0.04);
-      part(g, new THREE.BoxGeometry(0.01, 0.04, 0.01), amber, 0, 0.055, -0.32);
-      part(g, new THREE.CylinderGeometry(0.009, 0.009, 0.16, 10), metal, 0, 0.01, -0.27, Math.PI / 2);
-      part(g, new THREE.CylinderGeometry(0.013, 0.013, 0.03, 10), dark, 0, 0.01, -0.37, Math.PI / 2);
-      part(g, new THREE.BoxGeometry(0.05, 0.05, 0.1), dark, 0, -0.01, -0.26);
-      part(g, new THREE.BoxGeometry(0.03, 0.15, 0.05), steel, 0, -0.1, -0.13);
-      part(g, new THREE.BoxGeometry(0.035, 0.09, 0.045), dark, 0, -0.07, -0.04, -0.2);
-      part(g, new THREE.BoxGeometry(0.04, 0.05, 0.12), wood, 0, 0, 0.07);
-      part(g, new THREE.BoxGeometry(0.042, 0.055, 0.012), dark, 0, 0, 0.135);
+      part(g, new THREE.BoxGeometry(0.058, 0.07, 0.22), dark, 0, 0, -0.1);
+      part(g, new THREE.BoxGeometry(0.03, 0.018, 0.16), gunmetal, 0, 0.048, -0.12);
+      part(g, new THREE.BoxGeometry(0.012, 0.02, 0.012), dark, 0, 0.066, -0.05);
+      part(g, new THREE.BoxGeometry(0.005, 0.022, 0.005), amber, 0, 0.068, -0.16);
+      part(g, new THREE.CylinderGeometry(0.009, 0.009, 0.18, 10), metal, 0, 0.01, -0.28, Math.PI / 2);
+      part(g, new THREE.CylinderGeometry(0.014, 0.012, 0.05, 10), dark, 0, 0.01, -0.39, Math.PI / 2);
+      part(g, new THREE.BoxGeometry(0.048, 0.05, 0.12), poly, 0, -0.005, -0.26);
+      part(g, new THREE.BoxGeometry(0.03, 0.14, 0.045), poly, 0, -0.1, -0.12, 0.12);
+      part(g, new THREE.BoxGeometry(0.026, 0.012, 0.06), dark, 0, -0.042, -0.04);
+      part(g, new THREE.BoxGeometry(0.03, 0.008, 0.012), steel, 0, -0.046, -0.05);
+      part(g, new THREE.BoxGeometry(0.034, 0.1, 0.045), poly, 0, -0.075, -0.005, -0.22);
+      part(g, new THREE.BoxGeometry(0.028, 0.07, 0.04), poly, 0, -0.075, -0.24, 0.15);
+      // wire stock: two rails + butt plate
+      part(g, new THREE.BoxGeometry(0.012, 0.012, 0.14), steel, -0.018, 0.015, 0.1);
+      part(g, new THREE.BoxGeometry(0.012, 0.012, 0.14), steel, 0.018, 0.015, 0.1);
+      part(g, new THREE.BoxGeometry(0.042, 0.07, 0.016), dark, 0, 0.005, 0.17);
+      // the teeth: amber cones down the shroud
       for (let i = 0; i < 5; i++) {
-        const t = new THREE.Mesh(new THREE.ConeGeometry(0.008, 0.02, 4), amber);
+        const t = new THREE.Mesh(new THREE.ConeGeometry(0.008, 0.022, 4), amber);
         t.rotation.z = -Math.PI / 2;
-        t.position.set(0.034, 0.005, -0.04 - i * 0.03);
+        t.position.set(0.032, 0.005, -0.05 - i * 0.03);
         t.castShadow = true;
         g.add(t);
       }
     }
 
     function buildSniper(g: THREE.Group) {
-      part(g, new THREE.BoxGeometry(0.07, 0.085, 0.2), metal, 0, 0, -0.16);
+      part(g, new THREE.BoxGeometry(0.066, 0.08, 0.22), gunmetal, 0, 0, -0.16);
       part(g, new THREE.CylinderGeometry(0.012, 0.012, 0.64, 10), metal, 0, 0.018, -0.58, Math.PI / 2);
-      part(g, new THREE.CylinderGeometry(0.02, 0.02, 0.07, 10), dark, 0, 0.018, -0.9, Math.PI / 2);
-      part(g, new THREE.BoxGeometry(0.03, 0.02, 0.26), dark, 0, 0.05, -0.2);
-      part(g, new THREE.BoxGeometry(0.03, 0.03, 0.03), dark, 0, 0.07, -0.2);
+      part(g, new THREE.CylinderGeometry(0.02, 0.016, 0.08, 10), dark, 0, 0.018, -0.9, Math.PI / 2);
+      part(g, new THREE.BoxGeometry(0.05, 0.014, 0.06), dark, 0, 0.018, -0.9);
+      // scope, lens + mounting rings + knob
       part(g, new THREE.CylinderGeometry(0.02, 0.02, 0.24, 14), dark, 0, 0.1, -0.2, Math.PI / 2);
       part(g, new THREE.CylinderGeometry(0.026, 0.02, 0.05, 14), dark, 0, 0.1, -0.06, Math.PI / 2);
-      part(g, new THREE.CylinderGeometry(0.03, 0.026, 0.06, 14), dark, 0, 0.1, -0.34, Math.PI / 2);
-      part(g, new THREE.BoxGeometry(0.04, 0.12, 0.06), dark, 0, -0.1, -0.16);
-      part(g, new THREE.BoxGeometry(0.04, 0.12, 0.05), dark, 0, -0.095, -0.05, -0.25);
-      part(g, new THREE.BoxGeometry(0.06, 0.1, 0.3), wood, 0, -0.01, 0.1);
-      part(g, new THREE.BoxGeometry(0.058, 0.11, 0.02), dark, 0, -0.01, 0.26);
-      part(g, new THREE.BoxGeometry(0.01, 0.012, 0.04), dark, 0.042, 0.03, -0.14);
+      part(g, new THREE.CylinderGeometry(0.03, 0.024, 0.05, 14), dark, 0, 0.1, -0.34, Math.PI / 2);
+      part(g, new THREE.CylinderGeometry(0.017, 0.017, 0.012, 12), steel, 0, 0.1, -0.336, Math.PI / 2);
+      part(g, new THREE.BoxGeometry(0.018, 0.045, 0.02), steel, 0, 0.065, -0.12);
+      part(g, new THREE.BoxGeometry(0.018, 0.045, 0.02), steel, 0, 0.065, -0.28);
+      part(g, new THREE.BoxGeometry(0.03, 0.016, 0.03), dark, 0, 0.132, -0.2);
+      // bolt handle + knob
+      part(g, new THREE.CylinderGeometry(0.007, 0.007, 0.07, 8), steel, 0.04, 0.02, -0.1, Math.PI / 2);
+      part(g, new THREE.SphereGeometry(0.013, 8, 6), dark, 0.072, 0.02, -0.1);
+      // backup iron sight ring on the barrel
+      part(g, new THREE.BoxGeometry(0.024, 0.016, 0.02), dark, 0, 0.052, -0.62);
+      // magazine + trigger + grip
+      part(g, new THREE.BoxGeometry(0.03, 0.075, 0.07), poly, 0, -0.07, -0.18, 0.12);
+      part(g, new THREE.BoxGeometry(0.026, 0.012, 0.07), dark, 0, -0.045, -0.05);
+      part(g, new THREE.BoxGeometry(0.03, 0.008, 0.012), steel, 0, -0.05, -0.06);
+      part(g, new THREE.BoxGeometry(0.036, 0.1, 0.05), poly, 0, -0.08, -0.01, -0.25);
+      // stock with cheek riser + buttpad
+      part(g, new THREE.BoxGeometry(0.056, 0.09, 0.34), poly, 0, -0.012, 0.12);
+      part(g, new THREE.BoxGeometry(0.036, 0.03, 0.16), dark, 0, 0.04, 0.1);
+      part(g, new THREE.BoxGeometry(0.05, 0.11, 0.02), dark, 0, -0.015, 0.26);
     }
 
     function buildBetgun(g: THREE.Group) {
-      part(g, new THREE.BoxGeometry(0.08, 0.1, 0.26), dark, 0, 0, -0.14);
+      part(g, new THREE.BoxGeometry(0.08, 0.09, 0.26), dark, 0, 0, -0.14);
       part(g, new THREE.CylinderGeometry(0.026, 0.026, 0.6, 12), metal, -0.022, 0.02, -0.56, Math.PI / 2);
       part(g, new THREE.CylinderGeometry(0.026, 0.026, 0.6, 12), metal, 0.022, 0.02, -0.56, Math.PI / 2);
-      part(g, new THREE.BoxGeometry(0.07, 0.07, 0.2), wood, 0, -0.045, -0.4);
-      part(g, new THREE.BoxGeometry(0.04, 0.12, 0.05), dark, 0, -0.1, -0.02, -0.25);
-      part(g, new THREE.BoxGeometry(0.06, 0.12, 0.3), wood, 0, -0.01, 0.12);
-      part(g, new THREE.BoxGeometry(0.058, 0.13, 0.02), dark, 0, -0.01, 0.28);
+      part(g, new THREE.CylinderGeometry(0.029, 0.029, 0.02, 12), dark, -0.022, 0.02, -0.86, Math.PI / 2);
+      part(g, new THREE.CylinderGeometry(0.029, 0.029, 0.02, 12), dark, 0.022, 0.02, -0.86, Math.PI / 2);
+      part(g, new THREE.BoxGeometry(0.006, 0.014, 0.008), amber, 0, 0.052, -0.84); // bead sight
+      // pump forend with grooves
+      part(g, new THREE.BoxGeometry(0.07, 0.05, 0.16), wood, 0, -0.02, -0.42);
+      for (let i = 0; i < 3; i++) part(g, new THREE.BoxGeometry(0.074, 0.012, 0.02), dark, 0, 0.004, -0.38 - i * 0.05);
+      // side shell carrier: three red shells riding the receiver
+      for (let i = 0; i < 3; i++) part(g, new THREE.CylinderGeometry(0.009, 0.009, 0.032, 8), amber, 0.05, 0.02, -0.08 - i * 0.036, Math.PI / 2);
+      part(g, new THREE.BoxGeometry(0.026, 0.012, 0.07), dark, 0, -0.05, -0.02);
+      part(g, new THREE.BoxGeometry(0.03, 0.008, 0.012), steel, 0, -0.054, -0.03);
+      part(g, new THREE.BoxGeometry(0.04, 0.11, 0.05), wood, 0, -0.09, 0, -0.25);
+      part(g, new THREE.BoxGeometry(0.06, 0.12, 0.3), wood, 0, -0.01, 0.13);
+      part(g, new THREE.BoxGeometry(0.03, 0.026, 0.1), dark, 0, 0.04, 0.12); // comb
+      part(g, new THREE.BoxGeometry(0.058, 0.13, 0.024), dark, 0, -0.01, 0.28);
+    }
+
+    function buildPistol(g: THREE.Group) {
+      // slide with serrations + iron sights
+      part(g, new THREE.BoxGeometry(0.036, 0.05, 0.24), gunmetal, 0, 0.02, -0.1);
+      for (let i = 0; i < 5; i++) part(g, new THREE.BoxGeometry(0.04, 0.006, 0.012), dark, 0, 0.03, -0.02 - i * 0.018);
+      part(g, new THREE.BoxGeometry(0.006, 0.014, 0.006), dark, 0, 0.052, -0.2);
+      part(g, new THREE.BoxGeometry(0.004, 0.01, 0.004), amber, 0, 0.052, -0.202);
+      part(g, new THREE.BoxGeometry(0.014, 0.012, 0.01), dark, 0, 0.052, 0);
+      // frame + barrel stub + ejection port
+      part(g, new THREE.BoxGeometry(0.032, 0.03, 0.2), poly, 0, -0.02, -0.08);
+      part(g, new THREE.CylinderGeometry(0.008, 0.008, 0.05, 10), metal, 0, 0.015, -0.24, Math.PI / 2);
+      part(g, new THREE.BoxGeometry(0.02, 0.008, 0.05), dark, 0.008, 0.032, -0.05);
+      // grip with mag baseplate + flared heel
+      part(g, new THREE.BoxGeometry(0.03, 0.1, 0.05), poly, 0, -0.08, 0.01, -0.18);
+      part(g, new THREE.BoxGeometry(0.034, 0.02, 0.054), dark, 0, -0.126, 0.022, -0.18);
+      // trigger guard + trigger + hammer
+      part(g, new THREE.BoxGeometry(0.024, 0.008, 0.05), dark, 0, -0.04, -0.06);
+      part(g, new THREE.BoxGeometry(0.008, 0.008, 0.026), dark, 0, -0.04, -0.088);
+      part(g, new THREE.BoxGeometry(0.008, 0.012, 0.008), steel, 0, -0.032, -0.068);
+      part(g, new THREE.BoxGeometry(0.014, 0.016, 0.012), dark, 0, 0.032, 0.024, 0.5);
+    }
+
+    function buildRPG(g: THREE.Group) {
+      // main tube + front/rear bells
+      part(g, new THREE.CylinderGeometry(0.045, 0.045, 0.72, 14), poly, 0, 0.02, -0.18, Math.PI / 2);
+      part(g, new THREE.CylinderGeometry(0.052, 0.045, 0.1, 14), dark, 0, 0.02, -0.52, Math.PI / 2);
+      part(g, new THREE.CylinderGeometry(0.05, 0.045, 0.08, 14), dark, 0, 0.02, 0.18, Math.PI / 2);
+      // heat-shield rings down the tube
+      for (let i = 0; i < 3; i++) part(g, new THREE.CylinderGeometry(0.047, 0.047, 0.014, 14), dark, 0, 0.02, -0.36 + i * 0.16, Math.PI / 2);
+      // warhead: probe stick + conical head
+      part(g, new THREE.CylinderGeometry(0.028, 0.028, 0.1, 10), gunmetal, 0, 0.02, -0.56, Math.PI / 2);
+      part(g, new THREE.ConeGeometry(0.05, 0.16, 12), warhead, 0, 0.02, -0.66, -Math.PI / 2);
+      // rear blast cone
+      part(g, new THREE.ConeGeometry(0.05, 0.1, 12), gunmetal, 0, 0.02, 0.26, Math.PI / 2);
+      // grips + trigger guard
+      part(g, new THREE.BoxGeometry(0.03, 0.1, 0.045), poly, 0, -0.07, -0.02, -0.2);
+      part(g, new THREE.BoxGeometry(0.03, 0.09, 0.04), poly, 0, -0.07, -0.34, 0.15);
+      part(g, new THREE.BoxGeometry(0.024, 0.008, 0.05), dark, 0, -0.032, -0.06);
+      // optical sight on top
+      part(g, new THREE.BoxGeometry(0.02, 0.03, 0.02), steel, 0, 0.08, -0.08);
+      part(g, new THREE.BoxGeometry(0.03, 0.05, 0.12), dark, 0, 0.098, -0.02);
+      part(g, new THREE.CylinderGeometry(0.022, 0.022, 0.09, 10), dark, 0, 0.118, -0.12, Math.PI / 2);
     }
 
     function buildWeaponModel(kind: string, g: THREE.Group) {
       if (kind === 'smg') buildSMG(g);
       else if (kind === 'sniper') buildSniper(g);
       else if (kind === 'betgun') buildBetgun(g);
+      else if (kind === 'pistol') buildPistol(g);
+      else if (kind === 'rpg') buildRPG(g);
       else buildSK(g);
     }
 
@@ -3552,11 +3776,13 @@ export default function BattleRoyaleGame() {
       }
     }
 
-    const DUMMY_WEAPONS = ['sk', 'smg', 'sniper', 'betgun'];
-    let dummyWeaponCounter = 0;
+    // Every bot starts with the SAME sidearm as the player — the
+    // pistol. They upgrade by LOOTING weapon pickups scattered over
+    // the map (see the loot logic in updateAI).
+    const showcaseSpots: Array<{ x: number; z: number; kind: string }> = [];
 
     function spawnDummy(x: number, z: number, shooter = false, ai = false, weaponChoice?: string) {
-      const assignedWeapon = weaponChoice || (shooter ? DUMMY_WEAPONS[dummyWeaponCounter++ % DUMMY_WEAPONS.length] : 'sk');
+      const assignedWeapon = weaponChoice || 'pistol';
       const d: DummyObject = {
         group: new THREE.Group(),
         parts: [],
@@ -3597,14 +3823,23 @@ export default function BattleRoyaleGame() {
         }
         d.gunGroup = gun;
         d.muzzle = new THREE.Object3D();
-        const mz = assignedWeapon === 'sniper' ? 1.05 : assignedWeapon === 'betgun' ? 0.9 : assignedWeapon === 'smg' ? 0.65 : 0.85;
+        const mz =
+          assignedWeapon === 'sniper'
+            ? 1.05
+            : assignedWeapon === 'betgun'
+            ? 0.9
+            : assignedWeapon === 'smg'
+            ? 0.65
+            : assignedWeapon === 'pistol'
+            ? 0.55
+            : 0.85;
         d.muzzle.position.set(0, 0.02, mz);
         gun.add(d.muzzle);
         d.group.add(gun);
       }
 
       // The dummy's shield visual is a MICROBOT SWARM now — no
-      // holographic bubble: 1 bot per 10 shield orbits the figure
+      // holographic bubble: 1 bot per 5 shield orbits the figure
       // (see the Microbot Shield Swarm block above).
       d.bots = makeBotField(false, d);
 
@@ -3612,6 +3847,36 @@ export default function BattleRoyaleGame() {
       dummies.push(d);
       spots.push({ x, z });
       return d;
+    }
+
+    // Re-arm a bot in the field (loot pickup): swaps the held weapon
+    // model + muzzle offset to the new kind.
+    function armDummy(d: DummyObject, kind: string) {
+      d.weaponKind = kind;
+      if (!d.gunGroup) return; // non-shooter: the tag is enough
+      for (let i = d.gunGroup.children.length - 1; i >= 0; i--) {
+        const c: any = d.gunGroup.children[i];
+        if (c === d.muzzle) continue;
+        c.traverse?.((o: any) => {
+          if (o.isMesh && o.geometry) o.geometry.dispose();
+        });
+        d.gunGroup.remove(c);
+      }
+      const model = new THREE.Group();
+      buildWeaponModel(kind, model);
+      // First-person models aim along -Z; rotate to aim along +Z for dummies
+      model.rotation.y = Math.PI;
+      model.position.set(0, 0, 0.18);
+      for (const child of model.children) {
+        if ((child as THREE.Mesh).isMesh) (child as THREE.Mesh).castShadow = true;
+      }
+      d.gunGroup.add(model);
+      if (d.muzzle)
+        d.muzzle.position.set(
+          0,
+          0.02,
+          kind === 'sniper' ? 1.05 : kind === 'betgun' ? 0.9 : kind === 'smg' ? 0.65 : kind === 'pistol' ? 0.55 : 0.85
+        );
     }
 
     function addCrate(x: number, z: number, w: number, h: number, depth: number, color: THREE.Color) {
@@ -3635,7 +3900,10 @@ export default function BattleRoyaleGame() {
       spawnDummy(Math.cos(a) * r, Math.sin(a) * r);
     }
 
-    // Armed shooter dummies wielding each weapon (SK, Sharkteeth SMG, Sniper, Betgun)
+    // Armed shooter dummies — every bot now starts with the pistol
+    // like the player. The classic weapons are dropped as loot next
+    // to them (see the scatter block), so the AI squads visibly walk
+    // over and arm themselves — the same loot race as the player.
     const initialWeapons = ['sk', 'smg', 'sniper', 'betgun'];
     for (let i = 0; i < initialWeapons.length; i++) {
       let a = (i / initialWeapons.length) * Math.PI * 2;
@@ -3643,7 +3911,8 @@ export default function BattleRoyaleGame() {
       while (nearPool(Math.cos(a) * 32, Math.sin(a) * 32, 3) && tries++ < 50) {
         a = Math.random() * Math.PI * 2;
       }
-      spawnDummy(Math.cos(a) * 32, Math.sin(a) * 32, true, false, initialWeapons[i]);
+      spawnDummy(Math.cos(a) * 32, Math.sin(a) * 32, true, false);
+      showcaseSpots.push({ x: Math.cos(a) * 32, z: Math.sin(a) * 32, kind: initialWeapons[i] });
     }
 
     // Scatter crates
@@ -6831,6 +7100,43 @@ export default function BattleRoyaleGame() {
               setShooting(!!v);
               return !!v;
             },
+            // ---- Timed construction + rockets + weapons (?debug=1 e2e hooks) ----
+            builds: () => pendingBuilds.map((b) => ({ kind: b.kind, left: +(b.dur - b.t).toFixed(2) })),
+            setBuildSpeed: (mult: number) => {
+              buildSpeedMult = Math.max(0.02, +mult || 1);
+              return buildSpeedMult;
+            },
+            rockets: () => rockets.map((r) => ({ left: +(r.dur - r.t).toFixed(2) })),
+            nearestPickup: (kind?: string) => {
+              let best: any = null;
+              let bd = Infinity;
+              for (const p of pickups) {
+                if (p.taken || p.gone) continue;
+                if (kind && p.kind !== kind) continue;
+                const dd = Math.hypot(p.x - camera.position.x, p.z - camera.position.z);
+                if (dd < bd) {
+                  bd = dd;
+                  best = { kind: p.kind, x: +p.x.toFixed(1), z: +p.z.toFixed(1), d: +dd.toFixed(1) };
+                }
+              }
+              return best;
+            },
+            giveWeapon: (kind: string) => {
+              const w = (WEAPONS as any)[kind];
+              if (!w) return null;
+              if (!owned(w)) addWeapon(w, lastSlot);
+              else equip(w);
+              return w.name;
+            },
+            playerWeapon: () => (current ? { kind: current.kind, name: current.name, loaded: current.loaded } : null),
+            armBot: (i: number, kind: string) => {
+              const d = dummies[+i || 0];
+              if (!d) return null;
+              armDummy(d, kind);
+              return d.weaponKind || null;
+            },
+            botWeapons: () => dummies.map((d) => d.weaponKind || null),
+            botLootCount: () => dummies.filter((d) => d.ai && d.ai.lootTarget).length,
             // Replay the patrol-placement predicates and report why each
             // candidate fails (e2e diagnostics for empty patrol spawns).
             patrolProbe: () => {
@@ -7357,7 +7663,7 @@ export default function BattleRoyaleGame() {
     let lastSlot = 0;
     let msgT = 0;
     let msgText = '';
-    const reserve = { heavy: 60, light: 0 } as Record<string, number>;
+    const reserve = { heavy: 0, light: 60 } as Record<string, number>;
 
     const LIFE_MAX = 120;
     // Antenna is a recon frame: 100 life instead of the usual 120
@@ -7401,6 +7707,23 @@ export default function BattleRoyaleGame() {
     }
 
     const WEAPONS: Record<string, any> = {
+      pistol: {
+        name: 'Pistol',
+        kind: 'pistol',
+        ammo: 'light',
+        mag: 12,
+        loaded: 12,
+        damage: 26,
+        delay: 0.16,
+        reload: 0.85,
+        recoil: 0.018,
+        muzzleZ: -0.3,
+        falloff: [30, 90] as [number, number],
+        hip: new THREE.Vector3(0.2, -0.2, -0.45),
+        ads: new THREE.Vector3(0, -0.07, -0.34),
+        grip: new THREE.Vector3(0, -0.07, -0.03),
+        support: new THREE.Vector3(0, -0.03, -0.2),
+      },
       sk: {
         name: 'SK',
         kind: 'sk',
@@ -7424,7 +7747,7 @@ export default function BattleRoyaleGame() {
         ammo: 'light',
         mag: 40,
         loaded: 0,
-        damage: 15.2 * 1.4,
+        damage: 15.2 * 1.4 * 1.35, // sharkteeth +35% damage
         delay: 0.05,
         reload: 1.0,
         recoil: 0.01,
@@ -7471,15 +7794,37 @@ export default function BattleRoyaleGame() {
         grip: new THREE.Vector3(0, -0.1, -0.03),
         support: new THREE.Vector3(0, -0.045, -0.36),
       },
+      rpg: {
+        name: 'Rocket Launcher',
+        kind: 'rpg',
+        ammo: 'blast', // blast bombs ARE the ammunition
+        mag: 1,
+        loaded: 1,
+        damage: 90,
+        delay: 1.2,
+        reload: 2.4,
+        recoil: 0.12,
+        muzzleZ: -0.72,
+        rocket: true,
+        falloff: [400, 900] as [number, number],
+        hip: new THREE.Vector3(0.26, -0.22, -0.5),
+        ads: new THREE.Vector3(0.07, -0.1, -0.42),
+        grip: new THREE.Vector3(0, -0.09, -0.05),
+        support: new THREE.Vector3(0, -0.05, -0.34),
+      },
     };
 
+    makeWeapon(WEAPONS.pistol, buildPistol);
     makeWeapon(WEAPONS.sk, buildSK);
     makeWeapon(WEAPONS.smg, buildSMG);
     makeWeapon(WEAPONS.sniper, buildSniper);
     makeWeapon(WEAPONS.betgun, buildBetgun);
+    makeWeapon(WEAPONS.rpg, buildRPG);
 
-    let current = WEAPONS.sk;
-    const slots: any[] = [WEAPONS.sk, null];
+    // Everyone — player AND bots — starts with the pistol. Better
+    // guns come from the ground: loot them before the bots do.
+    let current = WEAPONS.pistol;
+    const slots: any[] = [WEAPONS.pistol, null];
     const owned = (w: any) => slots.includes(w);
     current.gun.visible = true;
 
@@ -7639,7 +7984,11 @@ export default function BattleRoyaleGame() {
       if (weaponEl) weaponEl.textContent = current.name;
       if (ammoEl) ammoEl.textContent = String(current.loaded);
       if (magEl) magEl.textContent = ` / ${current.mag}`;
-      if (reserveEl) reserveEl.textContent = `${current.ammo.toUpperCase()} ${reserve[current.ammo] || 0}`;
+      // The rocket launcher's magazine is BLAST BOMBS — the same
+      // grenades you throw, counted on the grenade plate
+      if (reserveEl)
+        reserveEl.textContent =
+          current.kind === 'rpg' ? `BLAST BOMBS ${grenades.blast}` : `${current.ammo.toUpperCase()} ${reserve[current.ammo] || 0}`;
     }
 
     function showMessage(text: string, seconds: number) {
@@ -7717,6 +8066,15 @@ export default function BattleRoyaleGame() {
     function startReload() {
       const w = current;
       if (!w || reloadT > 0 || w.loaded === w.mag) return;
+      if (w.kind === 'rpg') {
+        // Rockets load straight from the blast-bomb pouch
+        if (grenades.blast <= 0) {
+          showMessage('No blast bombs — loot or buy some (they feed the Rocket Launcher)', 1.8);
+          return;
+        }
+        reloadT = w.reload;
+        return;
+      }
       if ((reserve[w.ammo] || 0) <= 0) {
         showMessage(`No ${w.ammo} ammo`, 1.5);
         return;
@@ -7876,6 +8234,13 @@ export default function BattleRoyaleGame() {
           : hit
           ? hit.point
           : raycaster.ray.at(reach, new THREE.Vector3());
+      if (w.rocket) {
+        // The launcher eats blast bombs: the round flies to the
+        // impact point and detonates a full blast-bomb explosion.
+        launchRocket(from, to);
+        kick = w.recoil;
+        return;
+      }
       tracer(from, to);
       if (sd === Infinity && hit?.object.userData.dummy) {
         const s = shotDamage(w, hit.distance);
@@ -7903,6 +8268,73 @@ export default function BattleRoyaleGame() {
         }
       }
       kick = w.recoil;
+    }
+
+    // ----------------------------------------------------
+    // Rockets: the Rocket Launcher's slow, streaking projectiles.
+    // Each one flies the exact ray the bullet would have taken,
+    // then detonates a grenade-grade blast at the impact point.
+    // ----------------------------------------------------
+    const ROCKET_SPEED = 26;
+    const rockets: Array<{ mesh: THREE.Group; from: THREE.Vector3; to: THREE.Vector3; t: number; dur: number; trailT: number }> = [];
+    const rocketBodyMat = new THREE.MeshLambertMaterial({ color: 0x3a4250 });
+    const rocketWarheadMat = new THREE.MeshLambertMaterial({ color: 0x93342f });
+
+    function launchRocket(from: THREE.Vector3, to: THREE.Vector3) {
+      const g = new THREE.Group();
+      const body = new THREE.Mesh(new THREE.CylinderGeometry(0.03, 0.03, 0.22, 10), rocketBodyMat);
+      body.rotation.x = Math.PI / 2;
+      const nose = new THREE.Mesh(new THREE.ConeGeometry(0.034, 0.11, 10), rocketWarheadMat);
+      nose.rotation.x = Math.PI / 2;
+      nose.position.z = 0.16;
+      for (let i = 0; i < 4; i++) {
+        const fin = new THREE.Mesh(new THREE.BoxGeometry(0.008, 0.06, 0.05), rocketBodyMat);
+        fin.rotation.z = (i * Math.PI) / 2;
+        fin.position.set(Math.sin((i * Math.PI) / 2) * 0.032, Math.cos((i * Math.PI) / 2) * 0.032, -0.1);
+        g.add(fin);
+      }
+      g.add(body, nose);
+      g.position.copy(from);
+      g.lookAt(to); // non-camera lookAt: the group's +Z faces the target
+      scene.add(g);
+      rockets.push({
+        mesh: g,
+        from: from.clone(),
+        to: to.clone(),
+        t: 0,
+        dur: Math.max(0.12, from.distanceTo(to) / ROCKET_SPEED),
+        trailT: 0,
+      });
+    }
+
+    function updateRockets(dt: number) {
+      if (!running()) {
+        for (const r of rockets) {
+          scene.remove(r.mesh);
+          r.mesh.traverse((o: any) => o.geometry?.dispose());
+        }
+        rockets.length = 0;
+        return;
+      }
+      for (let i = rockets.length - 1; i >= 0; i--) {
+        const r = rockets[i];
+        r.t += dt;
+        const k = Math.min(1, r.t / r.dur);
+        r.mesh.position.lerpVectors(r.from, r.to, k);
+        // exhaust streak: a short fading line segment behind the round
+        r.trailT -= dt;
+        if (r.trailT <= 0) {
+          r.trailT = 0.045;
+          const tail = r.from.clone().lerp(r.to, Math.max(0, k - 0.05));
+          tracer(r.mesh.position.clone(), tail, 0xffb46b);
+        }
+        if (k >= 1) {
+          scene.remove(r.mesh);
+          r.mesh.traverse((o: any) => o.geometry?.dispose());
+          rockets.splice(i, 1);
+          blast(r.to.x, r.to.z, r.to.y);
+        }
+      }
     }
 
     const PROXIMITY = 15;
@@ -7935,9 +8367,16 @@ export default function BattleRoyaleGame() {
       if (w && reloadT > 0) {
         reloadT -= dt;
         if (reloadT <= 0) {
-          const take = Math.min(w.mag - w.loaded, reserve[w.ammo] || 0);
-          w.loaded += take;
-          reserve[w.ammo] = (reserve[w.ammo] || 0) - take;
+          if (w.kind === 'rpg') {
+            const take = Math.min(w.mag - w.loaded, grenades.blast);
+            w.loaded += take;
+            grenades.blast -= take;
+            refreshGrenades();
+          } else {
+            const take = Math.min(w.mag - w.loaded, reserve[w.ammo] || 0);
+            w.loaded += take;
+            reserve[w.ammo] = (reserve[w.ammo] || 0) - take;
+          }
           refreshHud();
         }
       }
@@ -8011,7 +8450,7 @@ export default function BattleRoyaleGame() {
 
     function pickupMesh(kind: string) {
       const g = new THREE.Group();
-      if (kind === 'smg' || kind === 'sk' || kind === 'sniper' || kind === 'betgun') {
+      if (kind === 'smg' || kind === 'sk' || kind === 'sniper' || kind === 'betgun' || kind === 'pistol' || kind === 'rpg') {
         const gun = new THREE.Group();
         buildWeaponModel(kind, gun);
         gun.position.set(0, 0.28, 0);
@@ -8023,7 +8462,17 @@ export default function BattleRoyaleGame() {
         }
         g.add(gun);
         const ringColor =
-          kind === 'smg' ? 0x38bdf8 : kind === 'sniper' ? 0x818cf8 : kind === 'betgun' ? 0xf97316 : 0xf59e0b;
+          kind === 'smg'
+            ? 0x38bdf8
+            : kind === 'sniper'
+            ? 0x818cf8
+            : kind === 'betgun'
+            ? 0xf97316
+            : kind === 'rpg'
+            ? 0xef4444
+            : kind === 'pistol'
+            ? 0x9ca3af
+            : 0xf59e0b;
         const ringMat = new THREE.MeshBasicMaterial({ color: ringColor, transparent: true, opacity: 0.65 });
         part(g, new THREE.TorusGeometry(0.38, 0.015, 6, 24), ringMat, 0, 0.04, 0, Math.PI / 2);
       } else if (kind === 'blast' || kind === 'fire' || kind === 'smoke') {
@@ -8762,14 +9211,39 @@ export default function BattleRoyaleGame() {
     scatter('sniper', 2 * FIELD);
     scatter('betgun', 2 * FIELD);
     scatter('shield', 4 * FIELD);
+    // The SK is no longer the starter — it lives as loot now, plus a
+    // few Rocket Launchers and spare Pistols. Extra blast bombs too:
+    // they double as RPG ammunition.
+    scatter('sk', 3 * FIELD);
+    scatter('rpg', 2);
+    scatter('pistol', 2 * FIELD);
+    // One of each classic weapon sits beside the showcase dummies on
+    // the 32 m ring — the AI squads walk over and loot them while
+    // the static shooters stand watch.
+    for (const s of showcaseSpots) {
+      const lx = s.x * 1.07;
+      const lz = s.z * 1.07;
+      const group = pickupMesh(s.kind);
+      group.position.set(lx, 0, lz);
+      world.add(group);
+      pickups.push({ kind: s.kind, x: lx, z: lz, group, taken: false, timer: 0 });
+    }
 
-    const AMMO_BONUS: Record<string, number> = { smg: 40, sniper: 10, sk: 10, betgun: 12 };
+    const AMMO_BONUS: Record<string, number> = { smg: 40, sniper: 10, sk: 10, betgun: 12, pistol: 36, rpg: 2 };
 
     function addWeapon(w: any, replaceSlot: number) {
       if (w.loaded === 0) {
-        const take = Math.min(w.mag, reserve[w.ammo] || 0);
-        w.loaded = take;
-        reserve[w.ammo] = (reserve[w.ammo] || 0) - take;
+        if (w.kind === 'rpg') {
+          // Rockets chamber from the blast-bomb pouch
+          const take = Math.min(w.mag, grenades.blast);
+          w.loaded = take;
+          grenades.blast -= take;
+          refreshGrenades();
+        } else {
+          const take = Math.min(w.mag, reserve[w.ammo] || 0);
+          w.loaded = take;
+          reserve[w.ammo] = (reserve[w.ammo] || 0) - take;
+        }
       }
       let i = slots.indexOf(null);
       if (i < 0) {
@@ -8816,14 +9290,27 @@ export default function BattleRoyaleGame() {
         p.timer = RESPAWN;
         p.group.visible = false;
       }
-      if (p.kind === 'smg' || p.kind === 'sniper' || p.kind === 'sk' || p.kind === 'betgun') {
+      if (p.kind === 'smg' || p.kind === 'sniper' || p.kind === 'sk' || p.kind === 'betgun' || p.kind === 'pistol' || p.kind === 'rpg') {
         const w = WEAPONS[p.kind];
         if (slots.includes(w)) {
-          const amount = AMMO_BONUS[p.kind] || 20;
-          reserve[w.ammo] = (reserve[w.ammo] || 0) + amount;
-          showMessage('+' + amount + ' ' + w.ammo + ' ammo', 1.5);
+          if (p.kind === 'rpg') {
+            // duplicate launcher pays out spare blast bombs
+            grenades.blast += 2;
+            refreshGrenades();
+            showMessage('+2 blast bombs', 1.5);
+          } else {
+            const amount = AMMO_BONUS[p.kind] || 20;
+            reserve[w.ammo] = (reserve[w.ammo] || 0) + amount;
+            showMessage('+' + amount + ' ' + w.ammo + ' ammo', 1.5);
+          }
         } else {
-          if (!p.dropped) reserve[w.ammo] = (reserve[w.ammo] || 0) + (AMMO_BONUS[p.kind] || 0);
+          if (p.kind === 'rpg') {
+            // a fresh launcher comes with a spare bomb loaded
+            if (!p.dropped) grenades.blast += 1;
+            refreshGrenades();
+          } else if (!p.dropped) {
+            reserve[w.ammo] = (reserve[w.ammo] || 0) + (AMMO_BONUS[p.kind] || 0);
+          }
           addWeapon(w, lastSlot);
         }
       } else if (p.kind === 'shield') {
@@ -9985,6 +10472,7 @@ export default function BattleRoyaleGame() {
       sniper: 260,
       betgun: 220,
       sk: 90,
+      rpg: 150,
       heavy: 40,
       light: 30,
       blast: 60,
@@ -9997,9 +10485,11 @@ export default function BattleRoyaleGame() {
       sniper: 'Sniper',
       betgun: 'Betgun',
       sk: 'SK',
+      rpg: 'Rocket Launcher',
+      pistol: 'Pistol',
       heavy: 'Heavy ammo',
       light: 'Light ammo',
-      blast: 'Blast grenade',
+      blast: 'Blast bomb',
       fire: 'Fire grenade',
       smoke: 'Smoke grenade',
     };
@@ -10045,7 +10535,7 @@ export default function BattleRoyaleGame() {
     function refreshInventory() {
       if (inventoryCreditsEl) inventoryCreditsEl.textContent = String(credits);
       const free = slots.indexOf(null) >= 0;
-      for (const id of ['smg', 'sniper', 'betgun', 'sk']) {
+      for (const id of ['smg', 'sniper', 'betgun', 'sk', 'rpg']) {
         const carried = owned(WEAPONS[id]);
         const note = carried ? 'Carried' : !free ? 'Both slots full' : 'Buy';
         inventorySetItem(id, note, !free || carried || credits < INVENTORY_PRICE[id]);
@@ -10073,7 +10563,13 @@ export default function BattleRoyaleGame() {
         const w = WEAPONS[id];
         if (owned(w) || slots.indexOf(null) < 0) return;
         credits -= price;
-        reserve[w.ammo] = (reserve[w.ammo] || 0) + (AMMO_BONUS[id] || 0);
+        if (w.kind === 'rpg') {
+          // the shop launcher ships with two spare blast bombs
+          grenades.blast += 2;
+          refreshGrenades();
+        } else {
+          reserve[w.ammo] = (reserve[w.ammo] || 0) + (AMMO_BONUS[id] || 0);
+        }
         addWeapon(w, lastSlot);
       } else if (id in GREN) {
         if (gTotal() >= carryCap()) return;
@@ -10184,7 +10680,9 @@ export default function BattleRoyaleGame() {
     refreshGrenades();
 
     // Grenade pickups scatter
-    scatter('blast', 4 * FIELD);
+    // blast bombs got a second job as Rocket Launcher ammo — more
+    // of them scattered so the launcher stays fed
+    scatter('blast', 6 * FIELD);
     scatter('fire', 3 * FIELD);
     scatter('smoke', 3 * FIELD);
 
@@ -10873,7 +11371,15 @@ export default function BattleRoyaleGame() {
       const oy = (Math.random() * 2 - 1) * err;
       const aim = new THREE.Vector3(camera.position.x + ox, camera.position.y - 0.5 + oy, camera.position.z);
 
-      if (wKind === 'smg') {
+      if (wKind === 'pistol') {
+        // Every bot's sidearm: quick, light ticks of damage
+        d.fireT = (d.ai ? 0.95 : 0.8) + Math.random() * 0.25;
+        tracer(shotFrom.clone(), aim, 0xfde68a);
+        if (Math.hypot(ox, oy) < PLAYER_HIT) {
+          d.hits += 1;
+          hurtPlayer(11, 0, d.group.position);
+        }
+      } else if (wKind === 'smg') {
         d.fireT = (d.ai ? 0.16 : 0.12) + Math.random() * 0.08;
         tracer(shotFrom.clone(), aim, 0xfde68a);
         if (Math.hypot(ox, oy) < PLAYER_HIT * 1.2) {
@@ -10954,6 +11460,8 @@ export default function BattleRoyaleGame() {
         hpSeen: DUMMY_LIFE,
         shieldSeen: dummyShield,
         hot: false,
+        lootT: 0,
+        lootTarget: null as any,
       };
     }
 
@@ -11110,6 +11618,79 @@ export default function BattleRoyaleGame() {
       }
     }
 
+    // ----------------------------------------------------
+    // BOT LOOTING: every bot starts with the pistol. While patrolling
+    // they scan for a classic weapon on the ground (sk / smg / sniper /
+    // betgun), walk over and TAKE it — the same pickups the player
+    // races for. Once armed they stop looking.
+    // ----------------------------------------------------
+    const BOT_LOOT_RADIUS = 45;
+    const BOT_LOOT_KINDS = ['sk', 'smg', 'sniper', 'betgun'];
+
+    function findBotLoot(d: DummyObject) {
+      const p = d.group.position;
+      let best: PickupItem | null = null;
+      let bestD = BOT_LOOT_RADIUS;
+      for (const pk of pickups) {
+        if (pk.taken || pk.gone) continue;
+        if (BOT_LOOT_KINDS.indexOf(pk.kind) < 0) continue;
+        const dd = Math.hypot(pk.x - p.x, pk.z - p.z);
+        if (dd < bestD) {
+          best = pk;
+          bestD = dd;
+        }
+      }
+      return best;
+    }
+
+    function botTakePickup(d: DummyObject, p: PickupItem) {
+      armDummy(d, p.kind);
+      if (p.dropped) p.gone = true;
+      else {
+        p.taken = true;
+        p.timer = RESPAWN;
+        p.group.visible = false;
+      }
+      d.ai.idle = 1;
+    }
+
+    // Returns true while the bot is actively walking to a pickup.
+    function updateLootAI(d: DummyObject, dt: number) {
+      const a = d.ai;
+      const p = d.group.position;
+      if (!a.lootTarget) {
+        if (d.weaponKind !== 'pistol') return false; // already armed
+        a.lootT -= dt;
+        if (a.lootT > 0) return false;
+        a.lootT = 0.8;
+        a.lootTarget = findBotLoot(d);
+        if (!a.lootTarget) return false;
+      }
+      const lp = a.lootTarget;
+      if (lp.taken || lp.gone) {
+        a.lootTarget = null;
+        return false;
+      }
+      const ldx = lp.x - p.x;
+      const ldz = lp.z - p.z;
+      if (Math.hypot(ldx, ldz) < 1.35) {
+        botTakePickup(d, lp);
+        a.lootTarget = null;
+        return false;
+      }
+      d.group.rotation.y = Math.atan2(ldx, ldz);
+      if (aiStep(d, lp.x, lp.z, AI.walk, dt) === 'blocked') {
+        a.blockedT += dt;
+        if (a.blockedT > 1) {
+          a.lootTarget = null;
+          a.blockedT = 0;
+        }
+      } else {
+        a.blockedT = 0;
+      }
+      return true;
+    }
+
     function aiEngage(d: DummyObject, dt: number) {
       const a = d.ai;
       const p = d.group.position;
@@ -11168,6 +11749,7 @@ export default function BattleRoyaleGame() {
           idle: 0.5,
           blockedT: 0,
           sees: false,
+          lootTarget: null,
         });
         a.hpSeen = d.hp;
         a.shieldSeen = d.shield;
@@ -11195,7 +11777,7 @@ export default function BattleRoyaleGame() {
         a.seen = a.sees ? a.seen + dt : Math.max(0, a.seen - dt);
         if (a.seen >= AI.reaction) engageNow(d);
         else if (a.sees) d.group.rotation.y = ang;
-        else aiWander(d, dt);
+        else if (!updateLootAI(d, dt)) aiWander(d, dt);
       }
       if (a.state === 'engage') {
         a.lost = a.sees ? 0 : a.lost + dt;
@@ -11259,6 +11841,8 @@ export default function BattleRoyaleGame() {
       updateGrenadePress(dt);
       updateShield(dt);
       updateMicrobots(dt); // the swarm orbits player + dummies, runs tasks
+      updatePendingBuilds(dt); // timed construction: ghosts print into pieces
+      updateRockets(dt); // rocket launcher rounds fly + detonate
       if (playerDown) {
         respawnT -= dt;
         if (respawnT <= 0) respawn();
@@ -11467,7 +12051,7 @@ export default function BattleRoyaleGame() {
         <div className="slot active" id="slot0">
           <span className="slot-key">1</span>
           <span className="slot-name" id="slotName0">
-            SK
+            Pistol
           </span>
         </div>
         <div className="slot empty" id="slot1">
@@ -11530,7 +12114,7 @@ export default function BattleRoyaleGame() {
       <div className="hud ammo">
         <div className="weapon-header">
           <div className="weapon" id="weapon">
-            SK
+            Pistol
           </div>
           <div className="fire-mode-seg" role="group" aria-label="Firing Mode">
             <button
@@ -11553,12 +12137,10 @@ export default function BattleRoyaleGame() {
         </div>
         <div className="status" id="status" />
         <div className="count">
-          <span id="ammo">30</span>
-          <small id="mag"> / 30</small>
+          <span id="ammo">12</span>
+          <small id="mag"> / 12</small>
         </div>
-        <div className="reserve" id="reserve">
-          HEAVY 60
-        </div>
+        <div className="reserve" id="reserve">LIGHT 60</div>
       </div>
 
       {/* Touch UI (Mobile) */}
@@ -12111,9 +12693,15 @@ export default function BattleRoyaleGame() {
               <kbd>V</kbd> opens build mode. The default <b>Auto</b> piece reads your aim: look <b>straight up while standing on a staircase</b> = <b>another staircase stacks on top</b> (chain them into the sky!), look <b>up</b> = <b>Ladder</b>, look <b>down on the ground</b> = <b>Ramp</b>, look <b>forward</b> = <b>Wall</b>, look <b>down while on a ramp / roof / container</b> (or mid-air) = <b>Platform</b>. <kbd>T</kbd> or the mouse wheel cycles manual pieces — <b>Wall</b>, <b>Door Wall</b>, <b>Floor</b>, <b>Ramp</b>, <b>Ladder</b>; <kbd>Left click</kbd> places. Walls and Doors
               are voxel now — bullets chip chunks out of them and grenades carve holes straight through; Floors bridge water; Ramps run you onto roofs; Ladders climb any wall — walk into them and keep moving
             </li>
-            <li>Bullets lose power with range: SMG past 20 m, SK past 60 m, sniper past 200 m</li>
+            <li><b>Everyone starts with the Pistol</b> — you AND every bot. Better guns lie on the ground as loot: SK, Sharkteeth, Sniper, Betgun and the Rocket Launcher. Bots loot too — teal patrols walk over and pick weapons up, so race them to it</li>
+            <li><b>Rocket Launcher:</b> fires slow streaking rockets that detonate a full blast — it feeds on BLAST BOMBS (the grenades you throw are its ammo, shown on the grenade plate). Find launchers as loot or buy one at 150 credits</li>
+            <li>Sharkteeth bites 35% harder now — it shreds shields up close faster than ever</li>
+            <li>Bullets lose power with range: pistol past 30 m, SMG past 20 m, SK past 60 m, sniper past 200 m</li>
             <li>
-              <b>Shield = a microbot swarm.</b> 1 bot hovers for every 10 shield — around you and around every dummy. A shot makes the nearest bot dash <b>into the bullet's path</b>; <b>direct sun recharges the swarm at 45/s</b> (roofs, tree crowns and being underwater block it — the ☀ on the Shield bar marks the charge)
+              <b>Shield = a microbot swarm.</b> 1 small bot hovers for every 5 shield — around you and around every dummy. A shot makes the nearest bot dash <b>into the bullet's path</b>; <b>direct sun recharges the swarm at 45/s</b> (roofs, tree crowns and being underwater block it — the ☀ on the Shield bar marks the charge)
+            </li>
+            <li>
+              <b>Construction takes a few seconds now:</b> place a piece and your microbots fly over and assemble it while a cyan ghost prints upward — wall / door ~3 s, ramp ~2.6 s, platform ~2.2 s, ladder ~2 s. The solid piece lands when they finish
             </li>
             <li>
               <b>Building and abilities SPEND shield:</b> every wooden piece (wall 10, door 12, floor 10, ramp 10, ladder 15), the turret and the antenna deploy (25 each) — your bots fly over and <b>assemble the piece</b>, merging into it. Sunlight is fuel: hunt open ground to keep building
@@ -12148,7 +12736,8 @@ export default function BattleRoyaleGame() {
               Tap WALL to arm build mode, then tap AIM to place. Auto reads your aim — look straight up on a staircase = another staircase on top, look up = ladder, look down on the ground = ramp, look forward = wall, look down from a ramp / roof = platform. Double-tap WALL to cycle pieces manually
             </li>
             <li>Trees are voxelized: shoot or blast them for WOOD — the fuel for every wooden build (the plate under the minimap shows your purse)</li>
-            <li>Your shield is a microbot swarm: it recharges fast in the sun (☀ on the shield bar) and every build / turret / antenna spends it</li>
+            <li>Your shield is a microbot swarm: it recharges fast in the sun (☀ on the shield bar) and every build / turret / antenna spends it. Placed pieces take a few seconds to assemble — watch the bots work</li>
+            <li>You start with a Pistol, and so do the bots — loot better weapons (or the Rocket Launcher, which eats blast bombs) before they do</li>
             <li>War wrecks — tanks, trucks, helicopters, skeletons — dot the island away from the POIs. They are destructible cover</li>
             <li>Wade into the sea: you slow down, then swim. Hold crouch to dive, tap jump to stroke up</li>
             <li>The top compass shows the nearest landmarks with distances — edge-pinned chips show which way to turn. Follow the port chips (PIER, YARD, DOCK, LIGHT) for the best loot</li>
