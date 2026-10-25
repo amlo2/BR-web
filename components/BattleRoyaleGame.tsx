@@ -288,9 +288,10 @@ export default function BattleRoyaleGame() {
     // bands — ridged mountain ranges where it bulges, lake
     // basins where it dips — and mf (moisture) splits the
     // remaining land: wet lowlands become jungle, moderate
-    // bands become forest, dry bands stay open grassland.
-    // The five weights always sum to 1 so height, tile
-    // coloring and vegetation placement all agree.
+    // bands become forest, dry bands stay open grassland, and a third
+    // field burns parts of that dry open land into explosive wasteland.
+    // The weights always sum to 1 so height, tile coloring and
+    // vegetation placement all agree.
     // ----------------------------------------------------
     interface BiomeW {
       mw: number; // mountain
@@ -298,6 +299,7 @@ export default function BattleRoyaleGame() {
       jw: number; // jungle
       fw: number; // forest
       gw: number; // grassland
+      ww: number; // wasteland (explosive badlands carved out of the grassland)
     }
     const BIO_SPAN = 430;
     const MOIST_SPAN = 310;
@@ -311,15 +313,21 @@ export default function BattleRoyaleGame() {
       const rest = Math.max(0, 1 - mw - lw);
       const wet = THREE.MathUtils.smoothstep(mf, 0.1, 0.3); // jungle
       const forested = THREE.MathUtils.smoothstep(mf, -0.06, 0.14); // forest
+      // Explosive wasteland: a third slow field pickles part of the dry,
+      // unforeseen grassland into ashen badlands — cracked dirt, dead
+      // stands and volatile fuel barrels. All six weights still sum to 1.
+      const waste = THREE.MathUtils.smoothstep(fbmOct(x / 340, z / 340, terrainSeed + 2100, 2), 0.17, 0.3);
+      const dryOpen = rest * (1 - wet) * (1 - forested);
       out.mw = mw;
       out.lw = lw;
       out.jw = rest * wet;
       out.fw = rest * (1 - wet) * forested;
-      out.gw = rest * (1 - wet) * (1 - forested);
+      out.gw = dryOpen * (1 - waste);
+      out.ww = dryOpen * waste;
     }
-    const BW: BiomeW = { mw: 0, lw: 0, jw: 0, fw: 0, gw: 0 }; // terrainHeight scratch
-    const CW: BiomeW = { mw: 0, lw: 0, jw: 0, fw: 0, gw: 0 }; // tile color scratch
-    const VW: BiomeW = { mw: 0, lw: 0, jw: 0, fw: 0, gw: 0 }; // vegetation scratch
+    const BW: BiomeW = { mw: 0, lw: 0, jw: 0, fw: 0, gw: 0, ww: 0 }; // terrainHeight scratch
+    const CW: BiomeW = { mw: 0, lw: 0, jw: 0, fw: 0, gw: 0, ww: 0 }; // tile color scratch
+    const VW: BiomeW = { mw: 0, lw: 0, jw: 0, fw: 0, gw: 0, ww: 0 }; // vegetation scratch
 
     const TERRAIN_HEIGHT = 30;
     const TERRAIN_SPAN = 130;
@@ -438,7 +446,12 @@ export default function BattleRoyaleGame() {
         // Ridged ranges: crests follow the noise's zero-crossings,
         // squared so the peaks stand out sharply from the valleys.
         const ridge = Math.max(0, 1 - 1.45 * Math.abs(fbm(x / 92, z / 92, terrainSeed + 77)));
-        raw += BW.mw * (MOUNT_LIFT + MOUNT_PEAK * ridge * ridge);
+        // Realism pass: cross-hatched secondary ribs plus a fine crag
+        // octave break the crests into spurs, gullies and jagged aretes —
+        // weathered rock, not smooth bumps.
+        const rib = Math.max(0, 1 - 1.7 * Math.abs(fbmOct(x / 37, z / 37, terrainSeed + 177, 2)));
+        const crag = gradNoise(x / 13, z / 13, terrainSeed + 277);
+        raw += BW.mw * (MOUNT_LIFT + MOUNT_PEAK * (ridge * ridge + 0.16 * rib * rib + 0.05 * crag));
       }
       let land = keep * Math.max(0.3, raw);
       const lwe = BW.lw * keep; // lakes never swallow the spawn pad
@@ -530,6 +543,8 @@ export default function BattleRoyaleGame() {
     const TILE_SNOW = new THREE.Color(0xeef3f6);
     const TILE_SAND = new THREE.Color(0xd8c48f);
     const TILE_DEEP = new THREE.Color(0x2f5d70);
+    const TILE_WASTE = new THREE.Color(0x99855c); // ashen wasteland dirt
+    const TILE_CLIFF = new THREE.Color(0x4c4f55); // bare dark cliff rock
     const tiles = new Map<string, { mesh: THREE.Mesh; cx: number; cz: number; veg?: THREE.Mesh | null; vegSolids?: SolidBox[]; vegTreeVox?: VoxelBox[] }>();
 
     const seaMesh = new THREE.Mesh(
@@ -569,21 +584,54 @@ export default function BattleRoyaleGame() {
           const vx = x0 + i * TILE_STEP;
           const vz = z0 + j * TILE_STEP;
           biomeWeights(vx, vz, CW);
-          // Convex biome mix (the five weights sum to 1)
-          let cr = CW.gw * TILE_GRASS.r + CW.fw * TILE_FOREST.r + CW.jw * TILE_JUNGLE.r + CW.mw * TILE_ROCK.r + CW.lw * TILE_LAKEBED.r;
-          let cg = CW.gw * TILE_GRASS.g + CW.fw * TILE_FOREST.g + CW.jw * TILE_JUNGLE.g + CW.mw * TILE_ROCK.g + CW.lw * TILE_LAKEBED.g;
-          let cb = CW.gw * TILE_GRASS.b + CW.fw * TILE_FOREST.b + CW.jw * TILE_JUNGLE.b + CW.mw * TILE_ROCK.b + CW.lw * TILE_LAKEBED.b;
+          // Convex biome mix (the six weights sum to 1)
+          let cr =
+            CW.gw * TILE_GRASS.r +
+            CW.fw * TILE_FOREST.r +
+            CW.jw * TILE_JUNGLE.r +
+            CW.mw * TILE_ROCK.r +
+            CW.lw * TILE_LAKEBED.r +
+            CW.ww * TILE_WASTE.r;
+          let cg =
+            CW.gw * TILE_GRASS.g +
+            CW.fw * TILE_FOREST.g +
+            CW.jw * TILE_JUNGLE.g +
+            CW.mw * TILE_ROCK.g +
+            CW.lw * TILE_LAKEBED.g +
+            CW.ww * TILE_WASTE.g;
+          let cb =
+            CW.gw * TILE_GRASS.b +
+            CW.fw * TILE_FOREST.b +
+            CW.jw * TILE_JUNGLE.b +
+            CW.mw * TILE_ROCK.b +
+            CW.lw * TILE_LAKEBED.b +
+            CW.ww * TILE_WASTE.b;
           // Stony above the treeline and on steep faces (cliffs stay rock
           // even inside forest / jungle)
+          const slope = Math.hypot(dx, dz);
           const stony = Math.max(
             THREE.MathUtils.smoothstep(h, 30, 52),
-            THREE.MathUtils.smoothstep(Math.hypot(dx, dz), 1.05, 1.8)
+            THREE.MathUtils.smoothstep(slope, 1.05, 1.8)
           );
           cr += (TILE_ROCK.r - cr) * stony;
           cg += (TILE_ROCK.g - cg) * stony;
           cb += (TILE_ROCK.b - cb) * stony;
-          // Snowcaps on the high peaks
-          const snow = THREE.MathUtils.smoothstep(h, 60, 72);
+          // Weathered rock reads as STRATA: mineral banding streaks the
+          // high ground so faces look like layered stone, not flat grey.
+          if (stony > 0.05) {
+            const strata = 0.92 + 0.13 * (0.5 + 0.5 * Math.sin(h * 0.55 + 6 * gradNoise(vx / 60, vz / 60, terrainSeed + 88)));
+            cr *= strata;
+            cg *= strata;
+            cb *= strata;
+          }
+          // Bare dark rock on the steepest faces — too sheer to hold soil
+          const cliff = THREE.MathUtils.smoothstep(slope, 1.5, 2.4);
+          cr += (TILE_CLIFF.r - cr) * cliff;
+          cg += (TILE_CLIFF.g - cg) * cliff;
+          cb += (TILE_CLIFF.b - cb) * cliff;
+          // Snowcaps on the high peaks — but only where the face is
+          // gentle enough to hold a drift; sheer walls stay bare rock.
+          const snow = THREE.MathUtils.smoothstep(h, 60, 72) * (1 - THREE.MathUtils.smoothstep(slope, 0.95, 1.5));
           cr += (TILE_SNOW.r - cr) * snow;
           cg += (TILE_SNOW.g - cg) * snow;
           cb += (TILE_SNOW.b - cb) * snow;
@@ -1196,18 +1244,43 @@ export default function BattleRoyaleGame() {
           else def = lib.tuft;
           s = 0.85 + rnd() * 0.55;
         } else {
-          // Grassland: open tuftland with lone acacias.
+          // Grassland — or, where the wasteland field crests, its ashen
+          // twin: cracked dirt, dead stands and EXPLOSIVE fuel barrels.
           if (h < WATER_Y + 0.32) continue;
-          if (pick < 0.4) def = lib.tuft;
-          else if (pick < 0.58) def = lib.bushDry;
-          else if (pick < 0.68) {
-            def = lib.acacia;
-            trunkR = 0.36;
-            trunkTop = 1.9;
-            treeName = 'acacia';
-          } else if (pick < 0.74) def = lib.rock;
-          else continue;
-          s = 0.9 + rnd() * 0.5;
+          if (VW.ww >= 0.5) {
+            if (pick < 0.028) {
+              // Fuel-barrel clump: 2-3 volatile drums parked close
+              // enough that one cook-off chains the rest.
+              const nb = 2 + (rnd() < 0.45 ? 1 : 0);
+              for (let b = 0; b < nb; b++) {
+                const bx = vx + (rnd() - 0.5) * 2.6;
+                const bz = vz + (rnd() - 0.5) * 2.6;
+                const bh = terrainHeight(bx, bz);
+                if (bh < WATER_Y + 0.35) continue;
+                placeBarrel(bx, bz, bh, solidRefs, treeVox);
+              }
+            } else if (pick < 0.13) {
+              def = lib.deadtree;
+              trunkR = 0.3;
+              trunkTop = 2.2;
+              treeName = 'deadtree';
+            } else if (pick < 0.34) def = lib.rock;
+            else if (pick < 0.52) def = lib.bushDry;
+            else if (pick < 0.85) def = lib.tuft;
+            else continue;
+            s = 0.9 + rnd() * 0.5;
+          } else {
+            if (pick < 0.4) def = lib.tuft;
+            else if (pick < 0.58) def = lib.bushDry;
+            else if (pick < 0.68) {
+              def = lib.acacia;
+              trunkR = 0.36;
+              trunkTop = 1.9;
+              treeName = 'acacia';
+            } else if (pick < 0.74) def = lib.rock;
+            else continue;
+            s = 0.9 + rnd() * 0.5;
+          }
         }
         if (!def) continue;
         const yaw = rnd() * Math.PI * 2;
@@ -1246,9 +1319,11 @@ export default function BattleRoyaleGame() {
           ph.visible = false;
           scene.add(ph);
           shootable.push(ph);
+          const tpal = buildTreePal(shape, vx, base, vz, yaw, s, gx, gz, gTop, gBot, shape.vox);
           registerDestructible(sb, ph, tvm, shape.vox, {
             grid: { hx: gx, hz: gz, top: gTop, bottom: gBot },
-            pal: buildTreePal(shape, vx, base, vz, yaw, s, gx, gz, gTop, gBot, shape.vox),
+            pal: tpal.pal,
+            inside: tpal.inside,
             gain: TREE_WOOD,
             vegTile: tileRec,
           });
@@ -1275,9 +1350,13 @@ export default function BattleRoyaleGame() {
       return { mesh, solidRefs, stamps, treeVox };
     }
 
-    // Per-voxel colour palette for a voxelized tree: rotate each voxel
-    // centre into the tree's local space and test it against the shape
-    // parts in order (trunk first) — brown trunk column, green crown.
+    // Per-voxel colour palette + SILHOUETTE MASK for a voxelized tree.
+    // Each voxel centre rotates into the tree's local frame, then into
+    // each part's own tilted frame (parts may carry rx / ry), and tests
+    // against the part box dilated by half a cell — so the chunky reveal
+    // is the TREE ITSELF (brown trunk column, green crown, palm fronds).
+    // Voxels outside every part are born DEAD: the first-hit reveal can
+    // never read as a solid brown rectangle filling the crown's bounds.
     function buildTreePal(
       shape: TreeShape,
       tx: number,
@@ -1290,7 +1369,7 @@ export default function BattleRoyaleGame() {
       gTop: number,
       gBot: number,
       vs: number
-    ): Float32Array {
+    ): { pal: Float32Array; inside: Uint8Array } {
       const nx = Math.max(1, Math.min(VOX_MAX_DIM, Math.round((ghx * 2) / vs)));
       const ny = Math.max(1, Math.min(VOX_MAX_DIM, Math.round((gTop - gBot) / vs)));
       const nz = Math.max(1, Math.min(VOX_MAX_DIM, Math.round((ghz * 2) / vs)));
@@ -1301,10 +1380,23 @@ export default function BattleRoyaleGame() {
       const y0 = gBot;
       const z0 = tz - ghz;
       const pal = new Float32Array(nx * ny * nz * 3);
+      const inside = new Uint8Array(nx * ny * nz);
       const cs = Math.cos(yaw);
       const sn = Math.sin(yaw);
       const tc = new THREE.Color();
       const trunkC = new THREE.Color(shape.parts[0].c);
+      // Part tilt trig (parts use Euler 'XYZ' = Rx . Ry) and the
+      // half-cell dilation that keeps thin fronds in the lattice.
+      const parts = shape.parts.map((p) => ({
+        p,
+        cy: Math.cos(p.ry ?? 0),
+        sy: Math.sin(p.ry ?? 0),
+        cx: Math.cos(p.rx ?? 0),
+        sx2: Math.sin(p.rx ?? 0),
+      }));
+      const dilX = 0.5 * (sx / s) + 0.02;
+      const dilY = 0.5 * (sy / s) + 0.02;
+      const dilZ = 0.5 * (sz / s) + 0.02;
       for (let k = 0; k < nz; k++) {
         for (let j = 0; j < ny; j++) {
           for (let i = 0; i < nx; i++) {
@@ -1318,24 +1410,59 @@ export default function BattleRoyaleGame() {
             const lz = (-sn * dx + cs * dz) / s;
             const ly = (wy - ty) / s;
             tc.copy(trunkC);
-            for (const part of shape.parts) {
+            let hit = false;
+            for (const { p, cy, sy, cx, sx2 } of parts) {
+              // part-local point = Ry(-ry) . Rx(-rx) . (P - C)
+              const ax = lx - p.x;
+              const ay = ly - p.y;
+              const az = lz - p.z;
+              const py1 = ay * cx + az * sx2;
+              const pz1 = -ay * sx2 + az * cx;
+              const px = ax * cy - pz1 * sy;
+              const pz = ax * sy + pz1 * cy;
               if (
-                Math.abs(lx - part.x) <= part.w / 2 + 0.02 &&
-                Math.abs(lz - part.z) <= part.d / 2 + 0.02 &&
-                ly >= part.y - part.h / 2 - 0.02 &&
-                ly <= part.y + part.h / 2 + 0.02
+                Math.abs(px) <= p.w / 2 + dilX &&
+                Math.abs(py1) <= p.h / 2 + dilY &&
+                Math.abs(pz) <= p.d / 2 + dilZ
               ) {
-                tc.setHex(part.c);
+                tc.setHex(p.c);
+                hit = true;
                 break;
               }
             }
+            inside[idx] = hit ? 1 : 0;
             pal[idx * 3] = tc.r;
             pal[idx * 3 + 1] = tc.g;
             pal[idx * 3 + 2] = tc.b;
           }
         }
       }
-      return pal;
+      return { pal, inside };
+    }
+
+    // Explosive wasteland dressing: FUEL BARRELS. Each drum is a small
+    // voxel-destructible — one round cracks the shell and the whole
+    // barrel detonates a full grenade blast (see killVoxel). They ride
+    // the tile-stream lifecycle exactly like voxelized trees.
+    let barrelMat: THREE.MeshLambertMaterial | null = null;
+    function placeBarrel(bx: number, bz: number, bh: number, solidRefs: SolidBox[], treeVox: VoxelBox[]) {
+      if (!barrelMat) {
+        barrelMat = new THREE.MeshLambertMaterial({ color: 0xb03b26 });
+        voxHpMap.set(barrelMat, 20); // a single pistol round lights it
+      }
+      const body = new THREE.Mesh(new THREE.CylinderGeometry(0.55, 0.55, 1.65, 10), barrelMat);
+      body.position.set(bx, bh + 0.83, bz);
+      body.castShadow = true;
+      scene.add(body);
+      shootable.push(body); // the drum is a real bullet target — chip it and it blows
+      const sb: SolidBox = { x: bx, z: bz, hx: 0.55, hz: 0.55, bottom: bh, top: bh + 1.66, group: scene };
+      solids.push(sb);
+      // NOTE: like voxelized trees, the drum is a SHOOTABLE, so it must
+      // NOT live in vegSolids — that list is the boulder soak set, and a
+      // drum in it would soak its own incoming rounds (vegCut).
+      solidRefs.push(sb);
+      registerDestructible(sb, body, barrelMat, 0.34, { boom: true });
+      treeVox.push(body.userData.vox as VoxelBox);
     }
 
     // Vegetation blocks bullets: nearest boulder along a shot segment
@@ -1462,6 +1589,10 @@ export default function BattleRoyaleGame() {
       pal: Float32Array | null;
       gain: number;
       vegTile: VegTileRec | null;
+      // Explosive wasteland barrels detonate a full blast the moment
+      // their shell first cracks (boomed latches so it fires only once).
+      boom: boolean;
+      boomed: boolean;
     }
 
     function registerDestructible(
@@ -1469,7 +1600,7 @@ export default function BattleRoyaleGame() {
       mesh: THREE.Mesh,
       mat: THREE.Material,
       customVoxSize?: number,
-      opts?: { grid?: { hx: number; hz: number; top: number; bottom: number }; pal?: Float32Array | null; gain?: number; vegTile?: VegTileRec | null }
+      opts?: { grid?: { hx: number; hz: number; top: number; bottom: number }; pal?: Float32Array | null; inside?: Uint8Array; gain?: number; vegTile?: VegTileRec | null; boom?: boolean }
     ) {
       // `grid` overrides the voxel lattice extents without touching the
       // collision solid — voxelized trees span trunk + canopy while
@@ -1524,7 +1655,31 @@ export default function BattleRoyaleGame() {
         pal: opts?.pal ?? null,
         gain: opts?.gain ?? 0,
         vegTile: opts?.vegTile ?? null,
+        boom: opts?.boom ?? false,
+        boomed: false,
       };
+      // Tree silhouette mask: voxels outside every shape part are born
+      // DEAD, so the first-hit chunky reveal IS the tree — brown trunk,
+      // green crown — and never a solid bounding rectangle.
+      if (opts?.inside) {
+        const ins = opts.inside;
+        let aliveN = 0;
+        for (let i = 0; i < total; i++) {
+          if (ins[i]) {
+            order[aliveN] = i;
+            slotOf[i] = aliveN;
+            aliveN++;
+          } else {
+            v.alive[i] = 0;
+            v.hp[i] = 0;
+            slotOf[i] = -1;
+          }
+        }
+        let tail = aliveN;
+        for (let i = 0; i < total; i++) if (!ins[i]) order[tail++] = i;
+        v.aliveCount = aliveN;
+        v.poolHp = aliveN * voxHp;
+      }
       mesh.userData.vox = v;
       voxBoxes.push(v);
     }
@@ -1601,6 +1756,13 @@ export default function BattleRoyaleGame() {
       v.deadSinceBuild++;
       voxCenter(v, idx, voxTmpP);
       spawnDebris(voxTmpP.x, voxTmpP.y, voxTmpP.z, v.color, chips);
+      // Fuel barrels cook off the instant their shell first cracks: a
+      // full grenade blast at the breach — chaining into any neighbour
+      // whose lattice the blast carves.
+      if (v.boom && !v.boomed) {
+        v.boomed = true;
+        blast(voxTmpP.x, voxTmpP.z, voxTmpP.y);
+      }
       // Harvest: voxelized trees drop wood for building with every
       // chunk knocked loose (bullets chip, blasts carve, collapses pay
       // out the whole remaining crown).
@@ -1700,15 +1862,45 @@ export default function BattleRoyaleGame() {
       for (const r of v.solidRefs) solids.push(r);
     }
 
-    // Bullets chip the voxel they strike
+    // Bullets chip the voxel they strike. Masked trees (and any lattice
+    // with born-dead cells) get a fallback: when the struck cell is dead —
+    // the invisible bounding-box raycast face pokes out past the tree's
+    // silhouette — the NEAREST living voxel within reach takes the hit,
+    // so crown-edge shots still chew chunks and pay wood.
+    const voxChipP = new THREE.Vector3();
     function chipVoxelAtPoint(v: VoxelBox, p: THREE.Vector3, dmg: number) {
       if (v.gone || v.aliveCount === 0) return;
       ensureInstanced(v);
-      const i = Math.min(v.nx - 1, Math.max(0, Math.floor((p.x - v.x0) / v.sx)));
-      const j = Math.min(v.ny - 1, Math.max(0, Math.floor((p.y - v.y0) / v.sy)));
-      const k = Math.min(v.nz - 1, Math.max(0, Math.floor((p.z - v.z0) / v.sz)));
-      const idx = i + v.nx * (j + v.ny * k);
-      if (!v.alive[idx]) return;
+      const i0 = Math.min(v.nx - 1, Math.max(0, Math.floor((p.x - v.x0) / v.sx)));
+      const j0 = Math.min(v.ny - 1, Math.max(0, Math.floor((p.y - v.y0) / v.sy)));
+      const k0 = Math.min(v.nz - 1, Math.max(0, Math.floor((p.z - v.z0) / v.sz)));
+      let idx = i0 + v.nx * (j0 + v.ny * k0);
+      if (!v.alive[idx]) {
+        let best = -1;
+        let bestD = Infinity;
+        const iLo = Math.max(0, i0 - 3);
+        const iHi = Math.min(v.nx - 1, i0 + 3);
+        const jLo = Math.max(0, j0 - 3);
+        const jHi = Math.min(v.ny - 1, j0 + 3);
+        const kLo = Math.max(0, k0 - 3);
+        const kHi = Math.min(v.nz - 1, k0 + 3);
+        for (let k = kLo; k <= kHi; k++) {
+          for (let j = jLo; j <= jHi; j++) {
+            for (let i = iLo; i <= iHi; i++) {
+              const c = i + v.nx * (j + v.ny * k);
+              if (!v.alive[c]) continue;
+              voxCenter(v, c, voxChipP);
+              const d = (voxChipP.x - p.x) ** 2 + (voxChipP.y - p.y) ** 2 + (voxChipP.z - p.z) ** 2;
+              if (d < bestD) {
+                bestD = d;
+                best = c;
+              }
+            }
+          }
+        }
+        if (best < 0) return;
+        idx = best;
+      }
       v.hp[idx] -= dmg;
       // Fortnite-style feedback: damage number, health bar, hit SFX
       noteVoxDamage(v, dmg, p);
@@ -3942,6 +4134,9 @@ export default function BattleRoyaleGame() {
     let kick = 0;
     let vy = 0;
     let grounded = true;
+    // Fall tracking: the highest feet height while airborne — landing
+    // compares against it to price the drop (see checkFallDamage).
+    let fallPeak = 0;
     let jumpTap = false;
     let moving = false;
     let sprinting = false;
@@ -4189,6 +4384,27 @@ export default function BattleRoyaleGame() {
       jumpTap = false;
     }
 
+    // Very steep natural ground refuses walkers — no more sprinting up
+    // cliff faces. Only applies while standing ON the terrain (built
+    // ramps, containers and stairs stay walkable); the carved transition
+    // routes stay climbable so the road network keeps working. Want up?
+    // Build a ramp or ladder — that is what they are for.
+    const STEEP_SLOPE = 1.15; // ~49 degrees: steeper ground refuses footing
+    const steepBlocked = (fx: number, fz: number, tx: number, tz: number) => {
+      if (!terrainOn) return false;
+      const feet = camera.position.y - eyeH;
+      const g0 = groundAt(fx, fz);
+      if (feet - g0 > 0.7) return false; // riding a structure, not the terrain
+      const dx = tx - fx;
+      const dz = tz - fz;
+      const d = Math.hypot(dx, dz);
+      if (d < 0.02) return false;
+      if (groundAt(tx, tz) - g0 <= STEEP_SLOPE * d) return false; // gentle enough
+      const np = nearPath(tx, tz);
+      if (np && np.d < np.w / 2 + 1.6) return false; // routes carve through
+      return true;
+    };
+
     function movePlayer(dt: number) {
       const preX = camera.position.x;
       const preZ = camera.position.z;
@@ -4196,6 +4412,11 @@ export default function BattleRoyaleGame() {
       const s = axis('KeyD', 'KeyA') + stick.x;
       const len = Math.hypot(f, s);
       const { floor, wet, swimming } = waterState();
+      // Track the fall: while grounded / climbing / swimming the peak
+      // simply follows the feet; airborne it holds the takeoff apex.
+      const feetNow = camera.position.y - eyeH;
+      if (grounded || climb || swimming) fallPeak = feetNow;
+      else fallPeak = Math.max(fallPeak, feetNow);
       moving = len > 0 && !climb;
       sprinting = moving && !wet && (keys.has('ShiftLeft') || keys.has('ShiftRight') || -stick.y >= STICK_RUN);
       // Water drag: progressive wading slowdown the deeper you go
@@ -4247,10 +4468,14 @@ export default function BattleRoyaleGame() {
         slide.x0 = camera.position.x;
         slide.z0 = camera.position.z;
         slide.step = slide.v * dt;
-        camera.position.x += slide.dx * slide.step;
-        camera.position.z += slide.dz * slide.step;
+        if (steepBlocked(camera.position.x, camera.position.z, camera.position.x + slide.dx * slide.step, camera.position.z + slide.dz * slide.step)) {
+          slide = null; // slammed into a cliff face — the slide dies there
+        } else {
+          camera.position.x += slide.dx * slide.step;
+          camera.position.z += slide.dz * slide.step;
+        }
         runDist = 0;
-        if (slide.v < SLIDE_STOP || slide.t >= SLIDE_TIME) slide = null;
+        if (slide && (slide.v < SLIDE_STOP || slide.t >= SLIDE_TIME)) slide = null;
       } else if (roll) {
         const u0 = roll.t / ROLL_TIME;
         roll.t += dt;
@@ -4273,10 +4498,30 @@ export default function BattleRoyaleGame() {
         const boost = 1 + 0.5 * Math.min(1, runDist / RUN_RAMP);
         const speed = (sprinting ? SPRINT : WALK) * boost * (current ? 1 : UNARMED_SPEED) * waterDrag;
         const step = speed * Math.min(1, len) * dt;
-        camera.position.x += wx * step;
-        camera.position.z += wz * step;
-        runDist += step;
-        playerGait += step * 4.5;
+        const nx = camera.position.x + wx * step;
+        const nz = camera.position.z + wz * step;
+        if (grounded && steepBlocked(camera.position.x, camera.position.z, nx, nz)) {
+          // Cliff face: straight ahead is too steep. Contour along the
+          // slope instead — at most ONE axis, so the fallback step is
+          // always a strict subset of the blocked move.
+          const sx = camera.position.x + wx * step;
+          const sz = camera.position.z + wz * step;
+          let slid = 0;
+          if (wx !== 0 && !steepBlocked(camera.position.x, camera.position.z, sx, camera.position.z)) {
+            camera.position.x = sx;
+            slid = step;
+          } else if (wz !== 0 && !steepBlocked(camera.position.x, camera.position.z, camera.position.x, sz)) {
+            camera.position.z = sz;
+            slid = step;
+          }
+          runDist = 0;
+          playerGait += slid * 4.5;
+        } else {
+          camera.position.x = nx;
+          camera.position.z = nz;
+          runDist += step;
+          playerGait += step * 4.5;
+        }
       } else {
         runDist = 0;
       }
@@ -4417,13 +4662,16 @@ export default function BattleRoyaleGame() {
         }
         const landing = supportAt(camera.position.x, camera.position.z, before);
         if (camera.position.y - eyeH <= landing + 0.01 && vy <= 0) {
+          checkFallDamage(fallPeak - landing);
           camera.position.y = eyeH + landing;
           vy = 0;
           grounded = true;
+          fallPeak = landing;
         } else if (standing && vy <= 0 && before - landing <= STEP_DOWN) {
           camera.position.y = eyeH + landing;
           vy = 0;
           grounded = true;
+          fallPeak = landing;
         } else {
           grounded = false;
         }
@@ -5781,15 +6029,16 @@ export default function BattleRoyaleGame() {
     }
 
     const POI_KINDS: Record<string, { label: string; cls: string; r: number; loot: string[]; n: number }> = {
-      village: { label: 'VILL', cls: 'c-vill', r: 44, loot: ['smg', 'shield', 'light', 'heavy'], n: 3 },
-      farm: { label: 'FARM', cls: 'c-farm', r: 40, loot: ['heavy', 'light', 'shield'], n: 2 },
-      fuel: { label: 'FUEL', cls: 'c-fuel', r: 32, loot: ['heavy', 'shield', 'smg'], n: 2 },
-      construction: { label: 'SITE', cls: 'c-site', r: 34, loot: ['heavy', 'smg', 'light'], n: 2 },
-      camp: { label: 'CAMP', cls: 'c-camp', r: 26, loot: ['sniper', 'smg', 'shield'], n: 3 },
-      radio: { label: 'MAST', cls: 'c-mast', r: 24, loot: ['sniper', 'shield'], n: 2 },
-      ruins: { label: 'RUIN', cls: 'c-ruin', r: 30, loot: ['betgun', 'heavy', 'light'], n: 2 },
-      outpost: { label: 'OUTP', cls: 'c-outp', r: 26, loot: ['sniper', 'heavy', 'shield'], n: 2 },
-      watertower: { label: 'WATER', cls: 'c-tow', r: 18, loot: ['shield', 'light'], n: 2 },
+      village: { label: 'VILL', cls: 'c-vill', r: 44, loot: ['smg', 'shield', 'light', 'heavy'], n: 5 },
+      farm: { label: 'FARM', cls: 'c-farm', r: 40, loot: ['heavy', 'light', 'shield'], n: 3 },
+      fuel: { label: 'FUEL', cls: 'c-fuel', r: 32, loot: ['heavy', 'shield', 'smg'], n: 3 },
+      construction: { label: 'SITE', cls: 'c-site', r: 34, loot: ['heavy', 'smg', 'light'], n: 3 },
+      camp: { label: 'CAMP', cls: 'c-camp', r: 26, loot: ['sniper', 'smg', 'shield'], n: 5 },
+      radio: { label: 'MAST', cls: 'c-mast', r: 24, loot: ['sniper', 'shield'], n: 3 },
+      ruins: { label: 'RUIN', cls: 'c-ruin', r: 30, loot: ['betgun', 'heavy', 'light'], n: 3 },
+      outpost: { label: 'OUTP', cls: 'c-outp', r: 26, loot: ['sniper', 'heavy', 'shield'], n: 3 },
+      watertower: { label: 'WATER', cls: 'c-tow', r: 18, loot: ['shield', 'light'], n: 3 },
+      tower: { label: 'TOWER', cls: 'c-vtow', r: 30, loot: ['sniper', 'heavy', 'blast', 'shield'], n: 3 },
     };
 
     function generatePois() {
@@ -5800,13 +6049,13 @@ export default function BattleRoyaleGame() {
         const def = POI_KINDS[kind];
         for (let i = 0; i < def.n; i++) {
           let best: { x: number; z: number; score: number } | null = null;
-          for (let t = 0; t < 160; t++) {
+          for (let t = 0; t < 260; t++) {
             const x = (rnd() * 2 - 1) * (HARBOR_HALF - 330);
             const z = (rnd() * 2 - 1) * (HARBOR_HALF - 330);
             if (seaDist(x, z) > -160) continue; // dry land, well inland
             if (Math.hypot(x - HARBOR_SPAWN.x, z - HARBOR_SPAWN.z) < 340) continue; // spawn stays clear
             if (harborAnchor && Math.hypot(x - harborAnchor.x, z - harborAnchor.z) < portClearR + 260) continue; // the port owns the coast
-            if (pois.some((p) => Math.hypot(p.x - x, p.z - z) < 300)) continue; // spread out
+            if (pois.some((p) => Math.hypot(p.x - x, p.z - z) < 210)) continue; // dense, but never overlapping
             const h0 = terrainHeight(x, z);
             if (h0 < WATER_Y + 2.5) continue;
             let spread = 0;
@@ -6468,6 +6717,26 @@ export default function BattleRoyaleGame() {
           buildShed({ x: sh.x, z: sh.z, rot: 0 }, gy, g);
           break;
         }
+        case 'tower': {
+          buildVertTower(B, gy, g);
+          const gt = place(-12, 8);
+          buildGuardTower({ x: gt.x, z: gt.z, rot: p.rot }, gy, g);
+          const cr = place(9, -9);
+          bBox({ x: cr.x, z: cr.z, rot: 0 }, 'z', -0.55, 0.55, -0.55, 0.55, gy, gy + 1.0, bmCrate, g);
+          // Roof loot — the climb's reward, hand-planted on the top deck
+          for (const [rk, ru, rv] of [
+            ['rpg', 1.9, 1.6],
+            ['shield', -1.9, -1.6],
+          ] as Array<[string, number, number]>) {
+            const spot = place(ru, rv);
+            const pk = pickupMesh(rk);
+            pk.position.set(spot.x, gy + 22.05, spot.z);
+            (pk.userData as any).poi = p.id;
+            scene.add(pk);
+            pickups.push({ kind: rk, x: spot.x, z: spot.z, group: pk, taken: false, timer: 0 });
+          }
+          break;
+        }
       }
 
       poiLoot(POI_KINDS[p.kind].loot, p.x, p.z, p.r * 0.5, gy, p.id, rnd);
@@ -7001,7 +7270,8 @@ export default function BattleRoyaleGame() {
                 jw: +VW.jw.toFixed(3),
                 fw: +VW.fw.toFixed(3),
                 gw: +VW.gw.toFixed(3),
-                sum: +(VW.mw + VW.lw + VW.jw + VW.fw + VW.gw).toFixed(3),
+                ww: +VW.ww.toFixed(3),
+                sum: +(VW.mw + VW.lw + VW.jw + VW.fw + VW.gw + VW.ww).toFixed(3),
                 h: +terrainHeight(bx, bz).toFixed(2),
               };
             },
@@ -7360,6 +7630,56 @@ export default function BattleRoyaleGame() {
                 .map((b) => ({ x: +b.x.toFixed(1), z: +b.z.toFixed(1), hx: +b.hx.toFixed(2), hz: +b.hz.toFixed(2), top: +b.top.toFixed(2), bottom: +(b.bottom ?? 0).toFixed(2) })),
             buildPiece: () => BUILD_PIECES[buildPieceIdx].kind,
             cyclePiece: (dir = 1) => cycleBuildPiece(dir),
+            // ---- Task H e2e hooks: fall damage / steep slopes / masked
+            // trees / wasteland barrels / run reset / permanent deaths ----
+            vitals: () => ({
+              life: +life.toFixed(1),
+              shield: +shield.toFixed(1),
+              level: playerLevel,
+              xp,
+              credits,
+              downs,
+              wood: Math.floor(woodRes),
+              weapon: current ? current.kind : null,
+            }),
+            resetRun: () => {
+              resetRun();
+              return {
+                life: +life.toFixed(1),
+                shield: +shield.toFixed(1),
+                level: playerLevel,
+                xp,
+                credits,
+                wood: Math.floor(woodRes),
+                weapon: current ? current.kind : null,
+              };
+            },
+            steep: (fx: number, fz: number, tx: number, tz: number) => steepBlocked(+fx, +fz, +tx, +tz),
+            hurtFall: (drop: number) => {
+              const before = life;
+              checkFallDamage(+drop || 0);
+              return +(before - life).toFixed(1);
+            },
+            treeStats: () => {
+              const treeBoxes = voxBoxes.filter((v) => v.gain > 0);
+              return {
+                boxes: treeBoxes.length,
+                masked: treeBoxes.filter((v) => v.aliveCount < v.total).length,
+                aliveVox: treeBoxes.reduce((n, v) => n + v.aliveCount, 0),
+                totalVox: treeBoxes.reduce((n, v) => n + v.total, 0),
+              };
+            },
+            barrels: () =>
+              voxBoxes
+                .filter((v) => v.boom)
+                .map((v) => ({
+                  x: +(v.x0 + (v.nx * v.sx) / 2).toFixed(1),
+                  z: +(v.z0 + (v.nz * v.sz) / 2).toFixed(1),
+                  boomed: !!v.boomed,
+                  alive: v.aliveCount,
+                  gone: v.gone,
+                })),
+            permanentDeaths: () => dummies.filter((d) => d.ai && d.state === 'down').length,
           };
         }, 300);
       }
@@ -8946,6 +9266,49 @@ export default function BattleRoyaleGame() {
       bBox(B, 'x', 2.1, 2.9, -2.4, -1.4, gy, gy + 0.85, bmCrate, parent);
     }
 
+    // FAIRLY VERTICAL POI: a six-storey stair tower you can walk ALL the
+    // way up. Each deck is a concrete ring around a central shaft; a
+    // zig stair columns up the shaft in 0.4 m steps (guard-tower style —
+    // face it and walk), and the open shaft doubles as a 22 m fall
+    // hazard now that gravity bites. The best loot waits on the roof.
+    function buildVertTower(B: any, gy = 0, parent?: THREE.Object3D) {
+      const H = 22; // roof height
+      const FS = 4.4; // storey pitch
+      // Corner columns
+      for (const [cx, cz] of [
+        [-3.1, -3.1],
+        [3.1, -3.1],
+        [-3.1, 3.1],
+        [3.1, 3.1],
+      ]) {
+        bBox(B, 'z', cx - 0.26, cx + 0.26, cz - 0.26, cz + 0.26, gy, gy + H, bmConcreteDark, parent);
+      }
+      // Deck rings (five storeys + roof) around the central stair shaft
+      for (let f = 1; f <= 6; f++) {
+        const yy = gy + f * FS - 0.22;
+        bBox(B, 'x', -3.8, -0.8, -3.8, 3.8, yy, yy + 0.22, bmConcrete, parent); // west strip
+        bBox(B, 'x', 0.8, 3.8, -3.8, 3.8, yy, yy + 0.22, bmConcrete, parent); // east strip
+        bBox(B, 'z', -3.8, -0.8, -0.8, 0.8, yy, yy + 0.22, bmConcrete, parent); // north bridge
+        bBox(B, 'z', 0.8, 3.8, -0.8, 0.8, yy, yy + 0.22, bmConcrete, parent); // south bridge
+        // chest-high rails on the outer edges (the shaft edge stays open — mind the drop)
+        bBox(B, 'z', -3.8, 3.8, -3.92, -3.74, yy + 0.22, yy + 1.05, bmConcrete, parent); // west
+        bBox(B, 'z', -3.8, 3.8, 3.74, 3.92, yy + 0.22, yy + 1.05, bmConcrete, parent); // east
+        bBox(B, 'x', -3.92, 3.92, -3.92, -3.74, yy + 0.22, yy + 1.05, bmConcrete, parent); // north
+        bBox(B, 'x', -3.92, 3.92, 3.74, 3.92, yy + 0.22, yy + 1.05, bmConcrete, parent); // south
+      }
+      // The zig stair: 0.4 m steps (<= step-up) alternating left/right
+      // inside the shaft, all the way to the roof — face it and walk.
+      const steps = Math.ceil(H / 0.4);
+      for (let i = 0; i < steps; i++) {
+        const off = i % 2 === 0 ? -0.35 : 0.35;
+        bBox(B, 'x', off - 0.38, off + 0.38, -0.4, 0.4, gy + i * 0.4, gy + (i + 1) * 0.4, bmPlankDark, parent);
+      }
+      // Roof dressing: a red beacon mast + equipment box
+      bBox(B, 'z', 2.45, 2.85, 2.45, 2.85, gy + H, gy + H + 3.2, bmRust, parent);
+      bBox(B, 'z', 2.3, 3.0, 2.3, 3.0, gy + H + 3.2, gy + H + 3.6, bmBandRed, parent);
+      bBox(B, 'x', -3.2, -1.8, -3.2, -2.2, gy + H, gy + H + 0.9, bmSteelDark, parent);
+    }
+
     function buildRadioMast(B: any, gy = 0, parent?: THREE.Object3D) {
       const legs: Array<[number, number]> = [
         [0, 1.25],
@@ -9350,6 +9713,24 @@ export default function BattleRoyaleGame() {
       }
       if (had > 0 && shield <= 0) showMessage('Shield down', 1.5);
       if (life <= 0) goDown();
+    }
+
+    // FALL DAMAGE: gravity is not something the microbots can parry.
+    // Drops past the safe band bite HEALTH directly, so mountains,
+    // towers and roof-hopping all carry real risk. Water landings are
+    // free (swimming never prices a drop) — dive from anything.
+    const FALL_SAFE = 4.6; // metres you can drop without a scratch
+    const FALL_DMG_PER_M = 9; // HP per metre beyond the safe drop
+    function checkFallDamage(drop: number) {
+      if (playerDown || drop <= FALL_SAFE) return;
+      const dmg = Math.min(95, (drop - FALL_SAFE) * FALL_DMG_PER_M);
+      life = Math.max(0, life - dmg);
+      sinceHurt = 0;
+      hurtFlash = 0.4;
+      playSfx('wood_hit');
+      showDamagePopup('-' + Math.round(dmg) + ' HP', camera.position.clone().setY(camera.position.y - 0.55), '#ff8c5a', true);
+      if (life <= 0) goDown();
+      else showMessage('Hard landing: -' + Math.round(dmg) + ' HP — watch those cliffs', 2.2);
     }
 
     function goDown() {
@@ -10618,6 +10999,98 @@ export default function BattleRoyaleGame() {
     }
 
     const inventoryReturnMenuEl = $('inventoryReturnMenu');
+    // LEAVING A GAME WIPES THE SLATE: every carry-over — XP, level,
+    // credits, kills, loadout, ammo, grenades, wood, deployed turret /
+    // antenna, half-built ghosts, stray rockets — resets so the next
+    // deployment starts from scratch. No more progress leaking between
+    // games.
+    function resetRun() {
+      xp = 0;
+      playerLevel = 1;
+      levelKey = ''; // force the level HUD to repaint
+      shieldLevel = 1;
+      turretLevel = 1;
+      turretDamage = 38;
+      turretDelay = 0.6;
+      if (turret) {
+        scene.remove(turret.group);
+        turret = null;
+      }
+      removeAntenna(true);
+      credits = 300;
+      downs = 0;
+      if (creditsEl) creditsEl.textContent = String(credits);
+      if (downsEl) downsEl.textContent = String(downs);
+      playerDown = false;
+      respawnT = 0;
+      life = lifeMax();
+      shield = shieldMax();
+      sinceHurt = 99;
+      hurtFlash = 0;
+      shieldFlash = 0;
+      // Loadout back to the boot pistol
+      for (const key of Object.keys(WEAPONS)) {
+        const w = (WEAPONS as any)[key];
+        w.gun.visible = false;
+        w.loaded = w.mag;
+      }
+      slots[0] = WEAPONS.pistol;
+      slots[1] = null;
+      current = WEAPONS.pistol;
+      current.gun.visible = true;
+      lastSlot = 0;
+      cooldown = 0;
+      reloadT = 0;
+      flashT = 0;
+      reserve.heavy = 0;
+      reserve.light = 60;
+      grenades.blast = 0;
+      grenades.fire = 0;
+      grenades.smoke = 0;
+      // Build economy + stray projectiles + half-built ghosts
+      woodRes = 60;
+      cancelPendingBuilds();
+      for (const r of rockets) {
+        scene.remove(r.mesh);
+        r.mesh.traverse((o: any) => o.geometry?.dispose());
+      }
+      rockets.length = 0;
+      for (const m of playerBuiltVox) {
+        m.parent?.remove(m);
+        m.geometry.dispose();
+      }
+      playerBuiltVox.length = 0;
+      stairPieces.length = 0;
+      stairRamps.length = 0;
+      resetBuildables();
+      // Fresh stance back at the spawn point
+      camera.position.set(spawn.x, EYE + groundAt(spawn.x, spawn.z), spawn.z);
+      yaw = 0;
+      pitch = 0;
+      vy = 0;
+      grounded = true;
+      fallPeak = groundAt(spawn.x, spawn.z);
+      climb = null;
+      slide = null;
+      roll = null;
+      airCarry = null;
+      slideReq = false;
+      rollReq = 0;
+      eyeH = EYE;
+      crouched = false;
+      setMapOpen(false);
+      // HUD repaint
+      refreshHud();
+      refreshSlots();
+      refreshGrenades();
+      refreshWood();
+      updateBuildHud();
+      updateLevelHud();
+      updateTurretHud();
+      vitalsShown = '';
+      updateVitals();
+      if (inventoryEl && !inventoryEl.hidden) refreshInventory();
+    }
     function returnToMenu() {
       if (inventoryEl) inventoryEl.hidden = true;
       if (overlay) overlay.hidden = true;
@@ -10627,6 +11100,7 @@ export default function BattleRoyaleGame() {
       keys.clear();
       mouseHeld = aimMouse = false;
       releaseTouch();
+      resetRun();
     }
 
     inventoryCloseEl?.addEventListener('click', closeInventory);
@@ -11024,6 +11498,7 @@ export default function BattleRoyaleGame() {
       'c-ruin': '#a8a29e',
       'c-outp': '#facc15',
       'c-tow': '#60a5fa',
+      'c-vtow': '#fb7185',
     };
     const mapMarkColor = (cls: string) => MAP_MARK_COLORS[cls] || '#cbd5e1';
     const mapTerrain = typeof document !== 'undefined' ? document.createElement('canvas') : null;
@@ -11056,6 +11531,11 @@ export default function BattleRoyaleGame() {
           else if (h < 32) col = '#7c9350';
           else if (h < 58) col = '#8b8471';
           else col = '#e8edf1';
+          // The wasteland reads as its own ashen country on the map
+          if (terrainOn && h > BEACH_Y + 0.15 && h < 40) {
+            biomeWeights(x, z, CW);
+            if (CW.ww > 0.45) col = '#8d7c52';
+          }
           c.fillStyle = col;
           c.fillRect(i * cell, j * cell, cell + 1, cell + 1);
         }
@@ -11288,6 +11768,17 @@ export default function BattleRoyaleGame() {
           d.timer = 3;
         }
       } else if (d.state === 'down') {
+        // Harbor mode: a bot's death is PERMANENT — the island only has
+        // so many patrols to lose. The swarm disbands and the body stays
+        // where it fell. (Range training dummies still respawn — they
+        // are range equipment.)
+        if (d.ai && terrainOn) {
+          if (d.bots) {
+            releaseField(d.bots);
+            d.bots = undefined;
+          }
+          return;
+        }
         d.timer -= dt;
         if (d.timer <= 0) {
           d.state = 'up';
@@ -12675,7 +13166,7 @@ export default function BattleRoyaleGame() {
               <b>Harbor is a procedural map.</b> The port owns the coast — pier, container yard, warehouses, gantry cranes, customs office, fuel tanks, a dry dock with a half-built ship, and a breakwater crowned by a climbable lighthouse. Every structure is destructible and the port holds the best loot
             </li>
             <li>
-              The rest of the map fills with POIs — <b>VILL</b>age, <b>FARM</b>, <b>FUEL</b> depot, construction <b>SITE</b> (tower crane!), <b>CAMP</b>, radio <b>MAST</b>, <b>RUIN</b>ns, <b>OUTP</b>ost and <b>WATER</b> tower — each with loot and a compass chip. Guard towers and lighthouses have walkable stairs to the top, and the port's warehouses have LADDERs up to their roofs
+              The rest of the map fills <b>DENSELY</b> with POIs — <b>VILL</b>age, <b>FARM</b>, <b>FUEL</b> depot, construction <b>SITE</b> (tower crane!), <b>CAMP</b>, radio <b>MAST</b>, <b>RUIN</b>ns, <b>OUTP</b>ost, <b>WATER</b> tower and the six-storey <b>TOWER</b> high-rises — each with loot and a compass chip. Guard towers and lighthouses have walkable stairs to the top, the TOWERs climb all the way to rooftop loot, and the port's warehouses have LADDERs up to their roofs
             </li>
             <li>
               Dust, mud and gravel transition routes stitch the port gate to every POI — follow the tan / brown corridors through the biomes instead of bushwhacking, and watch for them on the tactical map
@@ -12697,6 +13188,21 @@ export default function BattleRoyaleGame() {
             <li><b>Rocket Launcher:</b> fires slow streaking rockets that detonate a full blast — it feeds on BLAST BOMBS (the grenades you throw are its ammo, shown on the grenade plate). Find launchers as loot or buy one at 150 credits</li>
             <li>Sharkteeth bites 35% harder now — it shreds shields up close faster than ever</li>
             <li>Bullets lose power with range: pistol past 30 m, SMG past 20 m, SK past 60 m, sniper past 200 m</li>
+            <li>
+              <b>Watch your step:</b> drops past ~4.5 m bite your <b>HEALTH</b> directly — the swarm cannot parry gravity. Water landings are free, so dive from anything
+            </li>
+            <li>
+              <b>The mountains are real rock now</b> — ribs, crags, strata and bare cliff faces — and slopes steeper than ~49° refuse footing. Dust routes still climb; build ramps and ladders to conquer the cliffs
+            </li>
+            <li>
+              <b>Ashen WASTELAND patches</b> crack the drylands open: dead stands, red dirt — and <b>EXPLOSIVE fuel barrels</b>. One round detonates a drum, and clumps chain. Use them as weapons, not cover
+            </li>
+            <li>
+              <b>TOWER high-rises</b> — six-storey stair cores, walkable all the way to a roof with an RPG on it. The central shaft is a 22 m fall, so mind the hole
+            </li>
+            <li>
+              <b>Harbor patrols die permanently</b> — the island has only so many bots to lose. Leaving to the menu wipes the run: XP, credits, loadout and wood all start fresh
+            </li>
             <li>
               <b>Shield = a microbot swarm.</b> 1 small bot hovers for every 5 shield — around you and around every dummy. A shot makes the nearest bot dash <b>into the bullet's path</b>; <b>direct sun recharges the swarm at 45/s</b> (roofs, tree crowns and being underwater block it — the ☀ on the Shield bar marks the charge)
             </li>
@@ -12738,6 +13244,8 @@ export default function BattleRoyaleGame() {
             <li>Trees are voxelized: shoot or blast them for WOOD — the fuel for every wooden build (the plate under the minimap shows your purse)</li>
             <li>Your shield is a microbot swarm: it recharges fast in the sun (☀ on the shield bar) and every build / turret / antenna spends it. Placed pieces take a few seconds to assemble — watch the bots work</li>
             <li>You start with a Pistol, and so do the bots — loot better weapons (or the Rocket Launcher, which eats blast bombs) before they do</li>
+            <li>Gravity bites now: big drops hurt your HEALTH directly, and cliffs steeper than ~49° refuse footing — build ramps to conquer them</li>
+            <li>Ashen wastelands hide EXPLOSIVE fuel barrels — one shot detonates a drum and chains its neighbours. Harvest the chaos; climb the TOWER high-rises for rooftop loot</li>
             <li>War wrecks — tanks, trucks, helicopters, skeletons — dot the island away from the POIs. They are destructible cover</li>
             <li>Wade into the sea: you slow down, then swim. Hold crouch to dive, tap jump to stroke up</li>
             <li>The top compass shows the nearest landmarks with distances — edge-pinned chips show which way to turn. Follow the port chips (PIER, YARD, DOCK, LIGHT) for the best loot</li>

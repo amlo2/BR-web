@@ -1938,6 +1938,8 @@ body:not(.touch) .touch-build { display: none; }
 .compass-mark.c-outp b { color: #7fb2d9; }
 .compass-mark.c-tow { border-color: rgba(94, 207, 201, 0.6); }
 .compass-mark.c-tow b { color: #5ecfc9; }
+.compass-mark.c-vtow { border-color: rgba(244, 114, 182, 0.6); }
+.compass-mark.c-vtow b { color: #f472b6; }
 .compass-mark.c-ship { border-color: rgba(239, 68, 68, 0.65); }
 .compass-mark.c-ship b { color: #ef4444; }
 
