@@ -2405,9 +2405,11 @@ export default function BattleRoyaleGame() {
         showMessage(
           p.kind === 'auto'
             ? '🎯 Auto build: look up = ladder · look straight up ON a staircase = another staircase on top · look forward = wall · look down on the ground = ramp · look down from a ramp / structure = platform. [LEFT CLICK / TAP AIM] place' +
-                (terrainOn ? ' · 🪵 ' + (PIECE_COST[resolvedBuildKind()] ?? 10) + ' wood' : '')
+                (terrainOn ? ' · 🪵 ' + (PIECE_COST[resolvedBuildKind()] ?? 10) + ' wood' : '') +
+                ' · ⚡ ' + (PIECE_COST[resolvedBuildKind()] ?? 10) + ' swarm'
             : p.icon + ' ' + p.label + ': [LEFT CLICK / TAP AIM] place (' + p.hp + ' HP voxel)' +
-                (terrainOn ? ' · 🪵 ' + (PIECE_COST[p.kind] ?? 10) + ' wood' : '') + ' · [Wheel / T / double-tap WALL] cycle piece · [V / RIGHT CLICK] cancel',
+                (terrainOn ? ' · 🪵 ' + (PIECE_COST[p.kind] ?? 10) + ' wood' : '') +
+                ' · ⚡ ' + (PIECE_COST[p.kind] ?? 10) + ' swarm · [Wheel / T / double-tap WALL] cycle piece · [V / RIGHT CLICK] cancel',
           p.kind === 'auto' ? 5 : 3.2
         );
         setPreviewGeometry(resolvedBuildKind());
@@ -2523,8 +2525,8 @@ export default function BattleRoyaleGame() {
       const stateEl = $('buildWallState');
       if (stateEl)
         stateEl.textContent = auto
-          ? 'Voxel ' + p.hp + ' HP' + (terrainOn ? ' · 🪵' + (PIECE_COST[resolvedBuildKind()] ?? 10) : '') + ' · up = ladder · straight-up on stairs = stack · forward = wall · down = ramp / floor'
-          : 'Voxel ' + p.hp + ' HP' + (terrainOn ? ' · 🪵' + (PIECE_COST[p.kind] ?? 10) : '') + ' · wheel / T cycles piece';
+          ? 'Voxel ' + p.hp + ' HP' + (terrainOn ? ' · 🪵' + (PIECE_COST[resolvedBuildKind()] ?? 10) : '') + ' · ⚡' + (PIECE_COST[resolvedBuildKind()] ?? 10) + ' swarm (sun recharges 45/s) · up = ladder · straight-up on stairs = stack · forward = wall · down = ramp / floor'
+          : 'Voxel ' + p.hp + ' HP' + (terrainOn ? ' · 🪵' + (PIECE_COST[p.kind] ?? 10) : '') + ' · ⚡' + (PIECE_COST[p.kind] ?? 10) + ' swarm · wheel / T cycles piece';
       const tIcon = $('buildPieceIcon');
       if (tIcon) tIcon.textContent = p.icon;
       const tLabel = $('buildPieceLabel');
@@ -2676,24 +2678,30 @@ export default function BattleRoyaleGame() {
 
       if (kind === 'wall') {
         buildFortniteWall(px, groundAt(px, pz), pz, angle);
+        spendShield(PIECE_COST.wall, px, groundAt(px, pz) + 1.1, pz, 1.3);
         showMessage('🧱 Wall deployed! (' + piece.hp + ' HP, voxel) Take cover — bullets chip it, grenades carve it!', 2.5);
       } else if (kind === 'door') {
         buildFortniteDoor(px, groundAt(px, pz), pz, angle);
+        spendShield(PIECE_COST.door, px, groundAt(px, pz) + 1.1, pz, 1.3);
         showMessage('🚪 Door wall up! Cover with a doorway you control!', 2.5);
       } else if (kind === 'floor') {
         const top = Math.max(feetY, groundAt(px, pz) + 0.05) + 0.06;
         addVoxSolid(px, top - 0.28, top, pz, 3, 3, bmPlank);
+        spendShield(PIECE_COST.floor, px, top + 0.25, pz, 1.5);
         showMessage('🟫 Floor placed! Bridge water or raise a platform!', 2.5);
       } else if (kind === 'ladder') {
         buildFortniteLadder(px, pz, angle, feetY);
+        spendShield(PIECE_COST.ladder, px, feetY + 1.7, pz, 0.9);
         showMessage('🪜 Ladder placed! Walk in and keep moving — you climb it like a stair!', 2.5);
       } else if (stacking && rampUnderfoot) {
         // Continue THIS staircase: the next one starts where it ends, at
         // its top — walk straight up the chain into the sky.
         buildFortniteRamp(rampUnderfoot.endX, rampUnderfoot.endZ, rampUnderfoot.angleY, rampUnderfoot.topEnd);
+        spendShield(PIECE_COST.ramp, rampUnderfoot.endX, rampUnderfoot.topEnd + 0.5, rampUnderfoot.endZ, 1.1);
         showMessage('📐 Another staircase stacks on top — keep climbing!', 2.5);
       } else {
         buildFortniteRamp(px, pz, angle, feetY);
+        spendShield(PIECE_COST.ramp, px, feetY + 0.55, pz, 1.2);
         showMessage('📐 Ramp placed! Run up onto roofs and containers!', 2.5);
       }
       toggleBuildWall(false);
@@ -2838,6 +2846,442 @@ export default function BattleRoyaleGame() {
       }
     }
 
+    // ----------------------------------------------------
+    // Microbot Shield Swarm
+    // ----------------------------------------------------
+    // The shield is not a holographic bubble anymore — it is a swarm
+    // of microbots. One bot flies for every 10 shield points,
+    // orbiting its host (the player or a training dummy). Every
+    // absorbed shot makes the nearest bot dash INTO the bullet's
+    // path and flash — a bot standing in front of the round. Building
+    // with wood and deploying the turret / antenna SPENDS shield:
+    // the bots stream off the orbit, arc to the build point,
+    // assemble the piece and merge into it. In direct sun the swarm
+    // recharges at 45 shield per second; under a roof or a tree
+    // crown it only gets the legacy 6-second trickle.
+    const SHIELD_PER_BOT = 10;
+    const SUN_REGEN = 45; // shield per second in direct sun
+    const ABILITY_SHIELD_COST = 25; // turret / antenna deploy drain
+    const botEase = (k: number) => 1 - (1 - k) * (1 - k);
+
+    interface BotTask {
+      kind: 'intercept' | 'burst' | 'build';
+      t: number; // clock, counts up from -stagger delay
+      dur: number; // fly duration
+      hold: number; // hold at the target (intercept flash / build assemble)
+      back: number; // return-to-orbit duration (intercept)
+      fx: number;
+      fy: number;
+      fz: number; // start
+      tx: number;
+      ty: number;
+      tz: number; // target
+      lift: number; // arc height on the flight
+      asmR: number; // assemble orbit radius (build)
+      flash: number; // white-hot pulse 0..1
+    }
+
+    interface BotSlot {
+      on: boolean;
+      field: BotField | null;
+      ang: number; // base orbit angle
+      h0: number;
+      h1: number; // height band above host feet
+      phase: number;
+      speed: number;
+      rad: number;
+      wob: number;
+      grow: number; // pop-in 0..1
+      die: number; // shrink-out countdown (0 = alive)
+      task: BotTask | null;
+      x: number;
+      y: number;
+      z: number;
+    }
+
+    interface BotField {
+      isPlayer: boolean;
+      dummy: DummyObject | null;
+      slots: number[];
+      dead: boolean;
+    }
+
+    const MAX_BOTS = 720; // player 46 + every patrol at max shield
+    const botSlots: BotSlot[] = [];
+    for (let i = 0; i < MAX_BOTS; i++) {
+      botSlots.push({
+        on: false, field: null, ang: 0, h0: 0.2, h1: 1.6, phase: 0, speed: 0, rad: 1, wob: 0,
+        grow: 1, die: 0, task: null, x: 0, y: 0, z: 0,
+      });
+    }
+    const botCore = new THREE.InstancedMesh(
+      new THREE.BoxGeometry(0.055, 0.055, 0.055),
+      new THREE.MeshBasicMaterial({ color: 0xbdf6ff }),
+      MAX_BOTS
+    );
+    const botHalo = new THREE.InstancedMesh(
+      new THREE.BoxGeometry(0.14, 0.14, 0.14),
+      new THREE.MeshBasicMaterial({ color: 0x67e8f9, transparent: true, opacity: 0.3, blending: THREE.AdditiveBlending, depthWrite: false }),
+      MAX_BOTS
+    );
+    botCore.frustumCulled = false;
+    botHalo.frustumCulled = false;
+    scene.add(botCore);
+    scene.add(botHalo);
+    {
+      const zero = new THREE.Matrix4().makeScale(0, 0, 0);
+      const cyan = new THREE.Color(0x9ef1ff);
+      for (let i = 0; i < MAX_BOTS; i++) {
+        botCore.setMatrixAt(i, zero);
+        botHalo.setMatrixAt(i, zero);
+        botCore.setColorAt(i, cyan);
+      }
+      botCore.instanceMatrix.needsUpdate = true;
+      botHalo.instanceMatrix.needsUpdate = true;
+      if (botCore.instanceColor) botCore.instanceColor.needsUpdate = true;
+    }
+
+    const botFields: BotField[] = [];
+    let playerField: BotField | null = null;
+    let botClock = 0;
+    const botM4 = new THREE.Matrix4();
+    const botQ = new THREE.Quaternion();
+    const botEU = new THREE.Euler();
+    const botS = new THREE.Vector3();
+    const botP = new THREE.Vector3();
+    const botO = new THREE.Vector3();
+    const botC = new THREE.Color();
+    const BOT_CYAN = new THREE.Color(0x9ef1ff);
+    const BOT_WHITE = new THREE.Color(0xffffff);
+
+    function makeBotField(isPlayer: boolean, dummy: DummyObject | null): BotField {
+      const f: BotField = { isPlayer, dummy, slots: [], dead: false };
+      botFields.push(f);
+      return f;
+    }
+
+    function hideBot(i: number) {
+      botM4.makeScale(0, 0, 0);
+      botCore.setMatrixAt(i, botM4);
+      botHalo.setMatrixAt(i, botM4);
+    }
+
+    function releaseField(f: BotField) {
+      if (f.dead) return;
+      f.dead = true;
+      for (const i of f.slots) {
+        botSlots[i].on = false;
+        botSlots[i].field = null;
+        botSlots[i].task = null;
+        hideBot(i);
+      }
+      f.slots.length = 0;
+      const idx = botFields.indexOf(f);
+      if (idx >= 0) botFields.splice(idx, 1);
+      if (f === playerField) playerField = null; // recreated on demand
+    }
+
+    function releaseAllBotFields() {
+      while (botFields.length) releaseField(botFields[0]);
+    }
+
+    // Host anchor: feet position of the player / dummy
+    function botHostFeet(f: BotField, out: THREE.Vector3) {
+      if (f.isPlayer) out.set(camera.position.x, camera.position.y - eyeH, camera.position.z);
+      else if (f.dummy) out.copy(f.dummy.group.position);
+      else out.set(0, 0, 0);
+      return out;
+    }
+
+    function acquireSlot(f: BotField): number {
+      for (let i = 0; i < MAX_BOTS; i++) {
+        const s = botSlots[i];
+        if (s.on) continue;
+        s.on = true;
+        s.field = f;
+        s.ang = Math.random() * Math.PI * 2;
+        s.h0 = 0.18 + Math.random() * 0.1;
+        s.h1 = 1.5 + Math.random() * 0.25;
+        s.phase = Math.random() * Math.PI * 2;
+        s.speed = 0.7 + Math.random() * 0.7;
+        s.rad = (f.isPlayer ? 1.12 : 1.0) + Math.random() * 0.14;
+        s.wob = 0.08 + Math.random() * 0.08;
+        s.grow = 0;
+        s.die = 0;
+        s.task = null;
+        f.slots.push(i);
+        return i;
+      }
+      return -1;
+    }
+
+    // Idle (non-tasked, alive) bots per field
+    function idleBotCount(f: BotField) {
+      let n = 0;
+      for (const i of f.slots) {
+        const s = botSlots[i];
+        if (!s.task && s.die <= 0) n++;
+      }
+      return n;
+    }
+
+    // Match the orbiting swarm to the host's shield: 1 bot / 10 shield
+    function reconcileField(f: BotField, want: number) {
+      if (f.dead || want < 0) return;
+      const have = idleBotCount(f);
+      if (want > have) {
+        for (let k = 0; k < want - have; k++) if (acquireSlot(f) < 0) break;
+      } else if (want < have) {
+        let drop = have - want;
+        for (let j = f.slots.length - 1; j >= 0 && drop > 0; j--) {
+          const s = botSlots[f.slots[j]];
+          if (s.task || s.die > 0) continue;
+          s.die = 0.2; // graceful shrink-out
+          drop--;
+        }
+      }
+    }
+
+    // A shot was absorbed: the nearest bot dashes into the bullet's
+    // path (and flashes) while the bots matching the lost shield
+    // burst away from the impact and fizzle out.
+    function botFieldHit(f: BotField | null, absorbed: number, fx: number, fy: number, fz: number) {
+      if (!f || f.dead || absorbed <= 0) return;
+      botHostFeet(f, botP);
+      let dx = botP.x - fx;
+      let dz = botP.z - fz;
+      const len = Math.hypot(dx, dz) || 1;
+      dx /= len;
+      dz /= len;
+      const cy = botP.y + 0.95;
+      const impactAng = Math.atan2(dx, dz);
+      let best = -1;
+      let bestDiff = 99;
+      for (const i of f.slots) {
+        const s = botSlots[i];
+        if (s.task || s.die > 0) continue;
+        const a = s.ang + botClock * s.speed - impactAng;
+        const diff = Math.abs(Math.atan2(Math.sin(a), Math.cos(a)));
+        if (diff < bestDiff) {
+          bestDiff = diff;
+          best = i;
+        }
+      }
+      if (best >= 0) {
+        const s = botSlots[best];
+        s.task = {
+          kind: 'intercept', t: 0, dur: 0.07, hold: 0.16, back: 0.32,
+          fx: s.x, fy: s.y, fz: s.z,
+          tx: botP.x + dx * (s.rad + 0.28),
+          ty: cy + (fy - cy) * 0.25,
+          tz: botP.z + dz * (s.rad + 0.28),
+          lift: 0.1, asmR: 0, flash: 1,
+        };
+      }
+      // Shield the host just lost = microbots knocked loose
+      let burst = Math.round(absorbed / SHIELD_PER_BOT) - (best >= 0 ? 1 : 0);
+      if (burst > 0) {
+        for (const i of f.slots) {
+          if (burst <= 0) break;
+          const s = botSlots[i];
+          if (s.task || s.die > 0) continue;
+          const a = impactAng + (Math.random() - 0.5) * 1.6;
+          const push = s.rad + 1.2 + Math.random();
+          s.task = {
+            kind: 'burst', t: 0, dur: 0.34 + Math.random() * 0.12, hold: 0, back: 0,
+            fx: s.x, fy: s.y, fz: s.z,
+            tx: botP.x + Math.sin(a) * push,
+            ty: cy + 0.4 + Math.random() * 0.8,
+            tz: botP.z + Math.cos(a) * push,
+            lift: 0.5, asmR: 0, flash: 0.4,
+          };
+          burst--;
+        }
+      }
+    }
+
+    // Builder swarm: `amount` shield detaches, arcs to the piece and
+    // assembles it, then merges into it.
+    function botFieldSpend(f: BotField | null, amount: number, tx: number, ty: number, tz: number, asmR: number) {
+      if (!f || f.dead || amount <= 0) return;
+      const send = Math.min(Math.max(1, Math.round(amount / SHIELD_PER_BOT)), 6);
+      let sent = 0;
+      for (const i of f.slots) {
+        if (sent >= send) break;
+        const s = botSlots[i];
+        if (s.task || s.die > 0) continue;
+        const dist = Math.hypot(tx - s.x, tz - s.z);
+        s.task = {
+          kind: 'build',
+          t: -sent * 0.05,
+          dur: 0.28 + dist * 0.02,
+          hold: 0.55 + Math.random() * 0.2,
+          back: 0,
+          fx: s.x, fy: s.y, fz: s.z, tx, ty, tz,
+          lift: 0.8 + Math.min(2, dist * 0.06),
+          asmR, flash: 0.35,
+        };
+        sent++;
+      }
+    }
+
+    // Wooden builds + turret / antenna deploys spend the swarm itself
+    function spendShield(amount: number, tx: number, ty: number, tz: number, asmR = 1.4) {
+      if (amount <= 0) return;
+      const spent = Math.min(shield, amount);
+      shield -= spent;
+      if (spent > 0) {
+        if (!playerField) playerField = makeBotField(true, null);
+        botFieldSpend(playerField, spent, tx, ty, tz, asmR);
+      }
+      if (shield <= 0.01) showMessage('⚡ Swarm spent — step into the sun to recharge (45/s)', 2.4);
+    }
+
+    // Is (x, z, headY) in direct sun? Tree crowns shade like roofs.
+    function canopyShade(x: number, z: number, headY: number) {
+      const tx0 = Math.floor((x - 4) / TILE);
+      const tx1 = Math.floor((x + 4) / TILE);
+      const tz0 = Math.floor((z - 4) / TILE);
+      const tz1 = Math.floor((z + 4) / TILE);
+      for (let tx = tx0; tx <= tx1; tx++) {
+        for (let tz = tz0; tz <= tz1; tz++) {
+          const t = tiles.get(tx + ',' + tz);
+          if (!t) continue;
+          for (const v of t.vegTreeVox ?? []) {
+            if (v.gone) continue;
+            // A living tree lattice over the head = crown shade. The
+            // lattice spans trunk + crown from the ground, so the top
+            // must clear the head, the footprint must cover it.
+            if (
+              v.y0 + v.ny * v.sy > headY + 1 &&
+              x > v.x0 - 0.1 && x < v.x0 + v.nx * v.sx + 0.1 &&
+              z > v.z0 - 0.1 && z < v.z0 + v.nz * v.sz + 0.1
+            ) return true;
+          }
+        }
+      }
+      return false;
+    }
+
+    function probeSunlit(x: number, z: number, headY: number) {
+      if (headY < WATER_Y + 0.25) return 'submerged';
+      if (overheadAt(x, z, headY + 0.4, headY + 90) !== null) return 'roof';
+      if (canopyShade(x, z, headY)) return 'canopy';
+      return 'sun';
+    }
+
+    let playerSunlitWhy = 'sun';
+    let sunProbeT = 0;
+
+    function updateMicrobots(dt: number) {
+      botClock += dt;
+      if (!playerField) playerField = makeBotField(true, null);
+      reconcileField(playerField, !running() || playerDown ? 0 : Math.ceil(shield / SHIELD_PER_BOT));
+      for (const d of dummies) {
+        if (!d.bots) continue;
+        reconcileField(d.bots, d.state === 'up' ? Math.ceil(d.shield / SHIELD_PER_BOT) : 0);
+      }
+      // Fields whose dummy left the world (mode switch) recycle quietly
+      for (let i = botFields.length - 1; i >= 0; i--) {
+        const f = botFields[i];
+        if (!f.dead && !f.isPlayer && f.dummy && dummies.indexOf(f.dummy) === -1) releaseField(f);
+      }
+      for (const f of botFields) {
+        if (f.dead) continue;
+        botHostFeet(f, botP);
+        const feetX = botP.x;
+        const feetY = botP.y;
+        const feetZ = botP.z;
+        for (let j = f.slots.length - 1; j >= 0; j--) {
+          const i = f.slots[j];
+          const s = botSlots[i];
+          if (s.grow < 1) s.grow = Math.min(1, s.grow + dt * 4);
+          if (s.die > 0) {
+            s.die -= dt;
+            if (s.die <= 0) {
+              s.on = false;
+              s.task = null;
+              s.field = null;
+              f.slots.splice(j, 1);
+              hideBot(i);
+              continue;
+            }
+          }
+          // live orbit position (also used while a build task waits out
+          // its stagger delay, and as the intercept return target)
+          const a = s.ang + botClock * s.speed;
+          const h = s.h0 + (s.h1 - s.h0) * (0.5 + 0.5 * Math.sin(s.phase + botClock * 1.6));
+          const r = s.rad + s.wob * Math.sin(s.phase * 2.3 + botClock * 0.9);
+          botO.set(feetX + Math.sin(a) * r, feetY + h, feetZ + Math.cos(a) * r);
+          let scale = s.grow * (s.die > 0 ? Math.max(0, s.die / 0.2) : 1);
+          let flash = 0;
+          const t = s.task;
+          if (t) {
+            t.t += dt;
+            if (t.t >= 0) {
+              if (t.t < t.dur) {
+                // flight to the target (slight arc)
+                const k = botEase(t.t / t.dur);
+                s.x = t.fx + (t.tx - t.fx) * k;
+                s.z = t.fz + (t.tz - t.fz) * k;
+                s.y = t.fy + (t.ty - t.fy) * k + Math.sin(k * Math.PI) * t.lift;
+                if (t.kind === 'intercept') flash = t.flash * (0.4 + 0.6 * k);
+              } else if (t.t < t.dur + t.hold) {
+                const k = (t.t - t.dur) / Math.max(0.001, t.hold);
+                if (t.kind === 'intercept') {
+                  // standing in front of the bullet
+                  s.x = t.tx;
+                  s.y = t.ty;
+                  s.z = t.tz;
+                  flash = t.flash * (1 - k);
+                  scale *= 1 + 1.3 * (1 - k);
+                } else if (t.kind === 'build') {
+                  // assembling the piece: tight fast orbit around it
+                  const ba = botClock * 6 + i;
+                  s.x = t.tx + Math.sin(ba) * t.asmR;
+                  s.z = t.tz + Math.cos(ba) * t.asmR;
+                  s.y = t.ty + Math.sin(botClock * 3 + i * 1.7) * 0.25;
+                  flash = t.flash;
+                  scale *= 1 + 0.5 * Math.sin(botClock * 9 + i);
+                }
+              } else if (t.kind === 'intercept' && t.t < t.dur + t.hold + t.back) {
+                // glide back onto the live orbit
+                const k = botEase((t.t - t.dur - t.hold) / t.back);
+                s.x = t.tx + (botO.x - t.tx) * k;
+                s.y = t.ty + (botO.y - t.ty) * k;
+                s.z = t.tz + (botO.z - t.tz) * k;
+              } else {
+                if (t.kind === 'intercept') s.task = null;
+                else {
+                  s.die = 0.14; // burst / build bots merge out
+                  s.task = null;
+                }
+              }
+            }
+          }
+          if (!s.task || (s.task && s.task.t < 0)) {
+            s.x = botO.x;
+            s.y = botO.y;
+            s.z = botO.z;
+          }
+          botEU.set(botClock * 2.6 + i, botClock * 1.9 + i * 0.7, 0);
+          botQ.setFromEuler(botEU);
+          botS.setScalar(scale * (1 + flash * 1.1));
+          botP.set(s.x, s.y, s.z);
+          botM4.compose(botP, botQ, botS);
+          botCore.setMatrixAt(i, botM4);
+          botS.multiplyScalar(2.4);
+          botM4.compose(botP, botQ, botS);
+          botHalo.setMatrixAt(i, botM4);
+          botC.copy(BOT_CYAN).lerp(BOT_WHITE, Math.min(1, flash));
+          botCore.setColorAt(i, botC);
+        }
+      }
+      botCore.instanceMatrix.needsUpdate = true;
+      botHalo.instanceMatrix.needsUpdate = true;
+      if (botCore.instanceColor) botCore.instanceColor.needsUpdate = true;
+    }
+
     interface DummyObject {
       group: THREE.Group;
       parts: THREE.Mesh[];
@@ -2863,7 +3307,9 @@ export default function BattleRoyaleGame() {
       legs?: any[];
       arms?: any[];
       muzzle?: THREE.Object3D;
-      bubble?: THREE.Mesh;
+      bots?: BotField;
+      sunT?: number;
+      sunlit?: boolean;
       weaponKind?: string;
       gunGroup?: THREE.Group;
     }
@@ -2874,7 +3320,6 @@ export default function BattleRoyaleGame() {
     const DUMMY_SHIELD = 152;
     let dummyShield = DUMMY_SHIELD;
     let shootingOn = true;
-    const bubbleGeo = new THREE.SphereGeometry(1.05, 20, 14);
 
     // Shared weapon materials & 3D model builders (used for player, dummies, and ground drops)
     const metal = new THREE.MeshLambertMaterial({ color: 0x3a4250 });
@@ -3158,12 +3603,10 @@ export default function BattleRoyaleGame() {
         d.group.add(gun);
       }
 
-      d.bubble = new THREE.Mesh(
-        bubbleGeo,
-        new THREE.MeshBasicMaterial({ color: 0x67e8f9, transparent: true, opacity: 0.3, depthWrite: false })
-      );
-      d.bubble.position.y = 1.0;
-      d.group.add(d.bubble);
+      // The dummy's shield visual is a MICROBOT SWARM now — no
+      // holographic bubble: 1 bot per 10 shield orbits the figure
+      // (see the Microbot Shield Swarm block above).
+      d.bots = makeBotField(false, d);
 
       world.add(d.group);
       dummies.push(d);
@@ -5859,6 +6302,7 @@ export default function BattleRoyaleGame() {
       world.visible = false;
       clearPois(); // reclaim any previous map's POIs, pickups and pads
       dummies.length = 0;
+      releaseAllBotFields(); // every dummy's microbot swarm goes with it
       spots.length = 0;
       solids.length = 0;
       shootable.length = 0;
@@ -6335,6 +6779,57 @@ export default function BattleRoyaleGame() {
               woodRes = Math.max(0, woodRes + n);
               refreshWood();
               return Math.floor(woodRes);
+            },
+            // ---- Microbot shield swarm (?debug=1 e2e hooks) ----
+            bots: () => {
+              const used = botSlots.reduce((n, s) => n + (s.on ? 1 : 0), 0);
+              const fieldInfo = (f: BotField | null | undefined) => {
+                if (!f) return { orbit: -1, slots: 0, tasks: 0 };
+                let idle = 0;
+                let tasks = 0;
+                for (const i of f.slots) {
+                  if (botSlots[i].task) tasks++;
+                  else if (botSlots[i].die <= 0) idle++;
+                }
+                return { orbit: idle, slots: f.slots.length, tasks };
+              };
+              return {
+                player: fieldInfo(playerField),
+                dummies: dummies.map((d) => ({ shield: Math.ceil(d.shield), up: d.state === 'up', ...fieldInfo(d.bots) })),
+                used,
+                max: MAX_BOTS,
+              };
+            },
+            sunlit: () => ({ on: playerSunlitWhy === 'sun', why: playerSunlitWhy }),
+            shieldNow: () => Math.ceil(shield),
+            setShield: (n: number) => {
+              shield = Math.max(0, Math.min(shieldMax(), +n || 0));
+              return Math.ceil(shield);
+            },
+            // Simulate a builder-spend at a point straight ahead
+            spendShield: (n: number) => {
+              const dx = -Math.sin(yaw) * 2.6;
+              const dz = -Math.cos(yaw) * 2.6;
+              spendShield(Math.max(1, +n || 10), camera.position.x + dx, camera.position.y - 0.3, camera.position.z + dz, 1.3);
+              return Math.ceil(shield);
+            },
+            // Real hit path: absorb `dmg` from a shooter 3 m ahead
+            hitShield: (dmg = 25) => {
+              const dir = new THREE.Vector3();
+              camera.getWorldDirection(dir);
+              const from = camera.position.clone().addScaledVector(dir, 3);
+              hurtPlayer(+dmg || 25, 0, from);
+              return Math.ceil(shield);
+            },
+            dummySun: (i: number) => {
+              const d = dummies[+i || 0];
+              return d ? probeSunlit(d.group.position.x, d.group.position.z, d.group.position.y + 1.85) : null;
+            },
+            // Silence (or restore) every armed dummy — e2e needs a
+            // quiet range for deterministic shield measurements
+            setShooting: (v: boolean) => {
+              setShooting(!!v);
+              return !!v;
             },
             // Replay the patrol-placement predicates and report why each
             // candidate fails (e2e diagnostics for empty patrol spawns).
@@ -6868,8 +7363,10 @@ export default function BattleRoyaleGame() {
     // Antenna is a recon frame: 100 life instead of the usual 120
     const lifeMax = () => (character === 'antenna' ? 100 : LIFE_MAX);
     const SHIELD_LEVELS = [152, 304, 456];
-    const SHIELD_DELAY = 6;
-    const SHIELD_REGEN = 0.25;
+    const SHIELD_DELAY = 6; // quiet window before dummies' solar recharge
+    // (the player's legacy 0.25 x max/s out-of-combat regen retired with
+    // the microbot rework — the SUN is the only recharge now, see
+    // updateShield; SHIELD_DELAY still gates the dummy swarms)
     const RESPAWN_TIME = 3;
     let life = LIFE_MAX;
     let shieldLevel = 1;
@@ -7250,13 +7747,19 @@ export default function BattleRoyaleGame() {
       hitTimer = setTimeout(() => hitmark.classList.remove('show'), 120);
     }
 
-    function hitDummy(d: DummyObject, dmg: number, pen = 0) {
+    function hitDummy(d: DummyObject, dmg: number, pen = 0, from?: { x: number; y: number; z: number }) {
       if (d.state !== 'up') return;
       const through = Math.min(d.shield, dmg);
       d.shield -= through;
       d.hp -= (dmg - through) + pen;
       d.quiet = 0;
       d.flash = 0.12;
+      // The dummy's microbots answer the shot: the nearest bot dashes
+      // into the bullet's path; bots matching the lost shield burst off.
+      if (through > 0) {
+        const f = from ?? camera.position;
+        botFieldHit(d.bots ?? null, through, f.x, f.y - 0.5, f.z);
+      }
       showHit();
       if (d.hp <= 0.001) dummyDown(d);
     }
@@ -7270,13 +7773,14 @@ export default function BattleRoyaleGame() {
       if (creditsEl) creditsEl.textContent = String(credits);
     }
 
-    function burnDummy(d: DummyObject, dmg: number, pen = 0) {
+    function burnDummy(d: DummyObject, dmg: number, pen = 0, from?: { x: number; y: number; z: number }) {
       if (d.state !== 'up') return;
       const through = Math.min(d.shield, dmg);
       d.shield -= through;
       d.hp -= (dmg - through) + pen;
       d.quiet = 0;
       d.flash = Math.max(d.flash, 0.05);
+      if (through >= 1 && from) botFieldHit(d.bots ?? null, through, from.x, from.y, from.z);
       if (d.hp <= 0.001) dummyDown(d);
     }
 
@@ -7375,7 +7879,7 @@ export default function BattleRoyaleGame() {
       tracer(from, to);
       if (sd === Infinity && hit?.object.userData.dummy) {
         const s = shotDamage(w, hit.distance);
-        hitDummy(hit.object.userData.dummy, s.dmg, s.pen);
+        hitDummy(hit.object.userData.dummy, s.dmg, s.pen, from);
       } else if (sd === Infinity && hit?.object) {
         if (hit.object.userData.antenna) {
           // Own fire can smash the scanner — it is a soft 300 HP target
@@ -8334,7 +8838,7 @@ export default function BattleRoyaleGame() {
     }
 
     // Health, Shield & Respawn
-    function hurtPlayer(dmg: number, pen = 0) {
+    function hurtPlayer(dmg: number, pen = 0, from?: { x: number; y: number; z: number }) {
       if (playerDown || dmg <= 0) return;
       if (roll && roll.t < ROLL_IFRAMES) return;
       const had = shield;
@@ -8344,6 +8848,19 @@ export default function BattleRoyaleGame() {
       sinceHurt = 0;
       hurtFlash = 0.35;
       shieldFlash = 0.22;
+      // Your microbots answer the shot: the nearest bot dashes into
+      // the bullet's path and flashes; bots matching the absorbed
+      // shield burst away from the impact.
+      if (absorbed >= 1 && playerField) {
+        const f =
+          from ??
+          {
+            x: camera.position.x - Math.sin(yaw) * 2,
+            y: camera.position.y - 0.4,
+            z: camera.position.z - Math.cos(yaw) * 2,
+          };
+        botFieldHit(playerField, absorbed, f.x, f.y, f.z);
+      }
       if (had > 0 && shield <= 0) showMessage('Shield down', 1.5);
       if (life <= 0) goDown();
     }
@@ -8397,14 +8914,33 @@ export default function BattleRoyaleGame() {
       sinceHurt += dt;
       hurtFlash = Math.max(0, hurtFlash - dt);
       shieldFlash = Math.max(0, shieldFlash - dt);
-      shield = calculateShieldRegen(shield, shieldMax(), sinceHurt, SHIELD_DELAY, SHIELD_REGEN, dt, playerDown);
+      // The rework makes the SUN the shield's only recharge: 45/s in
+      // direct light (below). The legacy out-of-combat trickle
+      // (0.25 x max per second — 38/s at level 1!) is retired by
+      // passing rate 0 here; game-math's default stays for its tests.
+      shield = calculateShieldRegen(shield, shieldMax(), sinceHurt, SHIELD_DELAY, 0, dt, playerDown);
+      // Solar recharge: the microbot swarm drinks direct sunlight —
+      // 45 shield / s under the open sky, no delay. Roofs, tree crowns
+      // and diving underwater cut the feed; in the shade the shield
+      // simply holds until you find daylight again.
+      sunProbeT -= dt;
+      if (sunProbeT <= 0) {
+        sunProbeT = 0.25;
+        playerSunlitWhy = probeSunlit(camera.position.x, camera.position.z, camera.position.y);
+      }
+      if (!playerDown && playerSunlitWhy === 'sun' && shield < shieldMax()) {
+        shield = Math.min(shieldMax(), shield + SUN_REGEN * dt);
+      }
     }
 
     let vitalsShown = '';
     function updateVitals() {
       const cap = shieldMax();
       const sf = Math.max(0, Math.min(1, shield / cap));
-      const regenerating = !playerDown && sinceHurt >= SHIELD_DELAY && shield < cap;
+      // The ☀ marks the solar swarm charge: the ONLY regen path now
+      // (the legacy out-of-combat trickle retired with the rework)
+      const sunCharging = !playerDown && playerSunlitWhy === 'sun' && shield < cap;
+      const regenerating = sunCharging;
       const key = Math.ceil(shield) + '/' + cap + '|' + Math.ceil(life) + '|' + shieldLevel;
       if (key !== vitalsShown) {
         vitalsShown = key;
@@ -8415,6 +8951,7 @@ export default function BattleRoyaleGame() {
       if (shieldFill) shieldFill.style.transform = 'scaleX(' + sf.toFixed(4) + ')';
       if (lifeFill) lifeFill.style.transform = 'scaleX(' + Math.max(0, life / lifeMax()).toFixed(4) + ')';
       shieldRow?.classList.toggle('regen', regenerating);
+      shieldRow?.classList.toggle('sun', !playerDown && playerSunlitWhy === 'sun');
       if (shieldFx) {
         shieldFx.style.setProperty('--sh', sf.toFixed(3));
         shieldFx.classList.toggle('regen', regenerating);
@@ -8616,7 +9153,9 @@ export default function BattleRoyaleGame() {
       group.position.set(spot.x, groundAt(spot.x, spot.z), spot.z);
       scene.add(group);
       turret = { group, muzzle, ammo: TURRET.mag, carried: false, age: 0, fireT: TURRET.spinUp, shots: 0 };
-      showMessage('Turret deployed', 1.5);
+      // The swarm assembles the turret — deploying spends 25 shield
+      spendShield(ABILITY_SHIELD_COST, spot.x, groundAt(spot.x, spot.z) + 0.9, spot.z, 1.1);
+      showMessage('Turret deployed · ⚡ swarm −25', 1.5);
     }
 
     function turretAction() {
@@ -8705,7 +9244,7 @@ export default function BattleRoyaleGame() {
       turret.ammo -= 1;
       turret.shots += 1;
       tracer(turret.muzzle.getWorldPosition(new THREE.Vector3()), new THREE.Vector3(target.group.position.x, 1, target.group.position.z), 0x67e8f9);
-      hitDummy(target, turretDamage);
+      hitDummy(target, turretDamage, 0, turret.group.position);
     }
 
     let levelKey = '';
@@ -8828,8 +9367,11 @@ export default function BattleRoyaleGame() {
           shootable.push(o);
         }
       });
+      // The swarm raises the mast — deploying spends 25 shield
+      spendShield(ABILITY_SHIELD_COST, spot.x, gy + 1.5, spot.z, 1.6);
       showMessage(
-        redeploy ? 'Antenna redeployed — scanning' : 'Antenna online — every enemy revealed for ' + Math.round(ANT.duration * antDurMult) + ' s',
+        (redeploy ? 'Antenna redeployed — scanning' : 'Antenna online — every enemy revealed for ' + Math.round(ANT.duration * antDurMult) + ' s') +
+          ' · ⚡ swarm −25',
         1.8
       );
       updateAntennaHud();
@@ -9211,8 +9753,8 @@ export default function BattleRoyaleGame() {
           }, 220);
         }
       }
-      for (const [d, amount] of hits) hitDummy(d, amount);
-      if (selfHit) hurtPlayer(selfDmg * selfShare(pd));
+      for (const [d, amount] of hits) hitDummy(d, amount, 0, blastOrigin);
+      if (selfHit) hurtPlayer(selfDmg * selfShare(pd), 0, blastOrigin);
       const ring = new THREE.Mesh(
         shockGeo,
         new THREE.MeshBasicMaterial({ color: 0xffb020, transparent: true, opacity: 0.6, depthWrite: false })
@@ -9396,7 +9938,7 @@ export default function BattleRoyaleGame() {
                 d.group.position.z
               );
             if (burning) {
-              burnDummy(d, GREN.fire.dps * dt, GREN.fire.pen * dt);
+              burnDummy(d, GREN.fire.dps * dt, GREN.fire.pen * dt, { x: e.x, y: groundAt(e.x, e.z) + 0.5, z: e.z });
             }
           }
           const pdd = Math.hypot(camera.position.x - e.x, camera.position.z - e.z);
@@ -10230,12 +10772,15 @@ export default function BattleRoyaleGame() {
 
       d.quiet += dt;
       if (d.state === 'up' && d.quiet >= SHIELD_DELAY && d.shield < d.shieldMax) {
-        d.shield = Math.min(d.shieldMax, d.shield + SHIELD_REGEN * d.shieldMax * dt);
-      }
-      const share = d.shieldMax > 0 ? d.shield / d.shieldMax : 0;
-      if (d.bubble) {
-        d.bubble.visible = d.state === 'up' && share > 0.01;
-        (d.bubble.material as any).opacity = 0.3 * share + (d.flash > 0 ? 0.25 : 0);
+        // Microbot swarms are solar: dummy shields recharge fast in
+        // DIRECT SUN only — under a roof or a tree crown the bots stay
+        // spent (the sun probe is throttled to every 0.4 s).
+        d.sunT = (d.sunT ?? 0) - dt;
+        if (d.sunT <= 0) {
+          d.sunT = 0.4;
+          d.sunlit = probeSunlit(d.group.position.x, d.group.position.z, d.group.position.y + 1.85) === 'sun';
+        }
+        if (d.sunlit) d.shield = Math.min(d.shieldMax, d.shield + SUN_REGEN * dt);
       }
 
       if (d.state === 'falling') {
@@ -10333,14 +10878,14 @@ export default function BattleRoyaleGame() {
         tracer(shotFrom.clone(), aim, 0xfde68a);
         if (Math.hypot(ox, oy) < PLAYER_HIT * 1.2) {
           d.hits += 1;
-          hurtPlayer(16);
+          hurtPlayer(16, 0, d.group.position);
         }
       } else if (wKind === 'sniper') {
         d.fireT = (d.ai ? 2.6 : 2.2) + Math.random() * 0.4;
         tracer(shotFrom.clone(), aim, 0x60a5fa);
         if (Math.hypot(ox, oy) < PLAYER_HIT * 0.9) {
           d.hits += 1;
-          hurtPlayer(70);
+          hurtPlayer(70, 0, d.group.position);
         }
       } else if (wKind === 'betgun') {
         d.fireT = (d.ai ? 1.5 : 1.3) + Math.random() * 0.3;
@@ -10354,14 +10899,14 @@ export default function BattleRoyaleGame() {
         }
         if (hits > 0) {
           d.hits += 1;
-          hurtPlayer(14 * hits);
+          hurtPlayer(14 * hits, 0, d.group.position);
         }
       } else {
         d.fireT = (d.ai ? AI.delay : ENEMY_DELAY) + Math.random() * 0.3;
         tracer(shotFrom.clone(), aim, 0xff5c6b);
         if (Math.hypot(ox, oy) < PLAYER_HIT) {
           d.hits += 1;
-          hurtPlayer(ENEMY_DAMAGE);
+          hurtPlayer(ENEMY_DAMAGE, 0, d.group.position);
         }
       }
     }
@@ -10713,6 +11258,7 @@ export default function BattleRoyaleGame() {
       streamPois();
       updateGrenadePress(dt);
       updateShield(dt);
+      updateMicrobots(dt); // the swarm orbits player + dummies, runs tasks
       if (playerDown) {
         respawnT -= dt;
         if (respawnT <= 0) respawn();
@@ -11566,13 +12112,18 @@ export default function BattleRoyaleGame() {
               are voxel now — bullets chip chunks out of them and grenades carve holes straight through; Floors bridge water; Ramps run you onto roofs; Ladders climb any wall — walk into them and keep moving
             </li>
             <li>Bullets lose power with range: SMG past 20 m, SK past 60 m, sniper past 200 m</li>
-            <li>Shield takes hits first, then life. It recharges after 6 s without damage</li>
-            <li>Dummies have a shield too: it takes hits first, then life, and it recharges</li>
+            <li>
+              <b>Shield = a microbot swarm.</b> 1 bot hovers for every 10 shield — around you and around every dummy. A shot makes the nearest bot dash <b>into the bullet's path</b>; <b>direct sun recharges the swarm at 45/s</b> (roofs, tree crowns and being underwater block it — the ☀ on the Shield bar marks the charge)
+            </li>
+            <li>
+              <b>Building and abilities SPEND shield:</b> every wooden piece (wall 10, door 12, floor 10, ramp 10, ladder 15), the turret and the antenna deploy (25 each) — your bots fly over and <b>assemble the piece</b>, merging into it. Sunlight is fuel: hunt open ground to keep building
+            </li>
+            <li>Dummies have a shield swarm too — theirs also recharges in the sun, not under cover</li>
             <li>Cyan shield cores refill your shield and give 200 XP</li>
             <li>
               Levels 2 and 4 raise shield to 304 and 456. Levels 3 and 5 upgrade the turret / bombardment / antenna
             </li>
-            <li><kbd>E</kbd> summons a turret. Reload with light ammo or pick up and relocate</li>
+            <li><kbd>E</kbd> summons a turret (−25 shield: the swarm assembles it). Reload with light ammo or pick up and relocate</li>
             <li>The red dummy shoots back. Teal dummies patrol, spot you, and take cover</li>
             <li><kbd>R</kbd> reload, <kbd>1</kbd> <kbd>2</kbd> or <kbd>Q</kbd> switch weapon slot, <kbd>Esc</kbd> pause</li>
             <li>
@@ -11582,7 +12133,7 @@ export default function BattleRoyaleGame() {
             <li>Barrage: <kbd>E</kbd> arms bombardment, right click calls it. Grenade pack clusters on death</li>
             <li>
               <b>Antenna</b> runs on 100 life. Passive minimap (top right): tap it or press <kbd>M</kbd> for the
-              simplified tactical map. <kbd>E</kbd> plants a 300 HP scanner for 60 s — every enemy shows on map
+              simplified tactical map. <kbd>E</kbd> plants a 300 HP scanner for 60 s (−25 shield to raise it) — every enemy shows on map
               and minimap until it powers down or gets shot out. Enemy shooters prioritise it when it is closer
               than you
             </li>
@@ -11597,12 +12148,13 @@ export default function BattleRoyaleGame() {
               Tap WALL to arm build mode, then tap AIM to place. Auto reads your aim — look straight up on a staircase = another staircase on top, look up = ladder, look down on the ground = ramp, look forward = wall, look down from a ramp / roof = platform. Double-tap WALL to cycle pieces manually
             </li>
             <li>Trees are voxelized: shoot or blast them for WOOD — the fuel for every wooden build (the plate under the minimap shows your purse)</li>
+            <li>Your shield is a microbot swarm: it recharges fast in the sun (☀ on the shield bar) and every build / turret / antenna spends it</li>
             <li>War wrecks — tanks, trucks, helicopters, skeletons — dot the island away from the POIs. They are destructible cover</li>
             <li>Wade into the sea: you slow down, then swim. Hold crouch to dive, tap jump to stroke up</li>
             <li>The top compass shows the nearest landmarks with distances — edge-pinned chips show which way to turn. Follow the port chips (PIER, YARD, DOCK, LIGHT) for the best loot</li>
             <li>Dust, mud and gravel routes run between the port gate and every POI — follow the tan / brown corridors instead of bushwhacking</li>
             <li>Tap INVENTORY to purchase weapons, ammo and customize dummies</li>
-            <li>Antenna recon: tap the round minimap (top right) for the full map. Tap ANTENNA to start the 60 s enemy scan — it has 300 HP, so guard it</li>
+            <li>Antenna recon: tap the round minimap (top right) for the full map. Tap ANTENNA to start the 60 s enemy scan — it has 300 HP, so guard it (planting costs 25 shield)</li>
           </ul>
           <button className="btn" id="btn" type="button">
             Click to resume

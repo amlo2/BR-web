@@ -376,6 +376,20 @@ body.aiming .crosshair {
   animation: holo-scan 1s linear infinite;
 }
 
+/* Solar swarm charge: the ☀ appears on the Shield label while the
+   microbot swarm drinks direct sunlight (45/s recharge) */
+.vital.sun .vital-name::after {
+  content: "☀";
+  margin-left: 5px;
+  color: #fbbf24;
+  text-shadow: 0 0 8px rgba(251, 191, 36, 0.9);
+}
+
+.vital.sun .shield-fill {
+  background: linear-gradient(90deg, var(--shield-deep), #a5f3fc 72%, #fde68a);
+  box-shadow: 0 0 12px rgba(251, 191, 36, 0.45);
+}
+
 .life-fill { background: var(--life); }
 
 .shield-fx, .hurt-fx, .smoke-fx {
