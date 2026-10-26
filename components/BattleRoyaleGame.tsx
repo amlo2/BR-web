@@ -15,6 +15,16 @@ import {
   LEVEL_COST,
   MAX_LEVEL,
 } from '@/lib/game-math';
+import {
+  pbrMaterial,
+  makeGerstnerWater,
+  makeSkyDome,
+  buildEnvironment,
+  makeLeafMaterial,
+  makeContactShadowMaterial,
+  setLitePBR,
+  type PBRKind,
+} from '@/lib/pbr-graphics';
 
 export default function BattleRoyaleGame() {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -102,34 +112,102 @@ export default function BattleRoyaleGame() {
     });
     renderer.setPixelRatio(isHeadless ? 1 : Math.min(window.devicePixelRatio || 1, 2));
     renderer.setSize(window.innerWidth, window.innerHeight);
+    // Cinematic pipeline: ACES filmic tone mapping keeps bright sky and
+    // sun-lit surfaces from clipping to white and gives the palette a
+    // filmic rolloff instead of the old flat linear look.
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.12;
     renderer.shadowMap.enabled = !isHeadless;
+    // PCF soft shadow maps blur the shadow edge over several taps —
+    // chunky geometry stops projecting razor-hard stencil silhouettes.
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
     const scene = new THREE.Scene();
-    scene.background = new THREE.Color(0x9cc7e8);
-    scene.fog = new THREE.Fog(0x9cc7e8, 60 * FIELD, 220 * FIELD);
+    // Exponential-squared atmospheric fog (replaced the old linear
+    // near/far fog): haze density grows smoothly with distance so the
+    // horizon melts into the sky instead of hitting a fog wall.
+    const FOG_COLOR = 0xaccfe8;
+    scene.background = new THREE.Color(FOG_COLOR);
+    scene.fog = new THREE.FogExp2(FOG_COLOR, 0.0022);
 
     const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 400 * FIELD);
     camera.rotation.order = 'YXZ';
     scene.add(camera);
 
-    scene.add(new THREE.HemisphereLight(0xffffff, 0x3f5a34, 2.0));
-    const sun = new THREE.DirectionalLight(0xffffff, 3.0);
+    scene.add(new THREE.HemisphereLight(0xc7ddf5, 0x6f6a54, 2.1));
+    const sun = new THREE.DirectionalLight(0xfff2df, 3.1);
     const SUN_OFFSET = new THREE.Vector3(40, 60, 25);
     sun.position.copy(SUN_OFFSET);
     if (!isHeadless) {
       sun.castShadow = true;
-      sun.shadow.mapSize.set(1024, 1024);
-      sun.shadow.bias = -0.0004;
-      Object.assign(sun.shadow.camera, { left: -70, right: 70, top: 70, bottom: -70, far: 200 });
+      sun.shadow.mapSize.set(touchDevice ? 1024 : 2048, touchDevice ? 1024 : 2048);
+      sun.shadow.bias = -0.0002;
+      sun.shadow.normalBias = 0.05; // chunky boxes + soft filtering need this
+      Object.assign(sun.shadow.camera, { left: -85, right: 85, top: 85, bottom: -85, far: 260 });
       sun.shadow.camera.updateProjectionMatrix();
     }
     scene.add(sun);
 
+    // Sun + sky ride with the camera so shadows and the atmosphere
+    // stay centered on the player wherever they roam on the island.
     function followSun() {
       sun.target.position.set(camera.position.x, groundAt(camera.position.x, camera.position.z), camera.position.z);
       sun.target.updateMatrixWorld();
       sun.position.set(camera.position.x + SUN_OFFSET.x, SUN_OFFSET.y, camera.position.z + SUN_OFFSET.z);
+      skyDome.position.copy(camera.position);
     }
+
+    // ----------------------------------------------------
+    // Atmospheric sky dome + image-based lighting. The dome rides
+    // with the camera (see followSun) painting a gradient from warm
+    // horizon to deep zenith with a sun disc + glow, and a PMREM
+    // bake of that sky feeds every PBR material ambient + metal
+    // reflections.
+    // ----------------------------------------------------
+    const skyMat = makeSkyDome({
+      zenith: 0x3f78c0,
+      horizon: 0xd2e4f2,
+      ground: 0x8fa9ba,
+      sunColor: 0xfff1d0,
+      sunDir: SUN_OFFSET.clone().normalize(),
+    });
+    const skyDome = new THREE.Mesh(new THREE.SphereGeometry(1050, 48, 28), skyMat);
+    skyDome.frustumCulled = false;
+    skyDome.renderOrder = -1000;
+    scene.add(skyDome);
+    {
+      // Headless test tabs rasterize in software (SwiftShader): full PBR
+      // + image-based lighting there triples frame time and starves the
+      // e2e wall-clock budgets — those environments run in LITE mode.
+      setLitePBR(isHeadless);
+      const envMat = makeSkyDome({
+        zenith: 0x3f78c0,
+        horizon: 0xd2e4f2,
+        ground: 0x8fa9ba,
+        sunColor: 0xfff1d0,
+        sunDir: SUN_OFFSET.clone().normalize(),
+        toneMapped: false,
+      });
+      const envTex = isHeadless ? null : buildEnvironment(renderer, envMat);
+      envMat.dispose();
+      if (envTex) {
+        scene.environment = envTex;
+        scene.environmentIntensity = 0.55;
+      }
+    }
+
+    // ----------------------------------------------------
+    // PBR material factory: every surface in the world goes through
+    // MAT() — a drop-in MeshLambertMaterial replacement that returns a
+    // MeshStandardMaterial wired with procedural noise albedo,
+    // roughness and normal maps (cached per semantic kind).
+    // ----------------------------------------------------
+    const MAT = (p: THREE.MeshStandardMaterialParameters = {}, kind?: PBRKind) => pbrMaterial(p, kind);
+
+    // Gerstner/Fresnel water surfaces register here so the game loop
+    // can tick their wave time uniform.
+    const waters: THREE.ShaderMaterial[] = [];
+    let waterT = 0;
 
     // ----------------------------------------------------
     // Training Range Pool
@@ -195,25 +273,45 @@ export default function BattleRoyaleGame() {
       geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
       geo.setIndex(idx);
       geo.computeVertexNormals();
-      const basin = new THREE.Mesh(geo, new THREE.MeshLambertMaterial({ color: 0x9cc3cf, side: THREE.DoubleSide }));
+      // World-planar UVs so the basin's concrete PBR maps tile correctly.
+      const uvB = new Float32Array((pos.length / 3) * 2);
+      for (let i = 0, v = 0; i < pos.length; i += 3, v += 2) {
+        uvB[v] = pos[i] * 0.25;
+        uvB[v + 1] = pos[i + 2] * 0.25;
+      }
+      geo.setAttribute('uv', new THREE.Float32BufferAttribute(uvB, 2));
+      const basin = new THREE.Mesh(geo, MAT({ color: 0x9cc3cf, side: THREE.DoubleSide }, 'concrete'));
       basin.receiveShadow = true;
 
-      const water = new THREE.Mesh(
-        new THREE.PlaneGeometry(POOL_END - x0, z1 - z0),
-        new THREE.MeshLambertMaterial({ color: 0x1d6e9c, transparent: true, opacity: 0.55, depthWrite: false, side: THREE.DoubleSide })
-      );
-      water.rotation.x = -Math.PI / 2;
+      // Gerstner ripple pool: small-scale waves + Schlick-Fresnel sky
+      // reflection replace the old flat blue plane.
+      const poolWater = makeGerstnerWater(POOL_END - x0, z1 - z0, 24, {
+        deep: 0x14586e,
+        sky: 0xbdd7ea,
+        sunColor: 0xfff1d0,
+        opacity: 0.6,
+        crest: 4,
+        waves: [
+          { dirDeg: 15, steepness: 0.1, wavelength: 3.4 },
+          { dirDeg: 74, steepness: 0.08, wavelength: 2.2 },
+          { dirDeg: 142, steepness: 0.07, wavelength: 1.5 },
+          { dirDeg: 235, steepness: 0.05, wavelength: 1.0 },
+        ],
+      });
+      const water = poolWater.mesh;
       water.position.set((x0 + POOL_END) / 2, WATER_Y, (z0 + z1) / 2);
+      waters.push(poolWater.material);
 
       const group = new THREE.Group();
       group.add(basin, water);
       return group;
     }
 
-    const ground = new THREE.Mesh(groundWithPool(), new THREE.MeshLambertMaterial({ color: 0x6f9a57 }));
+    const ground = new THREE.Mesh(groundWithPool(), MAT({ color: 0x6f9a57 }, 'grass'));
     ground.rotation.x = -Math.PI / 2;
     ground.receiveShadow = true;
     scene.add(ground);
+    const groundMapRef = (ground.material as THREE.MeshStandardMaterial).map; // e2e A/B switch
 
     const grid = new THREE.GridHelper(400 * FIELD, 80 * FIELD, 0x3b5a2f, 0x3b5a2f);
     grid.position.y = 0.05;
@@ -531,7 +629,7 @@ export default function BattleRoyaleGame() {
       return Math.min(terrainOn ? groundCut(ray, maxDist) : Infinity, surfaceCut(ray, maxDist));
     }
 
-    const terrainMat = new THREE.MeshLambertMaterial({ vertexColors: true });
+    const terrainMat = MAT({ vertexColors: true }, 'terrain');
     // Biome palette for the terrain tiles — mixed per-vertex by the
     // biome weights, then overridden by rock/snow/sand rules.
     const TILE_GRASS = new THREE.Color(0x7fa050);
@@ -544,15 +642,31 @@ export default function BattleRoyaleGame() {
     const TILE_DEEP = new THREE.Color(0x2f5d70);
     const TILE_WASTE = new THREE.Color(0x99855c); // ashen wasteland dirt
     const TILE_CLIFF = new THREE.Color(0x4c4f55); // bare dark cliff rock
-    const tiles = new Map<string, { mesh: THREE.Mesh; cx: number; cz: number; veg?: THREE.Mesh | null; vegSolids?: SolidBox[]; vegTreeVox?: VoxelBox[] }>();
+    const tiles = new Map<string, { mesh: THREE.Mesh; cx: number; cz: number; veg?: THREE.Mesh | null; leaf?: THREE.Mesh | null; blob?: THREE.Mesh | null; vegSolids?: SolidBox[]; vegTreeVox?: VoxelBox[] }>();
 
-    const seaMesh = new THREE.Mesh(
-      new THREE.PlaneGeometry(2 * (HARBOR_HALF + TERRAIN_MARGIN), 2 * (HARBOR_HALF + TERRAIN_MARGIN)),
-      new THREE.MeshLambertMaterial({ color: 0x2f79a8, transparent: true, opacity: 0.7, depthWrite: false, side: THREE.DoubleSide })
-    );
-    seaMesh.rotation.x = -Math.PI / 2;
+    // GERSTNER OCEAN: three summed Gerstner waves displace the surface
+    // vertically AND horizontally (pinched crests), the fragment stage
+    // layers scrolling noise ripples, fresnel sky-blend, sun glint and
+    // crest foam. Plane rotation is baked into the geometry so the
+    // shader works in world space directly.
+    const SEA_SIZE = 2 * (HARBOR_HALF + TERRAIN_MARGIN);
+    const seaWater = makeGerstnerWater(SEA_SIZE, SEA_SIZE, isHeadless ? 80 : 220, {
+      deep: 0x1d5580,
+      sky: 0xbdd7ea,
+      sunColor: 0xfff1d0,
+      opacity: 0.86,
+      crest: 0.45,
+      waves: [
+        { dirDeg: 24, steepness: 0.1, wavelength: 240 },
+        { dirDeg: 77, steepness: 0.12, wavelength: 150 },
+        { dirDeg: 151, steepness: 0.14, wavelength: 100 },
+        { dirDeg: 233, steepness: 0.16, wavelength: 60 },
+      ],
+    });
+    const seaMesh = seaWater.mesh;
     seaMesh.position.y = WATER_Y;
     seaMesh.visible = false;
+    waters.push(seaWater.material);
     scene.add(seaMesh);
 
     function buildTile(tx: number, tz: number) {
@@ -569,6 +683,7 @@ export default function BattleRoyaleGame() {
       const pos = new Float32Array(n * n * 3);
       const nor = new Float32Array(n * n * 3);
       const col = new Float32Array(n * n * 3);
+      const uvs = new Float32Array(n * n * 2);
       const c = new THREE.Color();
       for (let j = 0; j < n; j++) {
         for (let i = 0; i < n; i++) {
@@ -579,6 +694,7 @@ export default function BattleRoyaleGame() {
           const dz = (H[q + m] - H[q - m]) / (2 * TILE_STEP);
           const len = Math.hypot(dx, 1, dz);
           pos.set([x0 + i * TILE_STEP, h, z0 + j * TILE_STEP], k * 3);
+          uvs.set([x0 + i * TILE_STEP, z0 + j * TILE_STEP], k * 2);
           nor.set([-dx / len, 1 / len, -dz / len], k * 3);
           const vx = x0 + i * TILE_STEP;
           const vz = z0 + j * TILE_STEP;
@@ -668,6 +784,7 @@ export default function BattleRoyaleGame() {
       geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
       geo.setAttribute('normal', new THREE.BufferAttribute(nor, 3));
       geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
+      geo.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
       geo.setIndex(index);
       const mesh = new THREE.Mesh(geo, terrainMat);
       mesh.castShadow = true;
@@ -682,24 +799,38 @@ export default function BattleRoyaleGame() {
       // trunk/boulder collision boxes, seeded per tile so a revisited
       // tile regrows the exact same stand. Woody plants are voxelized
       // trees — destructible, and they drop wood when chewed apart.
+      // Bushes + tree crowns add a merged 2D leaf-card mesh and a
+      // contact-AO decal mesh per tile.
       const veg = terrainOn ? buildVegTile(tx, tz) : null;
       if (veg?.mesh) scene.add(veg.mesh);
+      if (veg?.leafMesh) scene.add(veg.leafMesh);
+      if (veg?.blobMesh) scene.add(veg.blobMesh);
       tiles.set(tx + ',' + tz, {
         mesh,
         cx: (tx + 0.5) * TILE,
         cz: (tz + 0.5) * TILE,
         veg: veg?.mesh ?? null,
+        leaf: veg?.leafMesh ?? null,
+        blob: veg?.blobMesh ?? null,
         vegSolids: veg?.solidRefs ?? [],
         vegTreeVox: veg?.treeVox ?? [],
       });
     }
 
-    function disposeTile(t: { mesh: THREE.Mesh; veg?: THREE.Mesh | null; vegSolids?: SolidBox[]; vegTreeVox?: VoxelBox[] }) {
+    function disposeTile(t: { mesh: THREE.Mesh; veg?: THREE.Mesh | null; leaf?: THREE.Mesh | null; blob?: THREE.Mesh | null; vegSolids?: SolidBox[]; vegTreeVox?: VoxelBox[] }) {
       scene.remove(t.mesh);
       t.mesh.geometry.dispose();
       if (t.veg) {
         scene.remove(t.veg);
         t.veg.geometry.dispose();
+      }
+      if (t.leaf) {
+        scene.remove(t.leaf);
+        t.leaf.geometry.dispose();
+      }
+      if (t.blob) {
+        scene.remove(t.blob);
+        t.blob.geometry.dispose();
       }
       for (const s of t.vegSolids ?? []) {
         let i = solids.indexOf(s);
@@ -792,7 +923,7 @@ export default function BattleRoyaleGame() {
     }
     let vegLib: Record<string, VegDef> | null = null;
     const vegSolids: SolidBox[] = [];
-    const vegMat = new THREE.MeshLambertMaterial({ vertexColors: true });
+    const vegMat = MAT({ vertexColors: true }, 'foliage');
 
     // ----------------------------------------------------
     // VOXELIZED TREES. Woody plants are chunky BOX-built shapes
@@ -824,7 +955,7 @@ export default function BattleRoyaleGame() {
       top: number; // crown top at s=1 (above the stamp base)
     }
     const TREE_WOOD = 2; // wood per destroyed tree voxel
-    let treeVoxMat: THREE.MeshLambertMaterial | null = null;
+    let treeVoxMat: THREE.MeshStandardMaterial | null = null;
     const TREE_SHAPES: Record<string, TreeShape> = {
       pine: {
         parts: [
@@ -906,14 +1037,213 @@ export default function BattleRoyaleGame() {
       tint: number;
       vox: VoxelBox | null; // set when this stamp is a destructible tree
       skip?: boolean; // tree voxelized — stamp leaves the merged mesh
+      leaf?: LeafCard[]; // crossed 2D leaf planes (bushes + tree crowns)
+      leafOnly?: boolean; // bush: renders ONLY as leaf planes, no merged stamp
     }
     interface VegTileRec {
       mesh: THREE.Mesh | null;
+      leafMesh: THREE.Mesh | null;
       stamps: StampRec[];
     }
 
+    // ----------------------------------------------------
+    // 2D-PLANE FOLIAGE. Leaves and bushes render as multiple
+    // alpha-tested crossed planes (a leaf-cluster sprite atlas) —
+    // the classic billboard-card technique: far cheaper than blob
+    // meshes and dramatically lusher on screen. Tree crowns keep
+    // their chunky box silhouettes (the voxel-destructible
+    // identity) and gain leaf cards wrapped around the crown.
+    // ----------------------------------------------------
+    interface LeafCard {
+      x: number;
+      y: number;
+      z: number;
+      w: number;
+      h: number;
+      yaw: number;
+      tilt: number;
+      quad: number; // leaf atlas quadrant (0 lush / 1 dry / 2 jungle / 3 sparse)
+      tint: number;
+    }
+    const leafMat = makeLeafMaterial();
+    const blobMat = makeContactShadowMaterial();
+    const UP_V = new THREE.Vector3(0, 1, 0);
+    const leafEuler = new THREE.Euler(0, 0, 0, 'YXZ');
+    const leafQuat = new THREE.Quaternion();
+    const leafTmp = new THREE.Vector3();
+
+    const TREE_LEAF_QUAD: Record<string, number> = {
+      pine: 2,
+      spruce: 2,
+      broadleaf: 0,
+      kapok: 2,
+      palm: 2,
+      acacia: 1,
+    };
+
+    function bushLeafCards(
+      x: number,
+      baseY: number,
+      z: number,
+      s: number,
+      tint: number,
+      quad: number,
+      rnd: () => number
+    ): LeafCard[] {
+      const cards: LeafCard[] = [];
+      const n = 2 + (rnd() < 0.7 ? 1 : 0);
+      for (let i = 0; i < n; i++) {
+        cards.push({
+          x,
+          y: baseY,
+          z,
+          w: (1.6 + rnd() * 0.6) * s,
+          h: (1.5 + rnd() * 0.5) * s,
+          yaw: rnd() * Math.PI * 2,
+          tilt: (rnd() - 0.5) * 0.3,
+          quad,
+          tint,
+        });
+      }
+      return cards;
+    }
+
+    function treeLeafCards(
+      name: string,
+      shape: TreeShape,
+      x: number,
+      baseY: number,
+      z: number,
+      s: number,
+      tint: number,
+      rnd: () => number
+    ): LeafCard[] {
+      const quad = TREE_LEAF_QUAD[name] ?? 0;
+      const cy = baseY + shape.top * 0.55 * s;
+      // cards are ~65% WIDER than the boxy crown so the foliage plane
+      // silhouette breaks out of the chunky box instead of hiding inside it
+      const cw = shape.ex * 3.3 * s;
+      const ch = Math.max(1.1, shape.top * 0.7 * s);
+      const cards: LeafCard[] = [];
+      if (name === 'palm') {
+        for (let i = 0; i < 3; i++) {
+          cards.push({
+            x,
+            y: cy - ch * 0.1,
+            z,
+            w: cw * 0.85,
+            h: ch * 0.55,
+            yaw: (i / 3) * Math.PI + rnd() * 0.7,
+            tilt: (rnd() - 0.5) * 0.55,
+            quad,
+            tint,
+          });
+        }
+        return cards;
+      }
+      // two crossed bands: lower pair wraps the crown mid, upper pair
+      // caps the crown — read as layered foliage from any angle
+      for (let i = 0; i < 2; i++) {
+        cards.push({
+          x,
+          y: cy - ch * 0.42,
+          z,
+          w: cw * (0.85 + rnd() * 0.25),
+          h: ch * 0.95,
+          yaw: i * Math.PI + rnd() * 0.8,
+          tilt: (rnd() - 0.5) * 0.3,
+          quad,
+          tint,
+        });
+      }
+      for (let i = 0; i < 2; i++) {
+        cards.push({
+          x,
+          y: cy + ch * 0.1,
+          z,
+          w: cw * (0.7 + rnd() * 0.25),
+          h: ch * 0.85,
+          yaw: i * Math.PI + Math.PI / 2 + rnd() * 0.8,
+          tilt: (rnd() - 0.5) * 0.35,
+          quad,
+          tint,
+        });
+      }
+      return cards;
+    }
+
+    /** One crossed plane = 2 triangles (6 verts), non-indexed, UVs
+     *  mapped to the card's atlas quadrant with a small inset. */
+    function pushLeafCard(c: LeafCard, P: number[], N: number[], C: number[], U: number[]) {
+      leafEuler.set(c.tilt, c.yaw, 0);
+      leafQuat.setFromEuler(leafEuler);
+      const qw = c.w / 2;
+      const h = c.h;
+      const u0 = (c.quad & 1) * 0.5 + 0.03;
+      const v0 = 0.53 - (c.quad >> 1) * 0.5;
+      const cs: Array<[number, number, number, number, number]> = [
+        [-qw, 0, 0, 0, 1],
+        [qw, 0, 0, 1, 1],
+        [qw, h, 0, 1, 0],
+        [-qw, 0, 0, 0, 1],
+        [qw, h, 0, 1, 0],
+        [-qw, h, 0, 0, 0],
+      ];
+      for (const [lx, ly, lz, fu, fv] of cs) {
+        leafTmp.set(lx, ly, lz).applyQuaternion(leafQuat);
+        P.push(leafTmp.x + c.x, leafTmp.y + c.y, leafTmp.z + c.z);
+        leafTmp.set(0, 0, 1).applyQuaternion(leafQuat);
+        N.push(leafTmp.x, leafTmp.y, leafTmp.z);
+        C.push(c.tint, c.tint, c.tint);
+        U.push(u0 + fu * 0.44, v0 + fv * 0.44);
+      }
+    }
+
+    /** Vertex-contact AO: soft radial shadow blob quad, oriented to
+     *  the terrain normal so it never clips through slopes. */
+    function pushContactBlob(x: number, y: number, z: number, r: number, P: number[], U: number[]) {
+      const nx = (terrainHeight(x - 2, z) - terrainHeight(x + 2, z)) / 4;
+      const nz = (terrainHeight(x, z - 2) - terrainHeight(x, z + 2)) / 4;
+      leafTmp.set(-nx, 1, -nz).normalize();
+      leafQuat.setFromUnitVectors(UP_V, leafTmp);
+      const cs: Array<[number, number, number, number, number]> = [
+        [-r, 0, -r, 0, 0],
+        [r, 0, -r, 1, 0],
+        [r, 0, r, 1, 1],
+        [-r, 0, -r, 0, 0],
+        [r, 0, r, 1, 1],
+        [-r, 0, r, 0, 1],
+      ];
+      for (const [lx, ly, lz, fu, fv] of cs) {
+        leafTmp.set(lx, ly, lz).applyQuaternion(leafQuat);
+        P.push(leafTmp.x + x, leafTmp.y + y + 0.06, leafTmp.z + z);
+        U.push(fu, fv);
+      }
+    }
+
+    /** World-planar UVs for merged vegetation meshes so the foliage
+     *  PBR noise maps tile across trunks, boulders and props. */
+    function vegUvFromPositions(P: number[]): Float32Array {
+      const uv = new Float32Array((P.length / 3) * 2);
+      for (let i = 0, v = 0; i < P.length; i += 3, v += 2) {
+        uv[v] = P[i] * 0.3;
+        uv[v + 1] = P[i + 2] * 0.3;
+      }
+      return uv;
+    }
+
+    function buildLeafGeometry(P: number[], N: number[], C: number[], U: number[]) {
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(P), 3));
+      geo.setAttribute('normal', new THREE.BufferAttribute(new Float32Array(N), 3));
+      geo.setAttribute('color', new THREE.BufferAttribute(new Float32Array(C), 3));
+      geo.setAttribute('uv', new THREE.BufferAttribute(new Float32Array(U), 2));
+      return geo;
+    }
+
     // A tree took its first hit: drop its stamp from the tile's merged
-    // mesh so the chunky voxel reveal is the only visual left.
+    // mesh AND its leaf cards so the chunky voxel reveal is the only
+    // visual left.
     function removeTreeStamp(v: VoxelBox) {
       const rec = v.vegTile;
       if (!rec || !rec.mesh) return;
@@ -928,16 +1258,26 @@ export default function BattleRoyaleGame() {
       const P: number[] = [];
       const N: number[] = [];
       const C: number[] = [];
+      const LP: number[] = [];
+      const LN: number[] = [];
+      const LC: number[] = [];
+      const LU: number[] = [];
       for (const st of rec.stamps) {
         if (st.skip) continue;
-        stampVeg(st.def, st.x, st.y, st.z, st.yaw, st.s, st.tint, P, N, C);
+        if (st.leaf) for (const lc of st.leaf) pushLeafCard(lc, LP, LN, LC, LU);
+        if (!st.leafOnly) stampVeg(st.def, st.x, st.y, st.z, st.yaw, st.s, st.tint, P, N, C);
       }
       rec.mesh.geometry.dispose();
       const geo = new THREE.BufferGeometry();
       geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(P), 3));
       geo.setAttribute('normal', new THREE.BufferAttribute(new Float32Array(N), 3));
       geo.setAttribute('color', new THREE.BufferAttribute(new Float32Array(C), 3));
+      geo.setAttribute('uv', new THREE.BufferAttribute(vegUvFromPositions(P), 2));
       rec.mesh.geometry = geo;
+      if (rec.leafMesh) {
+        rec.leafMesh.geometry.dispose();
+        rec.leafMesh.geometry = buildLeafGeometry(LP, LN, LC, LU);
+      }
     }
 
     function vegMat4(x: number, y: number, z: number, rx = 0, ry = 0, sx = 1, sy = 1, sz = 1) {
@@ -1017,7 +1357,7 @@ export default function BattleRoyaleGame() {
         );
       }
       if (!treeVoxMat) {
-        treeVoxMat = new THREE.MeshLambertMaterial({ color: 0x6b4a2f });
+        treeVoxMat = MAT({ color: 0x6b4a2f }, 'bark');
         voxHpMap.set(treeVoxMat, 26); // a couple of bullets per chunk
       }
       // Bushes: lush jungle/forest vs dry savanna
@@ -1104,11 +1444,21 @@ export default function BattleRoyaleGame() {
     const VEG_MAX_INST = 66; // instance cap per tile
     const VEG_MAX_VERTS = 22000; // vertex budget per tile
 
-    function buildVegTile(tx: number, tz: number): { mesh: THREE.Mesh | null; solidRefs: SolidBox[]; stamps: StampRec[]; treeVox: VoxelBox[] } {
+    function buildVegTile(
+      tx: number,
+      tz: number
+    ): {
+      mesh: THREE.Mesh | null;
+      leafMesh: THREE.Mesh | null;
+      blobMesh: THREE.Mesh | null;
+      solidRefs: SolidBox[];
+      stamps: StampRec[];
+      treeVox: VoxelBox[];
+    } {
       const solidRefs: SolidBox[] = [];
       const stamps: StampRec[] = [];
       const treeVox: VoxelBox[] = [];
-      const tileRec: VegTileRec = { mesh: null, stamps };
+      const tileRec: VegTileRec = { mesh: null, leafMesh: null, stamps };
       if (!vegLib) buildVegLib();
       const lib = vegLib!;
       const tvm = treeVoxMat!;
@@ -1118,6 +1468,13 @@ export default function BattleRoyaleGame() {
       const P: number[] = [];
       const N: number[] = [];
       const C: number[] = [];
+      // crossed leaf-plane buffers + contact-AO blob buffers
+      const LP: number[] = [];
+      const LN: number[] = [];
+      const LC: number[] = [];
+      const LU: number[] = [];
+      const BP: number[] = [];
+      const BU: number[] = [];
       let inst = 0;
       let verts = 0;
       for (let a = 0; a < 150 && inst < VEG_MAX_INST && verts < VEG_MAX_VERTS; a++) {
@@ -1286,8 +1643,17 @@ export default function BattleRoyaleGame() {
         const tint = 0.86 + rnd() * 0.26;
         const rec: StampRec = { def, x: vx, y: h - 0.06, z: vz, yaw, s, tint, vox: null };
         stamps.push(rec);
-        stampVeg(def, vx, h - 0.06, vz, yaw, s, tint, P, N, C);
-        verts += def.pos.length / 3;
+        // BUSHES render ONLY as crossed 2D leaf planes (multiple
+        // alpha-tested cards instead of the old sphere blobs).
+        const isBush = def === lib.bush || def === lib.bushDry;
+        if (isBush) {
+          rec.leafOnly = true;
+          rec.leaf = bushLeafCards(vx, h - 0.06, vz, s, tint, def === lib.bushDry ? 1 : 0, rnd);
+          verts += rec.leaf.length * 6;
+        } else {
+          stampVeg(def, vx, h - 0.06, vz, yaw, s, tint, P, N, C);
+          verts += def.pos.length / 3;
+        }
         inst++;
         if (trunkR && treeName) {
           // VOXELIZED TREE: trunk-only movement collision (forests
@@ -1298,6 +1664,12 @@ export default function BattleRoyaleGame() {
           // merged stamp above is swapped for the chunky voxels.
           const shape = TREE_SHAPES[treeName];
           const base = h - 0.06;
+          // Crown leaf cards: crossed 2D leaf planes wrapped around
+          // the crown soften the chunky silhouette (deadwood stays bare).
+          if (treeName !== 'deadtree') {
+            rec.leaf = treeLeafCards(treeName, shape, vx, base, vz, s, tint, rnd);
+            verts += rec.leaf.length * 6;
+          }
           const sb: SolidBox = {
             x: vx,
             z: vz,
@@ -1330,6 +1702,16 @@ export default function BattleRoyaleGame() {
           rec.vox = tv;
           treeVox.push(tv);
         }
+        // Leaf planes into the tile's card buffers.
+        if (rec.leaf) {
+          for (const lc of rec.leaf) pushLeafCard(lc, LP, LN, LC, LU);
+        }
+        // Vertex-contact AO blobs: soft contact shadows under every
+        // plant that visually touches the terrain.
+        if (isBush || trunkR || boulder || def === lib.rock || def === lib.rockBig) {
+          const br = (boulder ? 3.6 : def === lib.rockBig ? 3.4 : trunkR ? 3.0 : 1.9) * s;
+          pushContactBlob(vx, h, vz, br, BP, BU);
+        }
         if (boulder) {
           const sb: SolidBox = { x: vx, z: vz, hx: 1.75 * s, hz: 1.5 * s, bottom: h - 1.5, top: h + 1.15 * s };
           solids.push(sb);
@@ -1337,16 +1719,34 @@ export default function BattleRoyaleGame() {
           solidRefs.push(sb);
         }
       }
-      if (!inst) return { mesh: null, solidRefs, stamps, treeVox };
+      if (!inst) return { mesh: null, leafMesh: null, blobMesh: null, solidRefs, stamps, treeVox };
       const geo = new THREE.BufferGeometry();
       geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(P), 3));
       geo.setAttribute('normal', new THREE.BufferAttribute(new Float32Array(N), 3));
       geo.setAttribute('color', new THREE.BufferAttribute(new Float32Array(C), 3));
+      geo.setAttribute('uv', new THREE.BufferAttribute(vegUvFromPositions(P), 2));
       const mesh = new THREE.Mesh(geo, vegMat);
       mesh.castShadow = true;
       mesh.receiveShadow = false;
       tileRec.mesh = mesh;
-      return { mesh, solidRefs, stamps, treeVox };
+      // Leaf cards: one merged alpha-tested mesh per tile. Cards never
+      // cast shadows (their box crowns already do) — solid quad
+      // shadows would look wrong.
+      let leafMesh: THREE.Mesh | null = null;
+      if (LP.length) {
+        leafMesh = new THREE.Mesh(buildLeafGeometry(LP, LN, LC, LU), leafMat);
+        leafMesh.castShadow = false;
+        tileRec.leafMesh = leafMesh;
+      }
+      // Contact-AO decals: one merged transparent mesh per tile.
+      let blobMesh: THREE.Mesh | null = null;
+      if (BP.length) {
+        const bg = new THREE.BufferGeometry();
+        bg.setAttribute('position', new THREE.BufferAttribute(new Float32Array(BP), 3));
+        bg.setAttribute('uv', new THREE.BufferAttribute(new Float32Array(BU), 2));
+        blobMesh = new THREE.Mesh(bg, blobMat);
+      }
+      return { mesh, leafMesh, blobMesh, solidRefs, stamps, treeVox };
     }
 
     // Per-voxel colour palette + SILHOUETTE MASK for a voxelized tree.
@@ -1443,10 +1843,10 @@ export default function BattleRoyaleGame() {
     // voxel-destructible — one round cracks the shell and the whole
     // barrel detonates a full grenade blast (see killVoxel). They ride
     // the tile-stream lifecycle exactly like voxelized trees.
-    let barrelMat: THREE.MeshLambertMaterial | null = null;
+    let barrelMat: THREE.MeshStandardMaterial | null = null;
     function placeBarrel(bx: number, bz: number, bh: number, solidRefs: SolidBox[], treeVox: VoxelBox[]) {
       if (!barrelMat) {
-        barrelMat = new THREE.MeshLambertMaterial({ color: 0xb03b26 });
+        barrelMat = MAT({ color: 0xb03b26 }, 'metal');
         voxHpMap.set(barrelMat, 20); // a single pistol round lights it
       }
       const body = new THREE.Mesh(new THREE.CylinderGeometry(0.55, 0.55, 1.65, 10), barrelMat);
@@ -1627,7 +2027,7 @@ export default function BattleRoyaleGame() {
       const v: VoxelBox = {
         mesh,
         group: b.group ?? world,
-        color: (mat as THREE.MeshLambertMaterial).color.clone(),
+        color: (mat as THREE.MeshStandardMaterial).color.clone(),
         nx,
         ny,
         nz,
@@ -1700,7 +2100,7 @@ export default function BattleRoyaleGame() {
       if (v.inst || v.gone) return;
       const inst = new THREE.InstancedMesh(
         new THREE.BoxGeometry(1, 1, 1),
-        new THREE.MeshLambertMaterial({ color: 0xffffff }),
+        MAT({ color: 0xffffff }),
         v.total
       );
       inst.frustumCulled = false;
@@ -1722,6 +2122,13 @@ export default function BattleRoyaleGame() {
       }
       inst.count = v.aliveCount;
       inst.instanceMatrix.needsUpdate = true;
+      // Static voxel reveals are bounds-culled like every other mesh:
+      // compute the real instance bounds (killVoxel only shrinks the
+      // set, so the sphere stays a valid superset) and let the
+      // renderer skip whole structures outside the frustum instead of
+      // drawing every damaged building on the island forever.
+      inst.computeBoundingSphere();
+      inst.frustumCulled = true;
       v.group.add(inst);
       shootable.push(inst);
       v.mesh.visible = false;
@@ -1799,7 +2206,7 @@ export default function BattleRoyaleGame() {
           showDamagePopup('💥 DESTROYED', anchor, '#ef4444', true);
           const ring = new THREE.Mesh(
             shockGeo,
-            new THREE.MeshBasicMaterial({ color: 0x9ca3af, transparent: true, opacity: 0.5, depthWrite: false })
+            new THREE.MeshBasicMaterial({ toneMapped: false, color: 0x9ca3af, transparent: true, opacity: 0.5, depthWrite: false })
           );
           ring.position.set(anchor.x, groundAt(anchor.x, anchor.z) + 0.1, anchor.z);
           scene.add(ring);
@@ -2025,7 +2432,7 @@ export default function BattleRoyaleGame() {
         if (!p) {
           if (debrisPool.length >= DEBRIS_MAX) return;
           p = {
-            mesh: new THREE.Mesh(debrisGeo, new THREE.MeshLambertMaterial({ color: 0xffffff })),
+            mesh: new THREE.Mesh(debrisGeo, MAT({ color: 0xffffff })),
             vx: 0,
             vy: 0,
             vz: 0,
@@ -2047,7 +2454,7 @@ export default function BattleRoyaleGame() {
         p.mesh.position.set(x, y, z);
         p.mesh.rotation.set(Math.random() * 3, Math.random() * 3, Math.random() * 3);
         p.mesh.scale.setScalar(p.s);
-        (p.mesh.material as THREE.MeshLambertMaterial).color.copy(color).multiplyScalar(0.7 + Math.random() * 0.55);
+        (p.mesh.material as THREE.MeshStandardMaterial).color.copy(color).multiplyScalar(0.7 + Math.random() * 0.55);
         if (vel) {
           p.vx = vel.vx;
           p.vy = vel.vy;
@@ -2285,7 +2692,7 @@ export default function BattleRoyaleGame() {
       c.fillText(text, 128, 64);
       const texture = new THREE.CanvasTexture(cvs);
       texture.minFilter = THREE.LinearFilter;
-      const mat = new THREE.SpriteMaterial({ map: texture, transparent: true, depthWrite: false });
+      const mat = new THREE.SpriteMaterial({ map: texture, transparent: true, depthWrite: false, toneMapped: false });
       const sprite = new THREE.Sprite(mat);
       const scale = isBig ? 1.6 : 1.2;
       sprite.scale.set(scale * 2, scale, 1);
@@ -2307,11 +2714,11 @@ export default function BattleRoyaleGame() {
     function makeHealthBar(): { group: THREE.Group; fill: THREE.Mesh } {
       const g = new THREE.Group();
       const bgGeo = new THREE.PlaneGeometry(1.6, 0.16);
-      const bgMat = new THREE.MeshBasicMaterial({ color: 0x090d14, side: THREE.DoubleSide });
+      const bgMat = new THREE.MeshBasicMaterial({ toneMapped: false, color: 0x090d14, side: THREE.DoubleSide });
       const bg = new THREE.Mesh(bgGeo, bgMat);
       g.add(bg);
       const fillGeo = new THREE.PlaneGeometry(1.56, 0.12);
-      const fillMat = new THREE.MeshBasicMaterial({ color: 0x22c55e, side: THREE.DoubleSide });
+      const fillMat = new THREE.MeshBasicMaterial({ toneMapped: false, color: 0x22c55e, side: THREE.DoubleSide });
       const fill = new THREE.Mesh(fillGeo, fillMat);
       fill.position.z = 0.01;
       g.add(fill);
@@ -2385,7 +2792,7 @@ export default function BattleRoyaleGame() {
       showDamagePopup('💥 DESTROYED', anchor, '#ef4444', true);
       const ring = new THREE.Mesh(
         shockGeo,
-        new THREE.MeshBasicMaterial({ color: 0x9ca3af, transparent: true, opacity: 0.5, depthWrite: false })
+        new THREE.MeshBasicMaterial({ toneMapped: false, color: 0x9ca3af, transparent: true, opacity: 0.5, depthWrite: false })
       );
       ring.position.set(anchor.x, groundAt(anchor.x, anchor.z) + 0.1, anchor.z);
       scene.add(ring);
@@ -2532,7 +2939,7 @@ export default function BattleRoyaleGame() {
       // Debris shockwave ring on ground
       const ring = new THREE.Mesh(
         shockGeo,
-        new THREE.MeshBasicMaterial({ color: 0x9ca3af, transparent: true, opacity: 0.5, depthWrite: false })
+        new THREE.MeshBasicMaterial({ toneMapped: false, color: 0x9ca3af, transparent: true, opacity: 0.5, depthWrite: false })
       );
       ring.position.set(b.x, groundAt(b.x, b.z) + 0.1, b.z);
       scene.add(ring);
@@ -2573,6 +2980,7 @@ export default function BattleRoyaleGame() {
     // Build Mode State & Hologram Blueprint Preview
     let buildMode = false;
     const blueprintMat = new THREE.MeshBasicMaterial({
+      toneMapped: false,
       color: 0x38bdf8,
       transparent: true,
       opacity: 0.45,
@@ -2931,7 +3339,7 @@ export default function BattleRoyaleGame() {
         const sc = 0.12 + 0.88 * k;
         b.ghost.scale.y = sc;
         b.ghost.position.y = b.baseY + (b.ghostH * sc) / 2;
-        (b.ghost.material as THREE.MeshLambertMaterial).opacity = 0.24 + 0.12 * Math.sin(b.t * 9);
+        (b.ghost.material as THREE.MeshStandardMaterial).opacity = 0.24 + 0.12 * Math.sin(b.t * 9);
         if (k >= 1) {
           scene.remove(b.ghost);
           b.ghost.geometry.dispose();
@@ -2980,7 +3388,7 @@ export default function BattleRoyaleGame() {
       const [gw, gh, gd] = ghostDims(kind);
       const ghost = new THREE.Mesh(
         new THREE.BoxGeometry(gw, gh, gd),
-        new THREE.MeshLambertMaterial({ color: 0x67e8f9, transparent: true, opacity: 0.3, depthWrite: false })
+        MAT({ color: 0x67e8f9, transparent: true, opacity: 0.3, depthWrite: false, toneMapped: false })
       );
       let cx = px;
       let cz = pz;
@@ -3242,12 +3650,12 @@ export default function BattleRoyaleGame() {
     }
     const botCore = new THREE.InstancedMesh(
       new THREE.BoxGeometry(0.028, 0.028, 0.028),
-      new THREE.MeshBasicMaterial({ color: 0xbdf6ff }),
+      new THREE.MeshBasicMaterial({ toneMapped: false, color: 0xbdf6ff }),
       MAX_BOTS
     );
     const botHalo = new THREE.InstancedMesh(
       new THREE.BoxGeometry(0.072, 0.072, 0.072),
-      new THREE.MeshBasicMaterial({ color: 0x67e8f9, transparent: true, opacity: 0.3, blending: THREE.AdditiveBlending, depthWrite: false }),
+      new THREE.MeshBasicMaterial({ toneMapped: false, color: 0x67e8f9, transparent: true, opacity: 0.3, blending: THREE.AdditiveBlending, depthWrite: false }),
       MAX_BOTS
     );
     botCore.frustumCulled = false;
@@ -3625,7 +4033,7 @@ export default function BattleRoyaleGame() {
       shots: number;
       hits: number;
       ai: any;
-      bodyMat?: THREE.MeshLambertMaterial;
+      bodyMat?: THREE.MeshStandardMaterial;
       gait?: number;
       walkAmp?: number;
       lastX?: number;
@@ -3659,14 +4067,16 @@ export default function BattleRoyaleGame() {
     let shootingOn = true;
 
     // Shared weapon materials & 3D model builders (used for player, dummies, and ground drops)
-    const metal = new THREE.MeshLambertMaterial({ color: 0x3a4250 });
-    const dark = new THREE.MeshLambertMaterial({ color: 0x161b22 });
-    const wood = new THREE.MeshLambertMaterial({ color: 0x6b4a2e });
-    const amber = new THREE.MeshLambertMaterial({ color: 0xf2a516 });
-    const steel = new THREE.MeshLambertMaterial({ color: 0xb6bec9 });
-    const gunmetal = new THREE.MeshLambertMaterial({ color: 0x202836 });
-    const poly = new THREE.MeshLambertMaterial({ color: 0x3a4450 });
-    const warhead = new THREE.MeshLambertMaterial({ color: 0x93342f });
+    // Weapons are mostly-painted steel: brightened base colours + LOW metalness
+    // so the viewmodel keeps visible tonal detail instead of a black specular blob.
+    const metal = MAT({ color: 0x55617a, metalness: 0.22 }, 'metal');
+    const dark = MAT({ color: 0x2b3340, metalness: 0.2 }, 'metal');
+    const wood = MAT({ color: 0x7a5533 }, 'wood');
+    const amber = MAT({ color: 0xf2a516, metalness: 0.15 }, 'painted');
+    const steel = MAT({ color: 0x9aa5b5, metalness: 0.35 }, 'metal');
+    const gunmetal = MAT({ color: 0x39424f, metalness: 0.28 }, 'metal');
+    const poly = MAT({ color: 0x4a545f, metalness: 0.1 }, 'painted');
+    const warhead = MAT({ color: 0xa6493f, metalness: 0.1 }, 'painted');
 
     function part(g: THREE.Group, geo: THREE.BufferGeometry, mat: THREE.Material, x: number, y: number, z: number, rx = 0) {
       const m = new THREE.Mesh(geo, mat);
@@ -3895,9 +4305,9 @@ export default function BattleRoyaleGame() {
     }
 
     function buildFigure(d: DummyObject, bodyColor: number) {
-      const bodyMat = new THREE.MeshLambertMaterial({ color: bodyColor });
-      const jointMat = new THREE.MeshLambertMaterial({ color: 0x1f2937 });
-      const headMat = new THREE.MeshLambertMaterial({ color: 0xf3f4f6 });
+      const bodyMat = MAT({ color: bodyColor }, 'fabric');
+      const jointMat = MAT({ color: 0x1f2937 }, 'fabric');
+      const headMat = MAT({ color: 0xf3f4f6 }, 'skin');
       const add = (geo: THREE.BufferGeometry, mat: THREE.Material, x: number, y: number, z: number) => {
         const m = new THREE.Mesh(geo, mat);
         m.position.set(x, y, z);
@@ -4099,7 +4509,7 @@ export default function BattleRoyaleGame() {
     }
 
     function addCrate(x: number, z: number, w: number, h: number, depth: number, color: THREE.Color) {
-      const mat = new THREE.MeshLambertMaterial({ color });
+      const mat = MAT({ color });
       const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, h, depth), mat);
       mesh.position.set(x, h / 2, z);
       mesh.castShadow = true;
@@ -4380,24 +4790,22 @@ export default function BattleRoyaleGame() {
     // collider: wading applies progressive drag (movePlayer) and swimming
     // floats you at the surface — dive with C, stroke up with Space.
     const waterFxEl = $('waterFx');
-    const AIR_FOG = { color: 0x9cc7e8, near: 60 * FIELD, far: 220 * FIELD };
-    const SEA_FOG = { color: 0x0f364c, near: 1.5, far: 18 };
+    const AIR_FOG = { color: FOG_COLOR, density: 0.0022 };
+    const SEA_FOG = { color: 0x0f364c, density: 0.1 };
     let underFx = false;
     function updateWaterFx() {
       const under = camera.position.y < WATER_Y + 0.03 && groundAt(camera.position.x, camera.position.z) < WATER_Y;
       if (under === underFx) return;
       underFx = under;
       if (waterFxEl) waterFxEl.classList.toggle('on', under);
-      const f = scene.fog as THREE.Fog | null;
+      const f = scene.fog as THREE.FogExp2 | null;
       if (f) {
         if (under) {
           f.color.setHex(SEA_FOG.color);
-          f.near = SEA_FOG.near;
-          f.far = SEA_FOG.far;
+          f.density = SEA_FOG.density;
         } else {
           f.color.setHex(AIR_FOG.color);
-          f.near = AIR_FOG.near;
-          f.far = AIR_FOG.far;
+          f.density = AIR_FOG.density;
         }
       }
     }
@@ -5003,15 +5411,15 @@ export default function BattleRoyaleGame() {
     harborGroup.visible = false;
     scene.add(harborGroup);
 
-    const bmPlank = new THREE.MeshLambertMaterial({ color: 0x8a6a3f });
-    const bmPlankDark = new THREE.MeshLambertMaterial({ color: 0x6d5230 });
+    const bmPlank = MAT({ color: 0x8a6a3f }, 'plank');
+    const bmPlankDark = MAT({ color: 0x6d5230 }, 'plank');
     // Player-built wall / door wood (voxel walls, beams + planks)
-    const bmBuildWood = new THREE.MeshLambertMaterial({ color: 0x925f32 });
-    const bmBuildBeam = new THREE.MeshLambertMaterial({ color: 0x734823 });
-    const bmContainerRed = new THREE.MeshLambertMaterial({ color: 0x9c3b30 });
-    const bmContainerBlue = new THREE.MeshLambertMaterial({ color: 0x2d5f8a });
-    const bmContainerGreen = new THREE.MeshLambertMaterial({ color: 0x3e7a4a });
-    const bmContainerOrange = new THREE.MeshLambertMaterial({ color: 0xb06a28 });
+    const bmBuildWood = MAT({ color: 0x925f32 }, 'wood');
+    const bmBuildBeam = MAT({ color: 0x734823 }, 'wood');
+    const bmContainerRed = MAT({ color: 0x9c3b30 }, 'painted');
+    const bmContainerBlue = MAT({ color: 0x2d5f8a }, 'painted');
+    const bmContainerGreen = MAT({ color: 0x3e7a4a }, 'painted');
+    const bmContainerOrange = MAT({ color: 0xb06a28 }, 'painted');
     voxHpMap.set(bmPlank, 70);
     voxHpMap.set(bmPlankDark, 90);
     voxHpMap.set(bmBuildWood, 40);
@@ -6236,11 +6644,11 @@ export default function BattleRoyaleGame() {
     }
     const warProps: WarProp[] = [];
     const warZones: Array<{ x: number; z: number; r: number }> = [];
-    const bmArmyGreen = new THREE.MeshLambertMaterial({ color: 0x4a5240 });
-    const bmArmyDark = new THREE.MeshLambertMaterial({ color: 0x333a2e });
-    const bmArmyRust = new THREE.MeshLambertMaterial({ color: 0x6e5138 });
-    const bmSandbag = new THREE.MeshLambertMaterial({ color: 0x9c8a5e });
-    const bmBone = new THREE.MeshLambertMaterial({ color: 0xd8d3c4 });
+    const bmArmyGreen = MAT({ color: 0x4a5240 }, 'painted');
+    const bmArmyDark = MAT({ color: 0x333a2e }, 'painted');
+    const bmArmyRust = MAT({ color: 0x6e5138 }, 'metal');
+    const bmSandbag = MAT({ color: 0x9c8a5e }, 'fabric');
+    const bmBone = MAT({ color: 0xd8d3c4 }, 'generic');
     voxHpMap.set(bmArmyGreen, 60); // scenery-grade: a grenade visibly chunks a wreck
     voxHpMap.set(bmArmyDark, 70);
     voxHpMap.set(bmArmyRust, 50);
@@ -6404,6 +6812,7 @@ export default function BattleRoyaleGame() {
       geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(P2), 3));
       geo.setAttribute('normal', new THREE.BufferAttribute(new Float32Array(N2), 3));
       geo.setAttribute('color', new THREE.BufferAttribute(new Float32Array(C2), 3));
+      geo.setAttribute('uv', new THREE.BufferAttribute(vegUvFromPositions(P2), 2));
       const mesh = new THREE.Mesh(geo, vegMat);
       mesh.castShadow = true;
       g.add(mesh);
@@ -7110,11 +7519,11 @@ export default function BattleRoyaleGame() {
       lamp: new THREE.SphereGeometry(0.16, 8, 6),
     };
     const brDroneMat = {
-      hull: new THREE.MeshLambertMaterial({ color: 0x2b3442 }),
-      trim: new THREE.MeshLambertMaterial({ color: 0x38bdf8 }),
-      rotor: new THREE.MeshLambertMaterial({ color: 0x11161f }),
-      bay: new THREE.MeshLambertMaterial({ color: 0x1f2937 }),
-      lamp: new THREE.MeshBasicMaterial({ color: 0xf59e0b }),
+      hull: MAT({ color: 0x2b3442 }, 'metal'),
+      trim: MAT({ color: 0x38bdf8 }, 'painted'),
+      rotor: MAT({ color: 0x11161f }, 'metal'),
+      bay: MAT({ color: 0x1f2937 }, 'metal'),
+      lamp: new THREE.MeshBasicMaterial({ toneMapped: false, color: 0xf59e0b }),
     };
 
     function buildBrDrone(alt: number) {
@@ -7158,7 +7567,7 @@ export default function BattleRoyaleGame() {
 
     // -- passenger heads in the bays: ONE instanced sphere per seat --
     const brSeatGeo = new THREE.SphereGeometry(0.19, 8, 6);
-    const brSeatMat = new THREE.MeshLambertMaterial({ color: 0xd7dde6 });
+    const brSeatMat = MAT({ color: 0xd7dde6 }, 'painted');
     const brSeats = new THREE.InstancedMesh(brSeatGeo, brSeatMat, BR_DRONES * BR_PER_DRONE);
     brSeats.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
     brSeats.frustumCulled = false;
@@ -7169,12 +7578,12 @@ export default function BattleRoyaleGame() {
 
     // -- far LOD silhouettes + corpses + chute canopies (instanced) --
     const brFarGeo = new THREE.CapsuleGeometry(0.4, 1.12, 4, 10);
-    const brFarMat = new THREE.MeshLambertMaterial({ color: 0xffffff });
+    const brFarMat = MAT({ color: 0xffffff });
     const brFar = new THREE.InstancedMesh(brFarGeo, brFarMat, 224);
-    const brCorpseMat = new THREE.MeshLambertMaterial({ color: 0x565f6e });
+    const brCorpseMat = MAT({ color: 0x565f6e });
     const brCorpses = new THREE.InstancedMesh(brFarGeo, brCorpseMat, 224);
     const brChuteGeo = new THREE.SphereGeometry(1.55, 12, 7, 0, Math.PI * 2, 0, Math.PI * 0.52);
-    const brChuteMat = new THREE.MeshLambertMaterial({ color: 0xffffff });
+    const brChuteMat = MAT({ color: 0xffffff }, 'fabric');
     const brChutes = new THREE.InstancedMesh(brChuteGeo, brChuteMat, 224);
     for (const im of [brFar, brCorpses, brChutes]) {
       im.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
@@ -7337,7 +7746,7 @@ export default function BattleRoyaleGame() {
     // ----------------------------------------------------
     const brZoneWall = new THREE.Mesh(
       new THREE.CylinderGeometry(1, 1, 340, 64, 1, true),
-      new THREE.MeshBasicMaterial({ color: 0x8b5cf6, transparent: true, opacity: 0.14, side: THREE.DoubleSide, depthWrite: false })
+      new THREE.MeshBasicMaterial({ toneMapped: false, color: 0x8b5cf6, transparent: true, opacity: 0.14, side: THREE.DoubleSide, depthWrite: false })
     );
     brZoneWall.visible = false;
     scene.add(brZoneWall);
@@ -8647,6 +9056,88 @@ export default function BattleRoyaleGame() {
               }
               return { harbor: { hidden: hid, shown }, props: { hidden: ph, shown: ps }, loot: { hidden: lh, shown: ls } };
             },
+            // Task L: e2e A/B — toggle the ground's procedural map live
+            setGroundMap: (on: boolean) => {
+              const m = ground.material as THREE.MeshStandardMaterial;
+              m.map = on ? groundMapRef : null;
+              m.needsUpdate = true;
+              return !!m.map;
+            },
+            // Task L: cinematic graphics pipeline state (ACES / fog /
+            // gerstner water / leaf cards / AO blobs / instanced culling)
+            gfxInfo: () => {
+              let leafMeshes = 0;
+              let leafTris = 0;
+              let blobMeshes = 0;
+              for (const t of tiles.values()) {
+                if (t.leaf && t.leaf.visible) {
+                  leafMeshes++;
+                  leafTris += (t.leaf.geometry.getAttribute('position') as THREE.BufferAttribute).count / 3;
+                }
+                if (t.blob && t.blob.visible) blobMeshes++;
+              }
+              let voxInst = 0;
+              let voxCulled = 0;
+              for (const v of voxBoxes) {
+                if (v.inst) {
+                  voxInst++;
+                  if (v.inst.frustumCulled) voxCulled++;
+                }
+              }
+              const f = scene.fog as THREE.FogExp2 | null;
+              const seaMat = seaMesh.material as THREE.ShaderMaterial;
+              return {
+                toneMapping: renderer.toneMapping, // 4 = ACESFilmic
+                exposure: renderer.toneMappingExposure,
+                shadowType: renderer.shadowMap.type, // 2 = PCFSoft
+                shadowSize: renderer.shadowMap.enabled ? (isHeadless ? 0 : sun.shadow.mapSize.x) : 0,
+                fog: f ? { type: f.isFogExp2 ? 'FogExp2' : 'Fog', density: f.density, color: '#' + f.color.getHexString() } : null,
+                env: !!scene.environment,
+                envIntensity: scene.environmentIntensity,
+                headless: isHeadless,
+                skyDomePos: { x: +skyDome.position.x.toFixed(0), y: +skyDome.position.y.toFixed(0), z: +skyDome.position.z.toFixed(0) },
+                sea: seaMesh.visible
+                  ? { shader: seaMat.type, waves: [seaMat.uniforms.uWaveA.value.x !== undefined ? 1 : 0, seaMat.uniforms.uWaveB ? 1 : 0, seaMat.uniforms.uWaveC ? 1 : 0, seaMat.uniforms.uWaveD ? 1 : 0], uTime: seaMat.uniforms.uTime ? +seaMat.uniforms.uTime.value.toFixed(2) : -1, verts: (seaMesh.geometry.getAttribute('position') as THREE.BufferAttribute).count }
+                  : null,
+                waterSurfaces: waters.length,
+                // diagnostics: sample the ACTUAL pixels of the generated
+                // grass map canvas (is the noise field non-uniform?)
+                groundMapSamples: (() => {
+                  const img = (ground.material as THREE.MeshStandardMaterial).map?.image as HTMLCanvasElement | undefined;
+                  if (!img) return null;
+                  try {
+                    const c = document.createElement('canvas');
+                    c.width = 16;
+                    c.height = 16;
+                    const cx = c.getContext('2d')!;
+                    cx.drawImage(img, 0, 0, 16, 16);
+                    const d = cx.getImageData(0, 0, 16, 16).data;
+                    const lums: number[] = [];
+                    for (let i = 0; i < d.length; i += 4) lums.push(Math.round(0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2]));
+                    return lums;
+                  } catch {
+                    return null;
+                  }
+                })(),
+                texUploaded: renderer.info.memory.textures,
+                groundMap: (ground.material as THREE.MeshStandardMaterial).map
+                  ? {
+                      w: ((ground.material as THREE.MeshStandardMaterial).map!.image as HTMLCanvasElement)?.width ?? 0,
+                      repeat: (ground.material as THREE.MeshStandardMaterial).map!.repeat.x,
+                      colorSpace: (ground.material as THREE.MeshStandardMaterial).map!.colorSpace,
+                    }
+                  : null,
+                terrainMap: terrainMat.map
+                  ? { w: (terrainMat.map.image as HTMLCanvasElement)?.width ?? 0, repeat: terrainMat.map.repeat.x }
+                  : null,
+                leafMeshes,
+                leafTris: Math.round(leafTris),
+                blobMeshes,
+                voxInst,
+                voxCulled,
+                tiles: tiles.size,
+              };
+            },
             // Task K: tap-to-loot entry point (screen coords) for e2e
             tapPick: (x: number, y: number) => {
               tryTapPickup(x, y);
@@ -9104,7 +9595,7 @@ export default function BattleRoyaleGame() {
       build(g);
       const muzzle = new THREE.Object3D();
       muzzle.position.set(0, 0.02, cfg.muzzleZ);
-      const flare = new THREE.Mesh(new THREE.SphereGeometry(0.05, 8, 6), new THREE.MeshBasicMaterial({ color: 0xfde68a }));
+      const flare = new THREE.Mesh(new THREE.SphereGeometry(0.05, 8, 6), new THREE.MeshBasicMaterial({ toneMapped: false, color: 0xfde68a }));
       flare.position.copy(muzzle.position);
       flare.visible = false;
       g.add(muzzle, flare);
@@ -9238,10 +9729,10 @@ export default function BattleRoyaleGame() {
     current.gun.visible = true;
 
     // Player first-person body & arms
-    const skin = new THREE.MeshLambertMaterial({ color: 0xd8a47f });
-    const sleeve = new THREE.MeshLambertMaterial({ color: 0x2c333d });
-    const vest = new THREE.MeshLambertMaterial({ color: 0x3d4a3a });
-    const trousers = new THREE.MeshLambertMaterial({ color: 0x1f2630 });
+    const skin = MAT({ color: 0xd8a47f }, 'skin');
+    const sleeve = MAT({ color: 0x2c333d }, 'fabric');
+    const vest = MAT({ color: 0x3d4a3a }, 'fabric');
+    const trousers = MAT({ color: 0x1f2630 }, 'fabric');
     const bodyRig = new THREE.Group();
     camera.add(bodyRig);
     const armRig = new THREE.Group();
@@ -9257,7 +9748,7 @@ export default function BattleRoyaleGame() {
     const LEG_THIGH = 0.46;
     const LEG_SHIN = 0.46;
     const KNEE_FWD = new THREE.Vector3(0, 0, -1);
-    const bootMat = new THREE.MeshLambertMaterial({ color: 0x101418 });
+    const bootMat = MAT({ color: 0x101418 }, 'fabric');
     const pelvisMesh = bodyPart(new THREE.BoxGeometry(0.34, 1, 0.22), trousers, 0, 0, 0);
     const lowerMesh = bodyPart(new THREE.BoxGeometry(0.36, 1, 0.23), vest, 0, 0, 0);
     const chestMesh = bodyPart(new THREE.BoxGeometry(0.44, 1, 0.27), vest, 0, 0, 0);
@@ -9758,8 +10249,8 @@ export default function BattleRoyaleGame() {
     // ----------------------------------------------------
     const ROCKET_SPEED = 26;
     const rockets: Array<{ mesh: THREE.Group; from: THREE.Vector3; to: THREE.Vector3; t: number; dur: number; trailT: number }> = [];
-    const rocketBodyMat = new THREE.MeshLambertMaterial({ color: 0x3a4250 });
-    const rocketWarheadMat = new THREE.MeshLambertMaterial({ color: 0x93342f });
+    const rocketBodyMat = MAT({ color: 0x3a4250 }, 'metal');
+    const rocketWarheadMat = MAT({ color: 0x93342f }, 'painted');
 
     function launchRocket(from: THREE.Vector3, to: THREE.Vector3) {
       const g = new THREE.Group();
@@ -9929,7 +10420,7 @@ export default function BattleRoyaleGame() {
       return true;
     }
 
-    const cyanCore = new THREE.MeshLambertMaterial({ color: 0x67e8f9, emissive: 0x0e7490 });
+    const cyanCore = MAT({ color: 0x67e8f9, emissive: 0x0e7490 });
 
     function pickupMesh(kind: string) {
       const g = new THREE.Group();
@@ -9956,18 +10447,18 @@ export default function BattleRoyaleGame() {
             : kind === 'pistol'
             ? 0x9ca3af
             : 0xf59e0b;
-        const ringMat = new THREE.MeshBasicMaterial({ color: ringColor, transparent: true, opacity: 0.65 });
+        const ringMat = new THREE.MeshBasicMaterial({ toneMapped: false, color: ringColor, transparent: true, opacity: 0.65 });
         part(g, new THREE.TorusGeometry(0.38, 0.015, 6, 24), ringMat, 0, 0.04, 0, Math.PI / 2);
       } else if (kind === 'blast' || kind === 'fire' || kind === 'smoke') {
-        const body = new THREE.MeshLambertMaterial({
+        const body = MAT({
           color: kind === 'blast' ? 0x5b6b3a : kind === 'fire' ? 0xd9480f : 0x9ca3af,
-        });
+        }, 'metal');
         part(g, new THREE.SphereGeometry(0.2, 12, 10), body, 0, 0.22, 0);
         part(g, new THREE.TorusGeometry(0.2, 0.03, 6, 14), amber, 0, 0.22, 0, Math.PI / 2);
       } else if (kind === 'shield') {
         part(g, new THREE.OctahedronGeometry(0.34), cyanCore, 0, 0.7, 0);
       } else {
-        const body = new THREE.MeshLambertMaterial({ color: kind === 'heavy' ? 0x6b7a2a : 0x2a9fd6 });
+        const body = MAT({ color: kind === 'heavy' ? 0x6b7a2a : 0x2a9fd6 }, 'metal');
         part(g, new THREE.BoxGeometry(0.6, 0.35, 0.5), body, 0, 0.18, 0);
         part(g, new THREE.BoxGeometry(0.62, 0.06, 0.52), kind === 'heavy' ? amber : steel, 0, 0.38, 0);
       }
@@ -9992,25 +10483,25 @@ export default function BattleRoyaleGame() {
     // ----------------------------------------------------
     // Buildings
     // ----------------------------------------------------
-    const bmWall = new THREE.MeshLambertMaterial({ color: 0xd9c9ad });
-    const bmCream = new THREE.MeshLambertMaterial({ color: 0xe6d5b3 });
-    const bmTile = new THREE.MeshLambertMaterial({ color: 0x8b4a35, side: THREE.DoubleSide });
-    const bmSlab = new THREE.MeshLambertMaterial({ color: 0x8d7f70 });
-    const bmStair = new THREE.MeshLambertMaterial({ color: 0xa08f7c });
-    const bmRoof = new THREE.MeshLambertMaterial({ color: 0x5b4636 });
-    const bmGlass = new THREE.MeshLambertMaterial({
+    const bmWall = MAT({ color: 0xd9c9ad }, 'concrete');
+    const bmCream = MAT({ color: 0xe6d5b3 }, 'concrete');
+    const bmTile = MAT({ color: 0x8b4a35, side: THREE.DoubleSide }, 'concrete');
+    const bmSlab = MAT({ color: 0x8d7f70 }, 'concrete');
+    const bmStair = MAT({ color: 0xa08f7c }, 'concrete');
+    const bmRoof = MAT({ color: 0x5b4636 }, 'wood');
+    const bmGlass = MAT({
       color: 0xa5d8ff,
       transparent: true,
       opacity: 0.35,
       side: THREE.DoubleSide,
       depthWrite: false,
-    });
-    const bmConcrete = new THREE.MeshLambertMaterial({ color: 0x9a9d98 });
-    const bmConcreteDark = new THREE.MeshLambertMaterial({ color: 0x66696a });
-    const bmSteel = new THREE.MeshLambertMaterial({ color: 0x8a94a6 });
-    const bmSteelDark = new THREE.MeshLambertMaterial({ color: 0x4b5563 });
-    const bmCrate = new THREE.MeshLambertMaterial({ color: 0x8f6b3e });
-    const bmWood = new THREE.MeshLambertMaterial({ color: 0x7a5a3a });
+    }, 'glass');
+    const bmConcrete = MAT({ color: 0x9a9d98 }, 'concrete');
+    const bmConcreteDark = MAT({ color: 0x66696a }, 'concrete');
+    const bmSteel = MAT({ color: 0x8a94a6 }, 'metal');
+    const bmSteelDark = MAT({ color: 0x4b5563 }, 'metal');
+    const bmCrate = MAT({ color: 0x8f6b3e }, 'wood');
+    const bmWood = MAT({ color: 0x7a5a3a }, 'wood');
 
     // Structure toughness: hit points of one voxel chunk per material
     voxHpMap.set(bmWall, 110);
@@ -10297,19 +10788,19 @@ export default function BattleRoyaleGame() {
     // Builders take (B, gy, parent): local u/v around B, ground
     // level gy, and the POI group they live in.
     // ----------------------------------------------------
-    const bmBarn = new THREE.MeshLambertMaterial({ color: 0x9a4433 });
-    const bmHay = new THREE.MeshLambertMaterial({ color: 0xc9a84e });
-    const bmCanvasTan = new THREE.MeshLambertMaterial({ color: 0xb59a6a });
-    const bmCanvasGreen = new THREE.MeshLambertMaterial({ color: 0x5e7a4a });
-    const bmRock = new THREE.MeshLambertMaterial({ color: 0x767b7e });
-    const bmWhite = new THREE.MeshLambertMaterial({ color: 0xe4e4dc });
-    const bmBandRed = new THREE.MeshLambertMaterial({ color: 0xb03a30 });
-    const bmSilo = new THREE.MeshLambertMaterial({ color: 0xb8bcc2 });
-    const bmRust = new THREE.MeshLambertMaterial({ color: 0x9a6248 });
-    const bmWarnOrange = new THREE.MeshLambertMaterial({ color: 0xd99021 });
-    const bmGravel = new THREE.MeshLambertMaterial({ color: 0x8d8578 });
-    const bmLamp = new THREE.MeshLambertMaterial({ color: 0xffe9a0, emissive: 0xffc94d });
-    const bmBeaconRed = new THREE.MeshLambertMaterial({ color: 0xff6b5e, emissive: 0xb03a30 });
+    const bmBarn = MAT({ color: 0x9a4433 }, 'painted');
+    const bmHay = MAT({ color: 0xc9a84e }, 'fabric');
+    const bmCanvasTan = MAT({ color: 0xb59a6a }, 'fabric');
+    const bmCanvasGreen = MAT({ color: 0x5e7a4a }, 'fabric');
+    const bmRock = MAT({ color: 0x767b7e }, 'rock');
+    const bmWhite = MAT({ color: 0xe4e4dc }, 'painted');
+    const bmBandRed = MAT({ color: 0xb03a30 }, 'painted');
+    const bmSilo = MAT({ color: 0xb8bcc2 }, 'metal');
+    const bmRust = MAT({ color: 0x9a6248 }, 'metal');
+    const bmWarnOrange = MAT({ color: 0xd99021 }, 'painted');
+    const bmGravel = MAT({ color: 0x8d8578 }, 'concrete');
+    const bmLamp = MAT({ color: 0xffe9a0, emissive: 0xffc94d });
+    const bmBeaconRed = MAT({ color: 0xff6b5e, emissive: 0xb03a30 });
     voxHpMap.set(bmBarn, 110);
     voxHpMap.set(bmHay, 60);
     voxHpMap.set(bmCanvasTan, 55);
@@ -11433,13 +11924,14 @@ export default function BattleRoyaleGame() {
       part(g, new THREE.SphereGeometry(0.07, 12, 10), cyanCore, 0, 2.52, 0);
       const beacon = new THREE.Mesh(
         new THREE.SphereGeometry(0.085, 12, 10),
-        new THREE.MeshBasicMaterial({ color: 0x67e8f9, transparent: true, opacity: 0.95, depthWrite: false })
+        new THREE.MeshBasicMaterial({ toneMapped: false, color: 0x67e8f9, transparent: true, opacity: 0.95, depthWrite: false })
       );
       beacon.position.set(0, 2.52, 0);
       g.add(beacon);
       const halo = new THREE.Mesh(
         new THREE.SphereGeometry(0.24, 14, 10),
         new THREE.MeshBasicMaterial({
+          toneMapped: false,
           color: 0x67e8f9,
           transparent: true,
           opacity: 0.35,
@@ -11587,9 +12079,9 @@ export default function BattleRoyaleGame() {
 
     function grenadeMesh(kind: string) {
       const g = new THREE.Group();
-      const body = new THREE.MeshLambertMaterial({
+      const body = MAT({
         color: kind === 'blast' ? 0x5b6b3a : kind === 'fire' ? 0xd9480f : 0x9ca3af,
-      });
+      }, 'metal');
       g.add(new THREE.Mesh(new THREE.SphereGeometry(0.16, 12, 10), body));
       g.add(new THREE.Mesh(new THREE.TorusGeometry(0.16, 0.025, 6, 12), amber));
       return g;
@@ -11896,7 +12388,7 @@ export default function BattleRoyaleGame() {
       if (selfHit) hurtPlayer(selfDmg * selfShare(pd), 0, blastOrigin);
       const ring = new THREE.Mesh(
         shockGeo,
-        new THREE.MeshBasicMaterial({ color: 0xffb020, transparent: true, opacity: 0.6, depthWrite: false })
+        new THREE.MeshBasicMaterial({ toneMapped: false, color: 0xffb020, transparent: true, opacity: 0.6, depthWrite: false })
       );
       ring.position.set(x, groundAt(x, z) + 0.6, z);
       scene.add(ring);
@@ -11904,6 +12396,7 @@ export default function BattleRoyaleGame() {
       const flash = new THREE.Mesh(
         voxFlashGeo,
         new THREE.MeshBasicMaterial({
+          toneMapped: false,
           color: 0xffb050,
           transparent: true,
           opacity: 0.9,
@@ -11925,14 +12418,14 @@ export default function BattleRoyaleGame() {
       const G = GREN.fire;
       const g = new THREE.Group();
       const geo = new THREE.CircleGeometry(G.radius, 24);
-      const disc = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ color: 0xff7a18, transparent: true, opacity: 0.5, depthWrite: false }));
+      const disc = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ toneMapped: false, color: 0xff7a18, transparent: true, opacity: 0.5, depthWrite: false }));
       disc.rotation.x = -Math.PI / 2;
       disc.position.y = 0.05;
       g.add(disc);
       const flames: THREE.Mesh[] = [];
       for (let i = 0; i < 7; i++) {
         const a = (i / 7) * Math.PI * 2;
-        const f = new THREE.Mesh(flameGeo, new THREE.MeshBasicMaterial({ color: i % 2 ? 0xffb020 : 0xff4d00 }));
+        const f = new THREE.Mesh(flameGeo, new THREE.MeshBasicMaterial({ toneMapped: false, color: i % 2 ? 0xffb020 : 0xff4d00 }));
         f.position.set(Math.cos(a) * G.radius * 0.5, 0.55, Math.sin(a) * G.radius * 0.5);
         g.add(f);
         flames.push(f);
@@ -11949,7 +12442,7 @@ export default function BattleRoyaleGame() {
       for (let i = 0; i < 8; i++) {
         const a = (i / 8) * Math.PI * 2;
         const reach = i === 0 ? 0 : G.radius * 0.55;
-        const m = new THREE.Mesh(puffGeo, new THREE.MeshBasicMaterial({ color: 0xd4d8de, transparent: true, opacity: 0.85, depthWrite: false }));
+        const m = new THREE.Mesh(puffGeo, new THREE.MeshBasicMaterial({ toneMapped: false, color: 0xd4d8de, transparent: true, opacity: 0.85, depthWrite: false }));
         m.position.set(Math.cos(a) * reach, 1.4 + (i % 3) * 0.5, Math.sin(a) * reach);
         m.scale.setScalar(G.radius * 0.5 + (i % 2) * 0.6);
         g.add(m);
@@ -12553,7 +13046,7 @@ export default function BattleRoyaleGame() {
       bombardment = { x, z, t: 0, fired: 0 };
       bombCool = BOMB.cool;
       const geo = new THREE.RingGeometry(BOMB.spread * 0.9, BOMB.spread, 48);
-      const mark = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ color: 0xff1f1f, transparent: true, opacity: 1, depthWrite: false }));
+      const mark = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ toneMapped: false, color: 0xff1f1f, transparent: true, opacity: 1, depthWrite: false }));
       mark.rotation.x = -Math.PI / 2;
       mark.position.set(x, groundAt(x, z) + 0.07, z);
       scene.add(mark);
@@ -12567,8 +13060,8 @@ export default function BattleRoyaleGame() {
 
     function shellMesh() {
       const g = new THREE.Group();
-      g.add(new THREE.Mesh(shellBodyGeo, new THREE.MeshLambertMaterial({ color: 0x6b7280 })));
-      const nose = new THREE.Mesh(shellNoseGeo, new THREE.MeshLambertMaterial({ color: 0x1f2937 }));
+      g.add(new THREE.Mesh(shellBodyGeo, MAT({ color: 0x6b7280 }, 'metal')));
+      const nose = new THREE.Mesh(shellNoseGeo, MAT({ color: 0x1f2937 }, 'metal'));
       nose.position.y = -0.6;
       nose.rotation.x = Math.PI;
       g.add(nose);
@@ -13208,7 +13701,7 @@ export default function BattleRoyaleGame() {
     // 200-combatant match cannot afford permanent corpses.
     // ----------------------------------------------------
     const DEVOUR_T = 3.5;
-    const wormMat = new THREE.MeshLambertMaterial({ color: 0xd98c8c });
+    const wormMat = MAT({ color: 0xd98c8c });
     const wormGeoA = new THREE.BoxGeometry(0.1, 0.05, 0.17);
     const wormGeoB = new THREE.BoxGeometry(0.085, 0.045, 0.12);
     const WORM_N = 7;
@@ -13910,37 +14403,61 @@ export default function BattleRoyaleGame() {
     // ----------------------------------------------------
     // Main Game Loop
     // ----------------------------------------------------
-    // Distance culling — the harbor is 4 km wide but the fog wall
-    // ends at 660 m, so every structure drawn past ~700 m is
-    // invisible AND still costs draw-call submission + shadow
-    // frustum tests. This pass (every ~0.35 s, no per-frame work)
-    // flips .visible on the port's structure groups, the scattered
-    // war props and ground loot by camera distance. POIs already
-    // stream in/out (700 m build / 980 m reclaim), terrain tiles
-    // stream, far bots are instanced silhouettes, and three.js
-    // frustum-culls whatever remains — this closes the last gap.
+    // FRUSTUM + distance culling. The harbor is 4 km wide but the
+    // exponential haze swallows everything past ~700 m, so anything
+    // beyond that is invisible AND still costs draw-call submission
+    // + shadow frustum tests. This pass (every ~0.35 s, no per-frame
+    // work) flips .visible on the port's structure groups, war props,
+    // ground loot AND terrain tiles using BOTH tests:
+    //   1. distance  — farther than CULL_R → skip (the fog hides it)
+    //   2. frustum   — behind the camera or outside the FOV cone →
+    //                  skip even when nearby (three.js still frustum-
+    //                  culls individual meshes, but whole-group skips
+    //                  cut scene-graph traversal + shadow passes too).
+    // Sphere radii are generous so nothing ever pops at screen edges.
     const CULL_R = 700; // just past the fog: nothing pops in view
+    const cullFrustum = new THREE.Frustum();
+    const cullProjMatrix = new THREE.Matrix4();
+    const cullSphere = new THREE.Sphere();
     let cullT = 0;
     function cullingPass(dt: number) {
       cullT -= dt;
       if (cullT > 0) return;
       cullT = 0.35;
+      camera.updateMatrixWorld();
+      cullProjMatrix.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+      cullFrustum.setFromProjectionMatrix(cullProjMatrix);
       const px = camera.position.x;
       const pz = camera.position.z;
       const r2 = CULL_R * CULL_R;
       const isFar = (x: number, z: number) => (x - px) ** 2 + (z - pz) ** 2 > r2;
+      const inView = (x: number, z: number, r: number) => {
+        cullSphere.center.set(x, 0, z);
+        cullSphere.radius = r;
+        return cullFrustum.intersectsSphere(cullSphere);
+      };
       for (const child of harborGroup.children) {
-        const vis = !isFar(child.position.x, child.position.z);
+        const vis = !isFar(child.position.x, child.position.z) && inView(child.position.x, child.position.z, 46);
         if (child.visible !== vis) child.visible = vis;
       }
       for (const wp of warProps) {
-        const vis = !isFar(wp.x, wp.z);
+        const vis = !isFar(wp.x, wp.z) && inView(wp.x, wp.z, 16);
         if (wp.group.visible !== vis) wp.group.visible = vis;
       }
       for (const p of pickups) {
         if (p.taken || p.gone) continue;
-        const vis = !isFar(p.x, p.z);
+        const vis = !isFar(p.x, p.z) && inView(p.x, p.z, 3);
         if (p.group.visible !== vis) p.group.visible = vis;
+      }
+      // Terrain tiles stream by distance already — add the frustum
+      // test so the half-world behind the camera stops drawing (terrain
+      // mesh, merged vegetation, leaf cards, AO decals together).
+      for (const t of tiles.values()) {
+        const vis = inView(t.cx, t.cz, TILE * 0.75);
+        if (t.mesh.visible !== vis) t.mesh.visible = vis;
+        if (t.veg && t.veg.visible !== vis) t.veg.visible = vis;
+        if (t.leaf && t.leaf.visible !== vis) t.leaf.visible = vis;
+        if (t.blob && t.blob.visible !== vis) t.blob.visible = vis;
       }
     }
 
@@ -13948,6 +14465,9 @@ export default function BattleRoyaleGame() {
       streamTerrain();
       streamPois();
       cullingPass(dt);
+      // Gerstner water: advance the shared wave-clock.
+      waterT += dt;
+      for (const wm of waters) wm.uniforms.uTime.value = waterT;
       updateGrenadePress(dt);
       updateShield(dt);
       updateMicrobots(dt); // the swarm orbits player + dummies, runs tasks
