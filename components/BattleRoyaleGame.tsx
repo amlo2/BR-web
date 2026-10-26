@@ -3642,6 +3642,13 @@ export default function BattleRoyaleGame() {
       sunlit?: boolean;
       weaponKind?: string;
       gunGroup?: THREE.Group;
+      // Battle-royale extensions (harmless undefineds in range mode)
+      name?: string; // callsign for the kill feed
+      charColor?: number; // operator body colour
+      air?: BrAir | null; // parachuting down to the island
+      killer?: any; // DummyObject | 'storm' | 'sea' | 'ground'
+      lod?: 0 | 1; // 1 = full IK figure, 0 = far instanced silhouette
+      tick?: number; // stagger bucket for far-tier updates
     }
     const dummies: DummyObject[] = [];
     const spots: Array<{ x: number; z: number }> = [];
@@ -3979,7 +3986,14 @@ export default function BattleRoyaleGame() {
     // the map (see the loot logic in updateAI).
     const showcaseSpots: Array<{ x: number; z: number; kind: string }> = [];
 
-    function spawnDummy(x: number, z: number, shooter = false, ai = false, weaponChoice?: string) {
+    function spawnDummy(
+      x: number,
+      z: number,
+      shooter = false,
+      ai = false,
+      weaponChoice?: string,
+      br?: { name: string; color: number }
+    ) {
       const assignedWeapon = weaponChoice || 'pistol';
       const d: DummyObject = {
         group: new THREE.Group(),
@@ -4002,7 +4016,11 @@ export default function BattleRoyaleGame() {
       };
       d.group.rotation.order = 'YXZ';
       d.group.position.set(x, 0, z);
-      buildFigure(d, ai ? 0x14b8a6 : shooter ? 0x9f1239 : 0xf59e0b);
+      buildFigure(d, br ? br.color : ai ? 0x14b8a6 : shooter ? 0x9f1239 : 0xf59e0b);
+      d.name = br?.name;
+      d.charColor = br?.color;
+      d.tick = dummies.length % 4;
+      d.lod = 1;
 
       if (shooter) {
         const gun = new THREE.Group();
@@ -4038,8 +4056,10 @@ export default function BattleRoyaleGame() {
 
       // The dummy's shield visual is a MICROBOT SWARM now — no
       // holographic bubble: 1 bot per 5 shield orbits the figure
-      // (see the Microbot Shield Swarm block above).
-      d.bots = makeBotField(false, d);
+      // (see the Microbot Shield Swarm block above). BR bots start
+      // field-less — gateBotFields() arms the 8 closest to you so
+      // 200 combatants can never exhaust the 1024-slot pool.
+      d.bots = br ? undefined : makeBotField(false, d);
 
       world.add(d.group);
       dummies.push(d);
@@ -4091,27 +4111,35 @@ export default function BattleRoyaleGame() {
       registerDestructible(sb, mesh, mat);
     }
 
-    // Spawn initial dummies
-    for (let i = 0; i < 8; i++) {
-      const a = (i / 8) * Math.PI * 2 + Math.random() * 0.3;
-      const r = (18 + Math.random() * 28) * FIELD;
-      spawnDummy(Math.cos(a) * r, Math.sin(a) * r);
-    }
-
-    // Armed shooter dummies — every bot now starts with the pistol
-    // like the player. The classic weapons are dropped as loot next
-    // to them (see the scatter block), so the AI squads visibly walk
-    // over and arm themselves — the same loot race as the player.
-    const initialWeapons = ['sk', 'smg', 'sniper', 'betgun'];
-    for (let i = 0; i < initialWeapons.length; i++) {
-      let a = (i / initialWeapons.length) * Math.PI * 2;
-      let tries = 0;
-      while (nearPool(Math.cos(a) * 32, Math.sin(a) * 32, 3) && tries++ < 50) {
-        a = Math.random() * Math.PI * 2;
+    // Range boot bots — extracted so a return from Harbor can re-run it
+    // (enterHarbor strips the dummies; see spawnRangeBots / enterRangeIfNeeded).
+    function spawnRangeBots() {
+      // Spawn initial dummies
+      for (let i = 0; i < 8; i++) {
+        const a = (i / 8) * Math.PI * 2 + Math.random() * 0.3;
+        const r = (18 + Math.random() * 28) * FIELD;
+        spawnDummy(Math.cos(a) * r, Math.sin(a) * r);
       }
-      spawnDummy(Math.cos(a) * 32, Math.sin(a) * 32, true, false);
-      showcaseSpots.push({ x: Math.cos(a) * 32, z: Math.sin(a) * 32, kind: initialWeapons[i] });
+
+      // Armed shooter dummies — every bot now starts with the pistol
+      // like the player. The classic weapons are dropped as loot next
+      // to them (see the scatter block), so the AI squads visibly walk
+      // over and arm themselves — the same loot race as the player.
+      const initialWeapons = ['sk', 'smg', 'sniper', 'betgun'];
+      for (let i = 0; i < initialWeapons.length; i++) {
+        let a = (i / initialWeapons.length) * Math.PI * 2;
+        let tries = 0;
+        while (nearPool(Math.cos(a) * 32, Math.sin(a) * 32, 3) && tries++ < 50) {
+          a = Math.random() * Math.PI * 2;
+        }
+        spawnDummy(Math.cos(a) * 32, Math.sin(a) * 32, true, false);
+        showcaseSpots.push({ x: Math.cos(a) * 32, z: Math.sin(a) * 32, kind: initialWeapons[i] });
+      }
+      // NOTE: the 3 AI duelers spawn LATE in the boot (see the
+      // spawnAIDummies() call near the AI consts) — AI_DUMMIES is a
+      // const that does not exist yet at this point in the effect.
     }
+    spawnRangeBots();
 
     // Scatter crates
     for (let i = 0; i < 45 * FIELD; i++) {
@@ -4412,6 +4440,10 @@ export default function BattleRoyaleGame() {
     };
 
     function movePlayer(dt: number) {
+      if (brPlayer) {
+        updatePlayerDrop(dt); // riding the drone / skydiving — the drop owns the motion
+        return;
+      }
       const preX = camera.position.x;
       const preZ = camera.position.z;
       const f = axis('KeyW', 'KeyS') - stick.y;
@@ -4772,6 +4804,12 @@ export default function BattleRoyaleGame() {
         return;
       }
       if (!running()) return;
+      // Skydive controls: SPACE bails from the drone, again opens the chute
+      if (brPlayer && e.code === 'Space' && !e.repeat) {
+        if (!brPlayer.jumped) playerJumpNow();
+        else if (!brPlayer.chute) playerChuteOpen();
+      }
+      if (brPlayer && e.code === 'KeyE') return; // no turret deploys from the sky
       if (e.code === 'Space') e.preventDefault();
       keys.add(e.code);
       if (e.code === 'KeyC' && !e.repeat) {
@@ -6844,6 +6882,24 @@ export default function BattleRoyaleGame() {
 
     function enterHarbor() {
       world.visible = false;
+      // Snapshot the range world's registries ONCE so a return to the
+      // proving ground can restore them (solids/shootable/pickups hold
+      // the crate + building + pool registrations; meshes persist in
+      // the hidden `world` group).
+      if (!rangeBackup) {
+        rangeBackup = {
+          solids: solids.slice(),
+          shootable: shootable.filter((o: any) => !o.userData?.dummy).slice(),
+          pickups: pickups.slice(),
+          spots: spots.slice(),
+          buildings: BUILDINGS.slice(),
+        };
+      }
+      // Strip every dummy figure from its parent — the cleared array
+      // used to leak the groups into the hidden world forever.
+      for (const d of dummies) {
+        (d.group.parent || world).remove(d.group);
+      }
       clearPois(); // reclaim any previous map's POIs, pickups and pads
       dummies.length = 0;
       releaseAllBotFields(); // every dummy's microbot swarm goes with it
@@ -6897,51 +6953,930 @@ export default function BattleRoyaleGame() {
       airCarry = null;
       slideReq = false;
       rollReq = 0;
-      // Harbor patrols: AI squads roam the island so recon (the
-      // Antenna's scan, the shooters' duel) has someone to track.
-      spawnHarborPatrols();
+      // Harbor patrols were replaced by the Battle Royale drop —
+      // 20 drones, 200 combatants, the storm.
+      startBrDrop();
     }
 
-    const HARBOR_PATROLS = 8;
-    function spawnHarborPatrols() {
-      let placed = 0;
-      // Ring pass 1 (55-185 m) keeps patrols near the action, but on some
-      // seeds the port platform + sea swallow the whole ring — pass 2
-      // escalates outward (200-460 m) so the island is never empty.
-      for (const [r0, r1, tries] of [
-        [55, 185, 600],
-        [200, 460, 900],
-      ] as const) {
-        for (let t = 0; placed < HARBOR_PATROLS && t < tries; t++) {
-          const a = Math.random() * Math.PI * 2;
-          const r = r0 + Math.random() * (r1 - r0);
-          const x = HARBOR_SPAWN.x + Math.cos(a) * r;
-          const z = HARBOR_SPAWN.z + Math.sin(a) * r;
-          if (terrainHeight(x, z) < WATER_Y + 0.5) continue; // land only
-          // never inside the port platform itself — patrols belong on
-          // the island, not wedged between warehouse walls
-          if (
-            portPlan &&
-            x > portPlan.cx - portPlan.L / 2 - 12 &&
-            x < portPlan.cx + portPlan.L / 2 + 12 &&
-            z > portPlan.cz - portPlan.D / 2 - 12 &&
-            z < portPlan.cz + portPlan.D / 2 + 12
-          )
-            continue;
-          if (!aiFree(x, z, null)) continue;
-          // never inside a war decoration — no patrol wedged in a tank hull
-          if (warZones.some((w) => Math.hypot(x - w.x, z - w.z) < w.r + 2)) continue;
-          if (dummies.some((o) => Math.hypot(o.group.position.x - x, o.group.position.z - z) < 30)) continue;
-          const d = spawnDummy(x, z, true, true);
-          // The flat range world group is hidden in Harbor: patrols live
-          // on the scene and ride the streamed terrain mesh.
-          world.remove(d.group);
-          scene.add(d.group);
-          d.group.position.set(x, Math.max(groundAt(x, z), WATER_Y), z);
-          placed += 1;
-        }
-        if (placed >= HARBOR_PATROLS) break;
+    // ----------------------------------------------------
+    // RANGE RESTORE — enterHarbor tears the proving ground down
+    // (hidden world, cleared registries, stripped bots). The first
+    // Deploy back into the range rebuilds it: the backup registries
+    // go home, the flat world comes back, the boot bots respawn.
+    // ----------------------------------------------------
+    let rangeBackup: {
+      solids: SolidBox[];
+      shootable: THREE.Object3D[];
+      pickups: PickupItem[];
+      spots: Array<{ x: number; z: number }>;
+      buildings: any[];
+    } | null = null;
+
+    function enterRangeIfNeeded() {
+      if (!rangeBackup) return;
+      const b = rangeBackup;
+      rangeBackup = null;
+      brCleanup(); // end any BR match state if it leaked in
+      clearPois();
+      // strip every harbor / BR dummy figure
+      for (const d of dummies) {
+        (d.group.parent || world).remove(d.group);
       }
+      dummies.length = 0;
+      releaseAllBotFields();
+      spots.length = 0;
+      solids.length = 0;
+      shootable.length = 0;
+      resetVox();
+      pickups.length = 0;
+      BUILDINGS.length = 0;
+      for (const t of tiles.values()) disposeTile(t);
+      tiles.clear();
+      vegSolids.length = 0;
+      // flat proving ground state
+      terrainOn = false;
+      mapHalf = ARENA;
+      world.visible = true;
+      seaMesh.visible = false;
+      ground.visible = true;
+      grid.visible = true;
+      harborGroup.visible = false;
+      harborMarks.length = 0; // port + POI compass chips leave with the island
+      if (dummySecEl) dummySecEl.hidden = false;
+      if (inventoryModeEl) inventoryModeEl.textContent = 'Range';
+      // restore the boot registries (the crate / building / pool meshes
+      // persisted inside `world` the whole time)
+      solids.push(...b.solids);
+      shootable.push(...b.shootable);
+      spots.push(...b.spots);
+      BUILDINGS.push(...b.buildings);
+      for (const p of b.pickups) {
+        p.taken = false;
+        p.gone = false;
+        p.timer = 0;
+        p.group.visible = true;
+        pickups.push(p);
+      }
+      // boot bots + fresh stance at the range spawn
+      showcaseSpots.length = 0;
+      spawnRangeBots();
+      spawnAIDummies();
+      spawn = RANGE_SPAWN;
+      camera.position.set(RANGE_SPAWN.x, EYE + groundAt(RANGE_SPAWN.x, RANGE_SPAWN.z), RANGE_SPAWN.z);
+      yaw = 0;
+      pitch = 0;
+      vy = 0;
+      grounded = true;
+      rebuildDummyGrid();
+      rebuildSolidGrid();
+    }
+
+    // ----------------------------------------------------
+    // BATTLE ROYALE — the Harbor is a full BR match. 20 cargo
+    // drones cross the island corner-to-corner, each on its own
+    // parallel lane so none ever collide. 10 operators ride in
+    // each drone; one of them carries 9 bots + YOU. Everyone bails
+    // at a random moment along the flight, freefalls, pops a
+    // parachute steered toward a POI, lands, loots up and fights
+    // while a violet storm shrinks the circle — last one standing
+    // wins.
+    // ----------------------------------------------------
+    const BR_DRONES = 20;
+    const BR_PER_DRONE = 10; // the player's drone carries 9 bots + you
+    const BR_CORNER = HARBOR_HALF - 430; // corner-to-corner across the island
+    const BR_ALT = 175; // cruise altitude — peaks top out around 110 m
+    const BR_SPEED = 62; // m/s — a ~65 s crossing
+    const BR_LANE_GAP = 74; // metres between lanes — collision-free flight
+    const BR_LOD2 = 150 * 150; // full figure <-> far instanced silhouette
+    const BR_BOT_SHIELD = 60; // 200 bots drop lighter swarms than yours
+    const BR_PLAYER_DRONE = 10; // your ride, near the middle of the flock
+
+    // Operator roster the bots wear — the SAME characters as the
+    // lobby. Add a 4th operator here and future matches dress bots
+    // in it automatically.
+    const BR_CHARS = [
+      { id: 'bulwark', color: 0x14b8a6, tag: 'BUL' },
+      { id: 'barrage', color: 0xf59e0b, tag: 'BRR' },
+      { id: 'antenna', color: 0x8b5cf6, tag: 'ANT' },
+    ];
+
+    interface BrAir {
+      tx: number; // POI the chute steers toward
+      tz: number;
+      vy: number;
+      peak: number; // freefall apex — prices a no-chute landing
+      chute: boolean;
+    }
+    interface BrDrone {
+      group: THREE.Group;
+      rotors: THREE.Mesh[];
+      ax: number; az: number; // lane-offset start corner
+      bx: number; bz: number; // lane-offset end corner
+      t: number; // 0..1 along the flight
+      pax: number[]; // roster index riding each seat (-1 = you, -2 = bailed)
+      jumpAt: number[]; // per seat: bail fraction of the path
+      alt: number;
+    }
+
+    const brDrones: BrDrone[] = [];
+    let brOn = false;
+    let brPhase: 'idle' | 'drop' | 'live' | 'over' = 'idle';
+    let brAlive = 0;
+    let brT = 0;
+    let brPlacement = 0;
+    let brPlayer: { jumped: boolean; chute: boolean; vx: number; vz: number; vy: number; peak: number } | null = null;
+    let brPlayerDrone = -1;
+    const brRoster: Array<{ name: string; color: number; live?: DummyObject }> = [];
+    const brZoneChipEl = $('zoneChip');
+    const brAliveNumEl = $('aliveNum');
+    const brFeedEl = $('killFeed');
+    const brPromptEl = $('dropPrompt');
+    const brEndEl = $('brEnd');
+    const brEndTitleEl = $('brEndTitle');
+    const brEndSubEl = $('brEndSub');
+    const brEndStatsEl = $('brEndStats');
+
+    // -- shared drone geometry / materials -------------------------
+    const brDroneGeo = {
+      body: new THREE.BoxGeometry(2.7, 1.15, 6.6),
+      trim: new THREE.BoxGeometry(2.76, 0.18, 1.1),
+      boom: new THREE.BoxGeometry(0.32, 0.26, 5.6),
+      rotor: new THREE.CylinderGeometry(1.55, 1.55, 0.07, 18),
+      bay: new THREE.BoxGeometry(2.05, 0.85, 4.6),
+      fin: new THREE.BoxGeometry(0.18, 0.9, 1.6),
+      lamp: new THREE.SphereGeometry(0.16, 8, 6),
+    };
+    const brDroneMat = {
+      hull: new THREE.MeshLambertMaterial({ color: 0x2b3442 }),
+      trim: new THREE.MeshLambertMaterial({ color: 0x38bdf8 }),
+      rotor: new THREE.MeshLambertMaterial({ color: 0x11161f }),
+      bay: new THREE.MeshLambertMaterial({ color: 0x1f2937 }),
+      lamp: new THREE.MeshBasicMaterial({ color: 0xf59e0b }),
+    };
+
+    function buildBrDrone(alt: number) {
+      const g = new THREE.Group();
+      const hull = new THREE.Mesh(brDroneGeo.body, brDroneMat.hull);
+      hull.castShadow = true;
+      g.add(hull);
+      const trim = new THREE.Mesh(brDroneGeo.trim, brDroneMat.trim);
+      trim.position.set(0, 0.45, 2.3);
+      g.add(trim);
+      const bay = new THREE.Mesh(brDroneGeo.bay, brDroneMat.bay);
+      bay.position.set(0, -0.95, 0.35);
+      g.add(bay);
+      const rotors: THREE.Mesh[] = [];
+      const booms: Array<[number, number]> = [
+        [-1.55, -1.9],
+        [1.55, -1.9],
+        [-1.55, 1.9],
+        [1.55, 1.9],
+      ];
+      for (const [sx, sz] of booms) {
+        const boom = new THREE.Mesh(brDroneGeo.boom, brDroneMat.hull);
+        boom.rotation.y = Math.PI / 2;
+        boom.position.set(0, 0.55, sz);
+        g.add(boom);
+        const r = new THREE.Mesh(brDroneGeo.rotor, brDroneMat.rotor);
+        r.position.set(sx, 0.8, sz);
+        rotors.push(r);
+        g.add(r);
+      }
+      const fin = new THREE.Mesh(brDroneGeo.fin, brDroneMat.hull);
+      fin.position.set(0, 0.7, 3.1);
+      g.add(fin);
+      const lamp = new THREE.Mesh(brDroneGeo.lamp, brDroneMat.lamp);
+      lamp.position.set(0, 1.06, 0);
+      g.add(lamp);
+      g.userData.alt = alt;
+      scene.add(g);
+      return { group: g, rotors };
+    }
+
+    // -- passenger heads in the bays: ONE instanced sphere per seat --
+    const brSeatGeo = new THREE.SphereGeometry(0.19, 8, 6);
+    const brSeatMat = new THREE.MeshLambertMaterial({ color: 0xd7dde6 });
+    const brSeats = new THREE.InstancedMesh(brSeatGeo, brSeatMat, BR_DRONES * BR_PER_DRONE);
+    brSeats.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    brSeats.frustumCulled = false;
+    brSeats.count = 0;
+    brSeats.visible = false;
+    scene.add(brSeats);
+    const brSeatM4 = new THREE.Matrix4();
+
+    // -- far LOD silhouettes + corpses + chute canopies (instanced) --
+    const brFarGeo = new THREE.CapsuleGeometry(0.4, 1.12, 4, 10);
+    const brFarMat = new THREE.MeshLambertMaterial({ color: 0xffffff });
+    const brFar = new THREE.InstancedMesh(brFarGeo, brFarMat, 224);
+    const brCorpseMat = new THREE.MeshLambertMaterial({ color: 0x565f6e });
+    const brCorpses = new THREE.InstancedMesh(brFarGeo, brCorpseMat, 224);
+    const brChuteGeo = new THREE.SphereGeometry(1.55, 12, 7, 0, Math.PI * 2, 0, Math.PI * 0.52);
+    const brChuteMat = new THREE.MeshLambertMaterial({ color: 0xffffff });
+    const brChutes = new THREE.InstancedMesh(brChuteGeo, brChuteMat, 224);
+    for (const im of [brFar, brCorpses, brChutes]) {
+      im.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+      im.frustumCulled = false;
+      im.count = 0;
+      im.visible = false;
+      scene.add(im);
+    }
+    const brM4 = new THREE.Matrix4();
+    const brQ = new THREE.Quaternion();
+    const brV = new THREE.Vector3();
+    const brS = new THREE.Vector3(1, 1, 1);
+    const brE = new THREE.Euler();
+    const brCol = new THREE.Color();
+    const brWhite = new THREE.Color(0xffffff);
+
+    function brPickPoi(x: number, z: number) {
+      // funnel toward loot: nearest POIs win, with a taste for variety
+      let best: { x: number; z: number } | null = null;
+      let bestScore = -Infinity;
+      for (const p of pois) {
+        const score = -Math.hypot(p.x - x, p.z - z) / 240 + Math.random() * 0.9;
+        if (score > bestScore) {
+          best = p;
+          bestScore = score;
+        }
+      }
+      return best || { x: 0, z: 0 };
+    }
+
+    function spawnBrPassenger(dr: BrDrone, k: number, x: number, z: number, alt: number) {
+      const meta = brRoster[dr.pax[k]];
+      if (!meta) return;
+      const d = spawnDummy(x, z, true, true, 'pistol', { name: meta.name, color: meta.color });
+      // Harbor hides the flat range group — bots live on the scene
+      world.remove(d.group);
+      scene.add(d.group);
+      const px = x + (Math.random() - 0.5) * 7;
+      const pz = z + (Math.random() - 0.5) * 7;
+      d.group.position.set(px, alt - 1.5, pz);
+      const poi = brPickPoi(px, pz);
+      d.air = { tx: poi.x + (Math.random() - 0.5) * 16, tz: poi.z + (Math.random() - 0.5) * 16, vy: 0, peak: alt, chute: false };
+      // after touchdown, walk the POI and loot it
+      d.ai.search = { x: poi.x, z: poi.z };
+      meta.live = d;
+      dr.pax[k] = -2; // bailed
+    }
+
+    function updateBrDrones(dt: number) {
+      if (!brDrones.length) return;
+      const len = Math.hypot(2 * BR_CORNER, 2 * BR_CORNER);
+      let flying = 0;
+      for (const dr of brDrones) {
+        dr.t = Math.min(1.04, dr.t + (BR_SPEED * dt) / len);
+        for (const r of dr.rotors) r.rotation.y += dt * 26;
+        const t = dr.t;
+        const x = dr.ax + (dr.bx - dr.ax) * t;
+        const z = dr.az + (dr.bz - dr.az) * t;
+        dr.group.position.set(x, dr.alt + Math.sin(brT * 0.7 + dr.alt) * 1.4, z);
+        dr.group.rotation.y = Math.atan2(dr.bx - dr.ax, dr.bz - dr.az);
+        // you ride until you bail — the camera hangs under the hull
+        if (brPlayer && !brPlayer.jumped && dr === brDrones[brPlayerDrone]) {
+          camera.position.set(x, dr.alt - 1.35, z);
+        }
+        for (let k = 0; k < dr.pax.length; k++) {
+          const seat = dr.pax[k];
+          if (seat === -1) {
+            // your seat — the drone drops you at the far end if you wait
+            if (brPlayer && !brPlayer.jumped && t >= dr.jumpAt[k]) playerJumpNow();
+          } else if (seat >= 0 && t >= dr.jumpAt[k]) {
+            spawnBrPassenger(dr, k, x, z, dr.alt);
+          }
+        }
+        if (t < 1.02) flying++;
+        else if (dr.group.parent) scene.remove(dr.group);
+      }
+      // repaint the bay heads — zeroed per bailed seat
+      let seatIdx = 0;
+      for (const dr of brDrones) {
+        for (let k = 0; k < dr.pax.length; k++) {
+          if (dr.pax[k] === -2) brSeatM4.makeScale(0, 0, 0);
+          else
+            brSeatM4.makeTranslation(
+              dr.group.position.x + (k % 2 === 0 ? -0.45 : 0.45),
+              dr.group.position.y - 0.98,
+              dr.group.position.z + 1.5 - k * 0.62
+            );
+          brSeats.setMatrixAt(seatIdx++, brSeatM4);
+        }
+      }
+      brSeats.count = seatIdx;
+      brSeats.instanceMatrix.needsUpdate = true;
+      if (!flying && brDrones.length) {
+        brDrones.length = 0;
+        brSeats.count = 0;
+      }
+    }
+
+    function startBrDrop() {
+      brOn = true;
+      brPhase = 'drop';
+      brT = 0;
+      brAlive = BR_DRONES * BR_PER_DRONE; // you + 199 bots
+      dummyShield = BR_BOT_SHIELD;
+      brRoster.length = 0;
+      const counts = [0, 0, 0];
+      for (let i = 0; i < BR_DRONES * BR_PER_DRONE - 1; i++) {
+        const c = i % BR_CHARS.length;
+        const ch = BR_CHARS[c];
+        counts[c]++;
+        brRoster.push({ name: ch.tag + '-' + String(counts[c]).padStart(2, '0'), color: ch.color });
+      }
+      // lanes: parallel diagonals corner-to-corner, each drone its own
+      const perpX = Math.SQRT1_2;
+      const perpZ = -Math.SQRT1_2;
+      let cursor = 0;
+      for (let i = 0; i < BR_DRONES; i++) {
+        const lane = (i - (BR_DRONES - 1) / 2) * BR_LANE_GAP;
+        const alt = BR_ALT + (i % 3) * 7;
+        const ax = -BR_CORNER + perpX * lane;
+        const az = -BR_CORNER + perpZ * lane;
+        const bx = BR_CORNER + perpX * lane;
+        const bz = BR_CORNER + perpZ * lane;
+        const built = buildBrDrone(alt);
+        built.group.position.set(ax, alt, az);
+        built.group.rotation.y = Math.atan2(bx - ax, bz - az);
+        const pax: number[] = [];
+        const jumpAt: number[] = [];
+        for (let k = 0; k < BR_PER_DRONE; k++) {
+          if (i === BR_PLAYER_DRONE && k === BR_PER_DRONE - 1) {
+            pax.push(-1); // your seat
+            jumpAt.push(0.94); // auto-bail near the far corner
+          } else {
+            pax.push(cursor++);
+            jumpAt.push(0.08 + Math.random() * 0.66); // random moment in the flight
+          }
+        }
+        brDrones.push({ group: built.group, rotors: built.rotors, ax, az, bx, bz, t: 0, pax, jumpAt, alt });
+      }
+      brPlayer = { jumped: false, chute: false, vx: 0, vz: 0, vy: 0, peak: BR_ALT };
+      brPlayerDrone = BR_PLAYER_DRONE;
+      yaw = Math.atan2(-1, -1); // face the far corner, down the flight path
+      pitch = -0.25; // watch the island slide under
+      document.body.classList.add('br');
+      const dl = $('downsLabel');
+      if (dl) dl.textContent = 'Kills';
+      brSeats.visible = true;
+      brFar.visible = true;
+      brCorpses.visible = true;
+      brChutes.visible = true;
+      brZoneWall.visible = true;
+      if (brEndEl) brEndEl.hidden = true;
+      setBrAlive(BR_DRONES * BR_PER_DRONE);
+      rebuildDummyGrid();
+    }
+
+    // ----------------------------------------------------
+    // THE STORM — a violet wall that closes stage by stage toward
+    // a drifting centre. Outside it bleeds: bots and you alike.
+    // ----------------------------------------------------
+    const brZoneWall = new THREE.Mesh(
+      new THREE.CylinderGeometry(1, 1, 340, 64, 1, true),
+      new THREE.MeshBasicMaterial({ color: 0x8b5cf6, transparent: true, opacity: 0.14, side: THREE.DoubleSide, depthWrite: false })
+    );
+    brZoneWall.visible = false;
+    scene.add(brZoneWall);
+    const brZone = { cx: 0, cz: 0, r: 2600, stage: 0, phase: 'hold', t: 0, r0: 2600, c0x: 0, c0z: 0, r1: 2600, c1x: 0, c1z: 0, dur: 1, dps: 0 };
+    const BR_ZONE_STAGES = [
+      { hold: 78, move: 45, r: 820, dps: 2 }, // hold 1 covers the whole drop
+      { hold: 34, move: 40, r: 500, dps: 4 },
+      { hold: 28, move: 35, r: 290, dps: 7 },
+      { hold: 24, move: 30, r: 145, dps: 10 },
+      { hold: 18, move: 25, r: 58, dps: 14 },
+      { hold: 14, move: 20, r: 10, dps: 18 },
+    ];
+    const outsideZone = (x: number, z: number) => brOn && Math.hypot(x - brZone.cx, z - brZone.cz) > brZone.r;
+
+    let brZoneText = '';
+    function updateBrZone(dt: number) {
+      if (!brOn) return;
+      brZone.t += dt;
+      const cfg = BR_ZONE_STAGES[brZone.stage];
+      if (cfg) {
+        brZone.dps = cfg.dps;
+        if (brZone.phase === 'hold') {
+          if (brZone.t >= cfg.hold) {
+            // pick the next circle: inside the current one, on the island
+            brZone.phase = 'move';
+            brZone.t = 0;
+            const inward = Math.max(0, brZone.r - cfg.r) * 0.55;
+            const a = Math.random() * Math.PI * 2;
+            const d = Math.random() * inward;
+            const lim = Math.max(160, 1120 - cfg.r * 0.8);
+            brZone.r0 = brZone.r;
+            brZone.c0x = brZone.cx;
+            brZone.c0z = brZone.cz;
+            brZone.r1 = cfg.r;
+            brZone.c1x = THREE.MathUtils.clamp(brZone.cx + Math.sin(a) * d, -lim, lim);
+            brZone.c1z = THREE.MathUtils.clamp(brZone.cz + Math.cos(a) * d, -lim, lim);
+            brZone.dur = cfg.move;
+          }
+        } else {
+          const k = Math.min(1, brZone.t / brZone.dur);
+          const e = k * k * (3 - 2 * k); // smoothstep — readable wall motion
+          brZone.r = brZone.r0 + (brZone.r1 - brZone.r0) * e;
+          brZone.cx = brZone.c0x + (brZone.c1x - brZone.c0x) * e;
+          brZone.cz = brZone.c0z + (brZone.c1z - brZone.c0z) * e;
+          if (k >= 1) {
+            brZone.phase = 'hold';
+            brZone.t = 0;
+            brZone.stage++;
+          }
+        }
+      } else {
+        brZone.dps = 18; // fully collapsed — permanent storm
+      }
+      brZoneWall.position.set(brZone.cx, 150, brZone.cz);
+      brZoneWall.scale.set(brZone.r, 1, brZone.r);
+      (brZoneWall.material as THREE.MeshBasicMaterial).opacity = 0.13 + 0.04 * Math.sin(brT * 1.7);
+      // the storm ignores altitude but never bites mid-drop
+      if (!brPlayer && Math.hypot(camera.position.x - brZone.cx, camera.position.z - brZone.cz) > brZone.r) {
+        hurtPlayer(brZone.dps * dt, 0);
+      }
+      // zone chip
+      if (brZoneChipEl) {
+        let txt: string;
+        if (!cfg) txt = 'FINAL STORM';
+        else if (brZone.phase === 'hold') {
+          const s = Math.max(0, Math.ceil(cfg.hold - brZone.t));
+          txt = 'ZONE ' + Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
+        } else txt = 'ZONE CLOSING';
+        if (txt !== brZoneText) {
+          brZoneText = txt;
+          brZoneChipEl.textContent = txt;
+          brZoneChipEl.classList.toggle('closing', txt.indexOf('CLOSING') >= 0 || txt === 'FINAL STORM');
+        }
+      }
+    }
+
+    // ----------------------------------------------------
+    // ALIVE POOL + KILL FEED
+    // ----------------------------------------------------
+    function setBrAlive(n: number) {
+      brAlive = n;
+      if (brAliveNumEl) {
+        if (brAliveNumEl.textContent !== String(n)) {
+          brAliveNumEl.textContent = String(n);
+          popEl(brAliveNumEl);
+        }
+      }
+    }
+
+    function brFeedPush(html: string) {
+      if (!brFeedEl) return;
+      const row = document.createElement('div');
+      row.className = 'kf';
+      row.innerHTML = html;
+      brFeedEl.prepend(row);
+      while (brFeedEl.children.length > 6) brFeedEl.lastChild?.remove();
+      window.setTimeout(() => row.remove(), 5600);
+    }
+
+    function brKillerName(k: any) {
+      if (k === 'storm') return 'STORM';
+      if (k === 'sea') return 'THE SEA';
+      if (k === 'ground') return 'THE DROP';
+      if (k && k.name) return k.name;
+      return null;
+    }
+
+    // ----------------------------------------------------
+    // BOT-vs-BOT COMBAT — every combatant hunts the nearest
+    // enemy, you OR another bot. Fights near you use the REAL
+    // raycast LOS so cover works honestly; far fights settle on
+    // terrain-sampled LOS with probabilistic hits.
+    // ----------------------------------------------------
+    function botLos(d: DummyObject, o: DummyObject) {
+      const p = d.group.position;
+      const q = o.group.position;
+      const bothNear =
+        (p.x - camera.position.x) ** 2 + (p.z - camera.position.z) ** 2 < 130 * 130 &&
+        (q.x - camera.position.x) ** 2 + (q.z - camera.position.z) ** 2 < 130 * 130;
+      if (bothNear) {
+        aiFrom.set(p.x, p.y + 1.6, p.z);
+        aiTo.set(q.x, q.y + 1.3, q.z);
+        aiDir.subVectors(aiTo, aiFrom);
+        const len = aiDir.length();
+        if (len < 1e-3) return true;
+        aiDir.divideScalar(len);
+        lineRay.set(aiFrom, aiDir);
+        lineRay.far = Math.max(0.3, len - 0.4);
+        const hits = lineRay.intersectObjects(shootable, false);
+        lineRay.far = Infinity;
+        for (const h of hits) {
+          const ud: any = h.object.userData;
+          if (ud.dummy !== o && ud.dummy !== d) return false; // wall / cover in the way
+        }
+        return true;
+      }
+      // far duels: sample the terrain ridge line between them
+      const n = 10;
+      const dx = (q.x - p.x) / n;
+      const dz = (q.z - p.z) / n;
+      const y0 = p.y + 1.6;
+      const y1 = q.y + 1.3;
+      for (let i = 1; i < n; i++) {
+        const sx = p.x + dx * i;
+        const sz = p.z + dz * i;
+        if (terrainHeight(sx, sz) > y0 + ((y1 - y0) * i) / n) return false;
+      }
+      return true;
+    }
+
+    const BR_BOT_GUN: Record<string, { cd: number; dmg: number; acc: number }> = {
+      pistol: { cd: 0.95, dmg: 11, acc: 0.55 },
+      smg: { cd: 0.19, dmg: 5, acc: 0.42 },
+      sniper: { cd: 2.6, dmg: 62, acc: 0.7 },
+      betgun: { cd: 1.5, dmg: 14, acc: 0.62 },
+      sk: { cd: 1.25, dmg: 26, acc: 0.6 },
+    };
+
+    function aiPickFoe(d: DummyObject): DummyObject | 'player' | null {
+      const p = d.group.position;
+      if (!playerDown && !brPlayer) {
+        const pdx = camera.position.x - p.x;
+        const pdz = camera.position.z - p.z;
+        if (Math.hypot(pdx, pdz) < ENEMY_RANGE && aiSees(d)) return 'player';
+      }
+      let best: DummyObject | null = null;
+      let bestD = Infinity;
+      eachNearDummy(p.x, p.z, 46, (o) => {
+        if (o === d || o.state !== 'up' || o.air) return;
+        const dd = Math.hypot(o.group.position.x - p.x, o.group.position.z - p.z);
+        if (dd >= bestD || dd > 46) return;
+        if (botLos(d, o)) {
+          best = o;
+          bestD = dd;
+        }
+      });
+      return best;
+    }
+
+    function hurtBot(d: DummyObject, dmg: number, killer: DummyObject) {
+      if (d.state !== 'up') return;
+      const through = Math.min(d.shield, dmg);
+      d.shield -= through;
+      d.hp -= dmg - through;
+      d.quiet = 0;
+      d.flash = 0.12;
+      if (through > 0 && d.bots) {
+        const kp = killer.group.position;
+        botFieldHit(d.bots, through, kp.x, kp.y + 1, kp.z);
+      }
+      d.killer = killer;
+      if (d.hp <= 0.001) dummyDown(d);
+    }
+
+    function botShootBot(d: DummyObject, foe: DummyObject, dt: number) {
+      const p = d.group.position;
+      const q = foe.group.position;
+      const dist = Math.hypot(q.x - p.x, q.z - p.z);
+      d.group.rotation.y = Math.atan2(q.x - p.x, q.z - p.z);
+      d.fireT = Math.max(0, d.fireT - dt);
+      if (dist > 62) {
+        d.fireT = Math.max(d.fireT, 0.35);
+        return;
+      }
+      if (d.fireT > 0) return;
+      if (!botLos(d, foe)) {
+        d.fireT = 0.5 + Math.random() * 0.4;
+        return;
+      }
+      const c = BR_BOT_GUN[d.weaponKind || 'pistol'] || BR_BOT_GUN.pistol;
+      d.fireT = c.cd + Math.random() * 0.25;
+      d.shots += 1;
+      if (d.muzzle) d.muzzle.getWorldPosition(shotFrom);
+      else shotFrom.copy(p).add(FIG.gun);
+      const ox = (Math.random() * 2 - 1) * 1.3;
+      const oy = (Math.random() * 2 - 1) * 0.9;
+      tracer(
+        shotFrom.clone(),
+        new THREE.Vector3(q.x + ox, q.y + 1.15 + oy, q.z + ox * 0.5),
+        (d.weaponKind || 'pistol') === 'sniper' ? 0x60a5fa : 0xfde68a
+      );
+      const hitChance = c.acc * THREE.MathUtils.clamp(1.5 - dist / 34, 0.2, 1.15);
+      if (Math.random() < hitChance) {
+        d.hits += 1;
+        hurtBot(foe, c.dmg, d);
+      }
+    }
+
+    // ----------------------------------------------------
+    // SPATIAL GRIDS — 200 bots must never O(n^2) the frame.
+    // dummies: rebuilt ~0.45 s; solids: same cadence (walls are rare).
+    // ----------------------------------------------------
+    const GRID_CELL = 16;
+    const dummyGrid = new Map<number, DummyObject[]>();
+    const solidGrid = new Map<number, SolidBox[]>();
+    const gKey = (ix: number, iz: number) => (ix + 512) * 4096 + (iz + 512);
+
+    function rebuildDummyGrid() {
+      dummyGrid.clear();
+      for (const d of dummies) {
+        if (d.state !== 'up') continue;
+        const p = d.group.position;
+        const k = gKey(Math.floor(p.x / GRID_CELL), Math.floor(p.z / GRID_CELL));
+        let arr = dummyGrid.get(k);
+        if (!arr) {
+          arr = [];
+          dummyGrid.set(k, arr);
+        }
+        arr.push(d);
+      }
+    }
+
+    function eachNearDummy(x: number, z: number, r: number, cb: (d: DummyObject) => void) {
+      const i0 = Math.floor((x - r) / GRID_CELL);
+      const i1 = Math.floor((x + r) / GRID_CELL);
+      const j0 = Math.floor((z - r) / GRID_CELL);
+      const j1 = Math.floor((z + r) / GRID_CELL);
+      for (let i = i0; i <= i1; i++) {
+        for (let j = j0; j <= j1; j++) {
+          const arr = dummyGrid.get(gKey(i, j));
+          if (arr) for (const d of arr) cb(d);
+        }
+      }
+    }
+
+    function rebuildSolidGrid() {
+      solidGrid.clear();
+      for (const b of solids) {
+        const k = gKey(Math.floor(b.x / GRID_CELL), Math.floor(b.z / GRID_CELL));
+        let arr = solidGrid.get(k);
+        if (!arr) {
+          arr = [];
+          solidGrid.set(k, arr);
+        }
+        arr.push(b);
+      }
+    }
+
+    function eachNearSolid(x: number, z: number, r: number, cb: (b: SolidBox) => void) {
+      const i0 = Math.floor((x - r) / GRID_CELL);
+      const i1 = Math.floor((x + r) / GRID_CELL);
+      const j0 = Math.floor((z - r) / GRID_CELL);
+      const j1 = Math.floor((z + r) / GRID_CELL);
+      for (let i = i0; i <= i1; i++) {
+        for (let j = j0; j <= j1; j++) {
+          const arr = solidGrid.get(gKey(i, j));
+          if (arr) for (const b of arr) cb(b);
+        }
+      }
+    }
+
+    // ----------------------------------------------------
+    // BOT FIELD GATING + LOD — at most 8 nearby bots carry live
+    // microbot swarms (the pool is 1024); figures render within
+    // 150 m, instanced silhouettes beyond.
+    // ----------------------------------------------------
+    function gateBotFields() {
+      if (!brOn) return;
+      const near: Array<[DummyObject, number]> = [];
+      for (const d of dummies) {
+        if (!d.ai) continue;
+        if (d.state !== 'up' || d.air) {
+          if (d.bots) {
+            releaseField(d.bots);
+            d.bots = undefined;
+          }
+          continue;
+        }
+        const dd = (d.group.position.x - camera.position.x) ** 2 + (d.group.position.z - camera.position.z) ** 2;
+        if (dd < 90 * 90) near.push([d, dd]);
+        else if (d.bots) {
+          releaseField(d.bots);
+          d.bots = undefined;
+        }
+      }
+      near.sort((a, b) => a[1] - b[1]);
+      for (let i = 0; i < near.length; i++) {
+        const d = near[i][0];
+        if (i < 8) {
+          if (!d.bots) d.bots = makeBotField(false, d);
+        } else if (d.bots) {
+          releaseField(d.bots);
+          d.bots = undefined;
+        }
+      }
+    }
+
+    function refreshBotLod() {
+      if (!brOn) return;
+      const cx = camera.position.x;
+      const cz = camera.position.z;
+      for (const d of dummies) {
+        if (!d.ai) continue; // range figures always full
+        const dd = (d.group.position.x - cx) ** 2 + (d.group.position.z - cz) ** 2;
+        d.lod = dd < BR_LOD2 ? 1 : 0;
+        d.group.visible = d.lod === 1;
+      }
+    }
+
+    function refreshBrInstances() {
+      if (!brOn) return;
+      let fi = 0;
+      let ci = 0;
+      let chi = 0;
+      for (const d of dummies) {
+        if (!d.ai) continue;
+        const p = d.group.position;
+        if (d.state === 'up' && d.lod === 0 && fi < 220) {
+          brE.set(0, d.group.rotation.y, 0);
+          brQ.setFromEuler(brE);
+          brM4.compose(brV.set(p.x, p.y + 0.95, p.z), brQ, brS);
+          brFar.setMatrixAt(fi, brM4);
+          brCol.setHex(d.charColor ?? 0x9aa4b2);
+          brFar.setColorAt(fi, brCol);
+          fi++;
+        } else if (d.state !== 'up' && d.lod === 0 && ci < 220) {
+          brE.set(Math.PI / 2, d.group.rotation.y, 0);
+          brQ.setFromEuler(brE);
+          brM4.compose(brV.set(p.x, p.y + 0.4, p.z), brQ, brS);
+          brCorpses.setMatrixAt(ci, brM4);
+          ci++;
+        }
+        if (d.air && d.air.chute && chi < 220) {
+          brE.set(0, d.group.rotation.y, 0);
+          brQ.setFromEuler(brE);
+          brM4.compose(brV.set(p.x, p.y + 3.1, p.z), brQ, brS);
+          brChutes.setMatrixAt(chi, brM4);
+          brCol.setHex(d.charColor ?? 0xef4444).lerp(brWhite, 0.35);
+          brChutes.setColorAt(chi, brCol);
+          chi++;
+        }
+      }
+      brFar.count = fi;
+      brCorpses.count = ci;
+      brChutes.count = chi;
+      brFar.instanceMatrix.needsUpdate = true;
+      brCorpses.instanceMatrix.needsUpdate = true;
+      brChutes.instanceMatrix.needsUpdate = true;
+      if (brFar.instanceColor) brFar.instanceColor.needsUpdate = true;
+      if (brChutes.instanceColor) brChutes.instanceColor.needsUpdate = true;
+    }
+
+    // ----------------------------------------------------
+    // PLAYER DROP — ride your drone, SPACE to bail, freefall,
+    // SPACE again (or auto at 48 m) to pop the chute, WASD steers.
+    // ----------------------------------------------------
+    function playerJumpNow() {
+      if (!brPlayer || brPlayer.jumped) return;
+      brPlayer.jumped = true;
+      brPlayer.vy = 0;
+      brPlayer.vx = 0;
+      brPlayer.vz = 0;
+      brPlayer.peak = camera.position.y;
+    }
+
+    function playerChuteOpen() {
+      if (!brPlayer || !brPlayer.jumped || brPlayer.chute) return;
+      brPlayer.chute = true;
+    }
+
+    function updatePlayerDrop(dt: number) {
+      const p = brPlayer;
+      if (!p || !p.jumped) return; // riding: the drone carries the camera
+      const g = Math.max(groundAt(camera.position.x, camera.position.z), WATER_Y);
+      const agl = camera.position.y - EYE - g;
+      if (!p.chute && agl < 48) playerChuteOpen(); // never let you splat by accident
+      const targetVy = p.chute ? -8.6 : -31;
+      p.vy += (targetVy - p.vy) * Math.min(1, dt * (p.chute ? 3.2 : 0.7));
+      // WASD steering in look direction (same axes as movePlayer)
+      const f = axis('KeyW', 'KeyS') - stick.y;
+      const s = axis('KeyD', 'KeyA') + stick.x;
+      const len = Math.hypot(f, s);
+      if (len > 0) {
+        const acc = p.chute ? 15 : 9;
+        const ax = (-Math.sin(yaw) * f + Math.cos(yaw) * s) / len;
+        const az = (-Math.cos(yaw) * f - Math.sin(yaw) * s) / len;
+        p.vx += ax * acc * dt;
+        p.vz += az * acc * dt;
+      }
+      const drag = Math.max(0, 1 - dt * (p.chute ? 1.4 : 0.25));
+      p.vx *= drag;
+      p.vz *= drag;
+      const hs = Math.hypot(p.vx, p.vz);
+      const maxH = p.chute ? 13.5 : 17;
+      if (hs > maxH) {
+        p.vx *= maxH / hs;
+        p.vz *= maxH / hs;
+      }
+      camera.position.x += p.vx * dt;
+      camera.position.z += p.vz * dt;
+      camera.position.y += p.vy * dt;
+      p.peak = Math.max(p.peak, camera.position.y);
+      // touchdown
+      if (camera.position.y - EYE <= g + 0.03) {
+        const drop = p.peak - EYE - g;
+        const wasChute = p.chute;
+        brPlayer = null;
+        camera.position.y = g + EYE;
+        vy = 0;
+        grounded = true;
+        fallPeak = g;
+        if (!wasChute) checkFallDamage(drop); // no-chute landings price like cliffs
+        else playSfx('wood_hit');
+      }
+    }
+
+    function updateBrPrompt() {
+      if (!brPromptEl) return;
+      if (!brPlayer) {
+        if (!brPromptEl.hidden) brPromptEl.hidden = true;
+        return;
+      }
+      brPromptEl.hidden = false;
+      const g = Math.max(groundAt(camera.position.x, camera.position.z), WATER_Y);
+      const agl = Math.max(0, camera.position.y - EYE - g);
+      brPromptEl.innerHTML = brPlayer.chute
+        ? 'ALT <b>' + Math.round(agl) + '</b> m &middot; WASD steers'
+        : brPlayer.jumped
+        ? 'SPACE &mdash; deploy chute &middot; ALT <b>' + Math.round(agl) + '</b> m'
+        : 'SPACE &mdash; JUMP';
+    }
+
+    // ----------------------------------------------------
+    // BR HEARTBEAT + VICTORY / DEFEAT
+    // ----------------------------------------------------
+    let brGridT = 0;
+    let brFrameNo = 0;
+    function updateBr(dt: number) {
+      if (!brOn) return;
+      brT += dt;
+      brFrameNo++;
+      updateBrDrones(dt);
+      updateBrZone(dt);
+      if (brPhase === 'drop' && !brPlayer) brPhase = 'live';
+      refreshBrInstances();
+      updateBrPrompt();
+      if (brPhase !== 'over' && brAlive <= 1 && !playerDown && !brPlayer) showBrEnd(true);
+    }
+
+    function showBrEnd(win: boolean) {
+      brPhase = 'over';
+      if (win) brPlacement = 1;
+      if (brEndEl) {
+        if (brEndTitleEl)
+          brEndTitleEl.textContent = win ? '#1 — VICTORY' : '#' + Math.max(1, brPlacement) + ' / ' + BR_DRONES * BR_PER_DRONE;
+        if (brEndSubEl)
+          brEndSubEl.textContent = win
+            ? 'Last one standing out of 200 combatants.'
+            : brPlacement >= 100
+            ? 'The island eats most of them too. Drop earlier, loot faster.'
+            : 'So close. Watch the circle — the storm is the real killer.';
+        if (brEndStatsEl)
+          brEndStatsEl.innerHTML =
+            '<b>' + downs + '</b> kills &middot; survived <b>' + Math.floor(brT / 60) + ':' + String(Math.floor(brT % 60)).padStart(2, '0') + '</b> &middot; <b>' + credits + '</b> cr';
+        brEndEl.hidden = false;
+      }
+      document.exitPointerLock?.();
+    }
+
+    function brCleanup() {
+      if (!brOn && brPhase === 'idle' && !brDrones.length) return;
+      brOn = false;
+      brPhase = 'idle';
+      brAlive = 0;
+      brT = 0;
+      brPlacement = 0;
+      brPlayer = null;
+      brPlayerDrone = -1;
+      for (const dr of brDrones) scene.remove(dr.group);
+      brDrones.length = 0;
+      brRoster.length = 0;
+      dummyShield = DUMMY_SHIELD;
+      document.body.classList.remove('br');
+      const dl = $('downsLabel');
+      if (dl) dl.textContent = 'Downs';
+      brSeats.count = 0;
+      brSeats.visible = false;
+      for (const im of [brFar, brCorpses, brChutes]) {
+        im.count = 0;
+        im.visible = false;
+      }
+      brZoneWall.visible = false;
+      brZone.stage = 0;
+      brZone.phase = 'hold';
+      brZone.t = 0;
+      brZone.r = 2600;
+      brZone.cx = 0;
+      brZone.cz = 0;
+      brZone.dps = 0;
+      brZoneText = '';
+      if (brZoneChipEl) {
+        brZoneChipEl.textContent = '';
+        brZoneChipEl.classList.remove('closing');
+      }
+      if (brFeedEl) brFeedEl.innerHTML = '';
+      if (brPromptEl) brPromptEl.hidden = true;
+      if (brEndEl) brEndEl.hidden = true;
+      for (const d of dummies) {
+        d.group.visible = true;
+        d.lod = 1;
+      }
+      rebuildDummyGrid();
     }
 
     // ----------------------------------------------------
@@ -7213,7 +8148,10 @@ export default function BattleRoyaleGame() {
       if (deploying) return; // the exit animation is already carrying us out
       if (selectedMode === 'harbor') enterHarbor();
       else if (selectedMode !== 'range') return;
-      else refreshWood(); // Test Range: free builds — hide the wood plate
+      else {
+        enterRangeIfNeeded(); // returning from a Harbor match rebuilds the range
+        refreshWood(); // Test Range: free builds — hide the wood plate
+      }
       deploying = true;
       // Deploy = battle: claim the whole screen. The click is the user
       // gesture browsers demand; autostart boots simply skip the request.
@@ -7230,6 +8168,13 @@ export default function BattleRoyaleGame() {
     }
 
     playBtn?.addEventListener('click', startGame);
+    $('brEndBtn')?.addEventListener('click', returnToMenu);
+    // mobile: tapping the drop prompt bails / opens the chute
+    brPromptEl?.addEventListener('pointerdown', () => {
+      if (!brPlayer) return;
+      if (!brPlayer.jumped) playerJumpNow();
+      else playerChuteOpen();
+    });
 
     // Check for ?autostart=1 query param (Ultra Mode requirement)
     if (typeof window !== 'undefined') {
@@ -7262,6 +8207,151 @@ export default function BattleRoyaleGame() {
               refreshGrenades();
             },
             buildWall: (bx: number, bz: number, ang = 0) => buildFortniteWall(bx, groundAt(bx, bz), bz, ang),
+            // ---- Battle Royale test hooks ----
+            brInfo: () => ({
+              on: brOn,
+              phase: brPhase,
+              alive: brAlive,
+              t: +brT.toFixed(1),
+              placement: brPlacement,
+              playerDrop: brPlayer ? { jumped: brPlayer.jumped, chute: brPlayer.chute, y: +camera.position.y.toFixed(1) } : null,
+              zone: { r: Math.round(brZone.r), cx: Math.round(brZone.cx), cz: Math.round(brZone.cz), stage: brZone.stage, phase: brZone.phase, dps: brZone.dps },
+              drones: brDrones.map((dr) => ({
+                t: +dr.t.toFixed(3),
+                x: +dr.group.position.x.toFixed(1),
+                z: +dr.group.position.z.toFixed(1),
+                out: dr.pax.filter((k) => k === -2).length,
+              })),
+              bots: dummies
+                .filter((o) => o.ai)
+                .map((o) => ({
+                  name: o.name,
+                  state: o.state,
+                  lod: o.lod,
+                  air: !!o.air,
+                  chute: o.air ? o.air.chute : undefined,
+                  x: +o.group.position.x.toFixed(1),
+                  y: +o.group.position.y.toFixed(1),
+                  z: +o.group.position.z.toFixed(1),
+                  hp: Math.round(o.hp),
+                  shield: Math.round(o.shield),
+                  kind: o.weaponKind,
+                  ai: o.ai.state,
+                  foe: o.ai.foe === 'player' ? 'player' : o.ai.foe ? o.ai.foe.name : null,
+                  killer: o.killer ? (o.killer === 'storm' || o.killer === 'sea' || o.killer === 'ground' ? o.killer : o.killer.name) : null,
+                })),
+              feed: brFeedEl ? Array.from(brFeedEl.children).map((c) => (c as HTMLElement).textContent) : [],
+            }),
+            brLand: () => {
+              // finish the drop instantly: every passenger out and ON the
+              // ground spread along their drone's lane (a random point on
+              // the flight path — NOT the shared diagonal midpoint, or all
+              // 200 would pile onto one POI and the map blips would merge)
+              for (const dr of brDrones) {
+                for (let k = 0; k < dr.pax.length; k++) {
+                  const pi = dr.pax[k];
+                  if (pi < 0) continue; // -1 your seat, -2 already out
+                  const meta = brRoster[pi];
+                  if (!meta) continue;
+                  const tt = 0.12 + Math.random() * 0.68; // per-passenger bail point
+                  const jx = dr.ax + (dr.bx - dr.ax) * tt;
+                  const jz = dr.az + (dr.bz - dr.az) * tt;
+                  const poi = brPickPoi(jx, jz);
+                  let x = poi.x + (Math.random() - 0.5) * 34;
+                  let z = poi.z + (Math.random() - 0.5) * 34;
+                  for (let tries = 0; tries < 40 && (!aiFree(x, z, null) || terrainHeight(x, z) < WATER_Y + 0.4); tries++) {
+                    x = poi.x + (Math.random() - 0.5) * 60;
+                    z = poi.z + (Math.random() - 0.5) * 60;
+                  }
+                  const d = spawnDummy(x, z, true, true, 'pistol', { name: meta.name, color: meta.color });
+                  world.remove(d.group);
+                  scene.add(d.group);
+                  d.group.position.set(x, Math.max(groundAt(x, z), WATER_Y), z);
+                  d.ai.search = { x: poi.x, z: poi.z };
+                  meta.live = d;
+                  dr.pax[k] = -2;
+                }
+              }
+              if (brPlayer && brDrones[brPlayerDrone]) {
+                const dr = brDrones[brPlayerDrone];
+                // walk the flight path for a dry landing spot — the mid
+                // path can be ocean on some seeds
+                let t = 0.55;
+                let lx = 0;
+                let lz = 0;
+                for (let i = 0; i < 34; i++) {
+                  lx = dr.ax + (dr.bx - dr.ax) * t;
+                  lz = dr.az + (dr.bz - dr.az) * t;
+                  if (terrainHeight(lx, lz) > WATER_Y + 1.2) break;
+                  t = (t + 0.03) % 1;
+                }
+                camera.position.set(lx, Math.max(groundAt(lx, lz), WATER_Y) + EYE, lz);
+                brPlayer = null;
+                grounded = true;
+                vy = 0;
+                fallPeak = groundAt(lx, lz);
+              }
+              brPhase = 'live';
+              rebuildDummyGrid();
+              return 'landed';
+            },
+            brDuel: (dx: number, dz: number) => {
+              const alive = dummies.filter((o) => o.ai && o.state === 'up' && !o.air);
+              if (alive.length < 2) return 'need two living bots';
+              const a = alive[0];
+              const b = alive[1];
+              const ax = +dx;
+              const az = +dz;
+              a.group.position.set(ax - 8, Math.max(groundAt(ax - 8, az), WATER_Y), az);
+              b.group.position.set(ax + 8, Math.max(groundAt(ax + 8, az), WATER_Y), az);
+              a.group.visible = true;
+              b.group.visible = true;
+              a.lod = 1;
+              b.lod = 1;
+              a.ai.foe = b;
+              b.ai.foe = a;
+              a.ai.state = 'engage';
+              b.ai.state = 'engage';
+              a.ai.lost = 0;
+              b.ai.lost = 0;
+              a.fireT = 0.3;
+              b.fireT = 0.5;
+              rebuildDummyGrid();
+              return (a.name || 'A') + ' vs ' + (b.name || 'B');
+            },
+            brZoneTo: (sIdx: number) => {
+              const cfg = BR_ZONE_STAGES[+sIdx];
+              if (!cfg) return 'no stage ' + sIdx;
+              brZone.r = cfg.r;
+              brZone.stage = +sIdx;
+              brZone.phase = 'hold';
+              brZone.t = 0;
+              brZone.cx = 0;
+              brZone.cz = 0;
+              brZone.dps = cfg.dps;
+              return 'r=' + cfg.r + ' dps=' + cfg.dps;
+            },
+            brKillBots: (n: number) => {
+              let k = 0;
+              for (const o of dummies) {
+                if (k >= +n) break;
+                if (o.ai && o.state === 'up') {
+                  o.killer = 'storm';
+                  dummyDown(o);
+                  k++;
+                }
+              }
+              return k + ' eliminated';
+            },
+            brJump: () => {
+              if (!brPlayer) return 'not airborne';
+              if (!brPlayer.jumped) {
+                playerJumpNow();
+                return 'jumped';
+              }
+              playerChuteOpen();
+              return 'chute';
+            },
             popupInfo: () => ({
               cam: { x: +camera.position.x.toFixed(1), y: +camera.position.y.toFixed(1), z: +camera.position.z.toFixed(1) },
               popups: damagePopups.map((p) => ({
@@ -8510,6 +9600,7 @@ export default function BattleRoyaleGame() {
 
     function hitDummy(d: DummyObject, dmg: number, pen = 0, from?: { x: number; y: number; z: number }) {
       if (d.state !== 'up') return;
+      d.killer = undefined; // player-source hit overrides any old credit
       const through = Math.min(d.shield, dmg);
       d.shield -= through;
       d.hp -= (dmg - through) + pen;
@@ -8528,6 +9619,29 @@ export default function BattleRoyaleGame() {
     const DOWN_CREDITS = 50;
     function dummyDown(d: DummyObject) {
       d.state = 'falling';
+      if (brOn) {
+        // BR accounting: the alive pool shrinks no matter who died, but
+        // only YOUR eliminations pay. Every death gets a feed line.
+        setBrAlive(brAlive - 1);
+        const kName = brKillerName(d.killer);
+        if (!d.killer) {
+          // player sources never set a killer — turret, guns, grenades
+          downs += 1;
+          if (downsEl) {
+            downsEl.textContent = String(downs);
+            popEl(downsEl);
+          }
+          credits += DOWN_CREDITS;
+          if (creditsEl) {
+            creditsEl.textContent = String(credits);
+            popEl(creditsEl);
+          }
+          brFeedPush('<b>YOU</b> &#10005; ' + (d.name || 'BOT'));
+        } else {
+          brFeedPush((kName || 'BOT') + ' &#10005; ' + (d.name || 'BOT'));
+        }
+        return;
+      }
       downs += 1;
       if (downsEl) {
         downsEl.textContent = String(downs);
@@ -8542,6 +9656,7 @@ export default function BattleRoyaleGame() {
 
     function burnDummy(d: DummyObject, dmg: number, pen = 0, from?: { x: number; y: number; z: number }) {
       if (d.state !== 'up') return;
+      d.killer = undefined; // explosions are yours (or nobody's)
       const through = Math.min(d.shield, dmg);
       d.shield -= through;
       d.hp -= (dmg - through) + pen;
@@ -9846,6 +10961,11 @@ export default function BattleRoyaleGame() {
       reloadT = 0;
       scopeT = 0;
       scopeEl?.classList.remove('on');
+      if (brOn && brPhase !== 'over') {
+        // a BR death is the end of the run — placement card, no respawn
+        brPlacement = Math.max(1, brAlive);
+        showBrEnd(false);
+      }
     }
 
     function respawn() {
@@ -9922,7 +11042,7 @@ export default function BattleRoyaleGame() {
       }
       if (hurtFx) hurtFx.style.opacity = (hurtFlash / 0.35).toFixed(3);
       if (downedEl) downedEl.hidden = !playerDown;
-      if (playerDown && downedTimerEl) downedTimerEl.textContent = String(Math.ceil(respawnT));
+      if (playerDown && !brOn && downedTimerEl) downedTimerEl.textContent = String(Math.ceil(respawnT));
       updateLevelHud();
       updateTurretHud();
     }
@@ -11116,6 +12236,7 @@ export default function BattleRoyaleGame() {
     // deployment starts from scratch. No more progress leaking between
     // games.
     function resetRun() {
+      brCleanup();
       xp = 0;
       playerLevel = 1;
       levelKey = ''; // force the level HUD to repaint
@@ -11750,10 +12871,23 @@ export default function BattleRoyaleGame() {
         if (Math.abs(m.x - p.x) > MINIMAP_R || Math.abs(m.z - p.z) > MINIMAP_R) continue;
         drawBlip(ctx, toX(m.x), toY(m.z), 4, mapMarkColor(m.cls));
       }
+      if (brOn) {
+        // the storm on the round minimap
+        const zr = (brZone.r / MINIMAP_R) * (R - 6);
+        ctx.beginPath();
+        ctx.arc(toX(brZone.cx), toY(brZone.cz), Math.max(2, zr), 0, Math.PI * 2);
+        ctx.lineWidth = 2.5;
+        ctx.strokeStyle = 'rgba(167, 139, 250, 0.9)';
+        ctx.stroke();
+      }
       if (antenna) {
+        // 200 blips would ink the whole disc — cap the scan display
+        let blips = 0;
         for (const d of dummies) {
+          if (blips >= 40) break;
           if (d.state !== 'up') continue;
           drawBlip(ctx, toX(d.group.position.x), toY(d.group.position.z), 6.5, '#ff5c6b');
+          blips++;
         }
         drawDiamond(ctx, toX(antenna.group.position.x), toY(antenna.group.position.z), 5.5);
       }
@@ -11806,10 +12940,29 @@ export default function BattleRoyaleGame() {
         ctx.fillStyle = 'rgba(245, 247, 250, 0.95)';
         ctx.fillText(m.label, x + 8, y + (flip++ % 2 ? -11 : 12));
       }
+      if (brOn) {
+        // the storm circle on the tactical map
+        const zx = toX(brZone.cx);
+        const zy = toY(brZone.cz);
+        const zr = Math.abs(toX(brZone.cx + brZone.r) - zx);
+        ctx.beginPath();
+        ctx.arc(zx, zy, Math.max(2, zr), 0, Math.PI * 2);
+        ctx.lineWidth = 3;
+        ctx.strokeStyle = 'rgba(167, 139, 250, 0.95)';
+        ctx.stroke();
+        ctx.lineWidth = 1.5;
+        ctx.strokeStyle = 'rgba(167, 139, 250, 0.4)';
+        ctx.beginPath();
+        ctx.arc(zx, zy, Math.max(2, zr * 0.94), 0, Math.PI * 2);
+        ctx.stroke();
+      }
       if (antenna) {
+        let blips = 0;
         for (const d of dummies) {
+          if (blips >= 220) break;
           if (d.state !== 'up') continue;
           drawBlip(ctx, toX(d.group.position.x), toY(d.group.position.z), 6.5, '#ff5c6b');
+          blips++;
         }
         const ax = toX(antenna.group.position.x);
         const ay = toY(antenna.group.position.z);
@@ -11855,9 +13008,99 @@ export default function BattleRoyaleGame() {
     // ----------------------------------------------------
     // Dummy Update & Basic AI
     // ----------------------------------------------------
+    // Storm bite for bots — shield first, health behind it. The storm
+    // never credits the player.
+    function botStormBite(d: DummyObject, dt: number) {
+      if (!brOn || d.state !== 'up' || d.air || brZone.dps <= 0) return;
+      if (!outsideZone(d.group.position.x, d.group.position.z)) return;
+      const bite = brZone.dps * dt;
+      const through = Math.min(d.shield, bite);
+      d.shield -= through;
+      d.hp -= bite - through;
+      d.quiet = 0;
+      d.killer = 'storm';
+      if (d.hp <= 0.001) dummyDown(d);
+    }
+
+    // Parachute descent for bots: freefall from the drone, canopy at
+    // ~55 m, steer toward the chosen POI, touchdown or sea.
+    function updateBrChute(d: DummyObject, dt: number) {
+      const air = d.air;
+      if (!air) return;
+      const p = d.group.position;
+      const g = Math.max(groundAt(p.x, p.z), WATER_Y);
+      const agl = p.y - g;
+      if (!air.chute && agl < 55 + Math.random() * 10) air.chute = true; // staggered deploys read as a wave
+      const targetVy = air.chute ? -8.6 : -31;
+      air.vy += (targetVy - air.vy) * Math.min(1, dt * (air.chute ? 3.2 : 0.7));
+      p.y += air.vy * dt;
+      // steer toward the POI the drop chose
+      const dx = air.tx - p.x;
+      const dz = air.tz - p.z;
+      const dd = Math.hypot(dx, dz);
+      const hs = air.chute ? 12.5 : 8.5;
+      if (dd > 3) {
+        p.x += (dx / dd) * Math.min(hs, dd) * dt;
+        p.z += (dz / dd) * Math.min(hs, dd) * dt;
+      }
+      d.group.rotation.y = Math.atan2(dx, dz);
+      air.peak = Math.max(air.peak, p.y);
+      if (agl <= 0.06) {
+        // touchdown — sea drops drown, no-chute slams pay like cliffs
+        const drop = air.peak - g;
+        const wasChute = air.chute;
+        d.air = null;
+        p.y = g;
+        d.group.rotation.x = 0;
+        if (g < WATER_Y + 0.2) {
+          d.killer = 'sea';
+          dummyDown(d);
+          d.state = 'down';
+          d.group.rotation.x = -Math.PI / 2;
+          return;
+        }
+        if (!wasChute) {
+          const dmg = Math.min(95, Math.max(0, (drop - 4.6) * 9));
+          if (dmg > 0) {
+            const through = Math.min(d.shield, dmg);
+            d.shield -= through;
+            d.hp -= dmg - through;
+            d.quiet = 0;
+            d.killer = 'ground';
+            if (d.hp <= 0.001) dummyDown(d);
+          }
+        }
+      }
+    }
+
     function updateDummy(d: DummyObject, dt: number) {
+      // Airborne in the drop: the chute owns the motion until touchdown
+      if (d.air) {
+        updateBrChute(d, dt);
+        return;
+      }
+      if (brOn && d.lod === 0) {
+        // FAR TIER — hundreds of bots stay cheap: no posing, no probes,
+        // a flat shield trickle and the state timers that keep kills real
+        d.flash = Math.max(0, d.flash - dt);
+        d.quiet += dt;
+        if (d.state === 'up' && d.quiet >= SHIELD_DELAY && d.shield < d.shieldMax) {
+          d.shield = Math.min(d.shieldMax, d.shield + 4 * dt);
+        }
+        botStormBite(d, dt);
+        if (d.state === 'falling') {
+          d.group.rotation.x = Math.max(-Math.PI / 2, d.group.rotation.x - dt * 6);
+          if (d.group.rotation.x <= -Math.PI / 2) d.state = 'down';
+        } else if (d.state === 'down') {
+          if (d.bots) {
+            releaseField(d.bots);
+            d.bots = undefined;
+          }
+        }
+        return;
+      }
       poseFigure(d, dt);
-      // Harbor patrols ride the streamed terrain mesh (range floor is flat)
+      // Harbor bots ride the streamed terrain mesh (range floor is flat)
       if (terrainOn) d.group.position.y = Math.max(groundAt(d.group.position.x, d.group.position.z), WATER_Y - 0.05);
       d.flash = Math.max(0, d.flash - dt);
       const glow = d.flash > 0 ? 0.8 : 0;
@@ -11875,6 +13118,7 @@ export default function BattleRoyaleGame() {
         }
         if (d.sunlit) d.shield = Math.min(d.shieldMax, d.shield + SUN_REGEN * dt);
       }
+      botStormBite(d, dt);
 
       if (d.state === 'falling') {
         d.group.rotation.x = Math.max(-Math.PI / 2, d.group.rotation.x - dt * 6);
@@ -11916,7 +13160,15 @@ export default function BattleRoyaleGame() {
     const shotDir = new THREE.Vector3();
 
     function updateShooter(d: DummyObject, dt: number) {
-      if (!d.shooter || !d.armed || d.state !== 'up' || playerDown) return;
+      if (!d.shooter || !d.armed || d.state !== 'up' || d.air) return;
+      // BR: a bot hunting another bot fights it directly — this keeps
+      // running even while you spectate (playerDown), which is exactly
+      // how the match resolves after you fall.
+      if (d.ai && d.ai.foe && d.ai.foe !== 'player') {
+        botShootBot(d, d.ai.foe, dt);
+        return;
+      }
+      if (playerDown) return;
       if (d.ai && d.ai.state === 'patrol') return;
       const px = camera.position.x - d.group.position.x;
       const pz = camera.position.z - d.group.position.z;
@@ -12068,6 +13320,7 @@ export default function BattleRoyaleGame() {
         hot: false,
         lootT: 0,
         lootTarget: null as any,
+        foe: null as any, // 'player' | DummyObject — BR hunting target
       };
     }
 
@@ -12076,14 +13329,19 @@ export default function BattleRoyaleGame() {
       if (nearPool(x, z, 2)) return false;
       // Harbor patrols stay ashore: wading into the sea is off-limits
       if (terrainOn && terrainHeight(x, z) < WATER_Y + 0.25) return false;
-      for (const b of solids) {
-        if ((b.bottom ?? 0) > 1.9) continue;
-        if (Math.abs(x - b.x) < b.hx + 0.6 && Math.abs(z - b.z) < b.hz + 0.6) return false;
-      }
-      for (const o of dummies) {
-        if (o !== self && Math.hypot(o.group.position.x - x, o.group.position.z - z) < 1.3) return false;
-      }
-      return true;
+      // grid-fed: 200 bots + a thousand solids never scan the whole map
+      let blocked = false;
+      eachNearSolid(x, z, 3, (b) => {
+        if (blocked || (b.bottom ?? 0) > 1.9) return;
+        if (Math.abs(x - b.x) < b.hx + 0.6 && Math.abs(z - b.z) < b.hz + 0.6) blocked = true;
+      });
+      if (blocked) return false;
+      let squish = false;
+      eachNearDummy(x, z, 3.2, (o) => {
+        if (squish || o === self || o.state !== 'up') return;
+        if (Math.hypot(o.group.position.x - x, o.group.position.z - z) < 1.3) squish = true;
+      });
+      return !squish;
     }
 
     function aiPathClear(d: DummyObject, x1: number, z1: number) {
@@ -12154,17 +13412,17 @@ export default function BattleRoyaleGame() {
       return smokeDist(aiFrom, aiDir, len) === Infinity;
     }
 
-    function aiCover(d: DummyObject) {
+    function aiCover(d: DummyObject, fx: number, fz: number) {
       const p = d.group.position;
       let best: { x: number; z: number } | null = null;
       let bestD = Infinity;
-      for (const b of solids) {
-        if (b.top < 1.8 || (b.bottom ?? 0) > 0.5) continue;
-        if (Math.hypot(b.x - p.x, b.z - p.z) > 16) continue;
-        let ux = b.x - camera.position.x;
-        let uz = b.z - camera.position.z;
+      // grid-fed: only the boxes around this fight
+      eachNearSolid(p.x, p.z, 18, (b) => {
+        if (b.top < 1.8 || (b.bottom ?? 0) > 0.5) return;
+        let ux = b.x - fx;
+        let uz = b.z - fz;
         const l = Math.hypot(ux, uz);
-        if (l < 1e-3) continue;
+        if (l < 1e-3) return;
         ux /= l;
         uz /= l;
         const reach = Math.abs(ux) * b.hx + Math.abs(uz) * b.hz + 1;
@@ -12175,13 +13433,13 @@ export default function BattleRoyaleGame() {
           best = { x, z };
           bestD = cd;
         }
-      }
+      });
       return best;
     }
 
-    function aiRetreat(d: DummyObject) {
+    function aiRetreat(d: DummyObject, fx: number, fz: number) {
       const p = d.group.position;
-      const base = Math.atan2(p.x - camera.position.x, p.z - camera.position.z);
+      const base = Math.atan2(p.x - fx, p.z - fz);
       for (const turn of [0, 0.5, -0.5, 1, -1]) {
         const a = base + turn;
         const x = p.x + Math.sin(a) * 8;
@@ -12297,11 +13555,11 @@ export default function BattleRoyaleGame() {
       return true;
     }
 
-    function aiEngage(d: DummyObject, dt: number) {
+    function aiEngage(d: DummyObject, dt: number, tx: number, tz: number) {
       const a = d.ai;
       const p = d.group.position;
-      const dx = camera.position.x - p.x;
-      const dz = camera.position.z - p.z;
+      const dx = tx - p.x;
+      const dz = tz - p.z;
       const dist = Math.hypot(dx, dz) || 1e-3;
       const fx = dx / dist;
       const fz = dz / dist;
@@ -12344,6 +13602,7 @@ export default function BattleRoyaleGame() {
     function updateAI(d: DummyObject, dt: number) {
       const a = d.ai;
       if (!a) return;
+      if (d.air) return; // riding a chute — no combat until touchdown
       if (d.state !== 'up') {
         Object.assign(a, {
           state: 'patrol',
@@ -12356,15 +13615,30 @@ export default function BattleRoyaleGame() {
           blockedT: 0,
           sees: false,
           lootTarget: null,
+          foe: null,
         });
         a.hpSeen = d.hp;
         a.shieldSeen = d.shield;
         setBody(d, false);
         return;
       }
+      // our foe died — drop the grudge
+      if (a.foe && a.foe !== 'player' && a.foe.state !== 'up') a.foe = null;
       if (d.hp < a.hpSeen - 1e-6 || d.shield < a.shieldSeen - 1e-6) {
-        if (!playerDown) a.lastSeen = { x: camera.position.x, z: camera.position.z };
-        if (a.state === 'patrol') engageNow(d);
+        const k = d.killer;
+        if (brOn && k && k !== 'storm' && k !== 'sea' && k !== 'ground' && k.state === 'up') {
+          // shot by another bot — fight back, forget the player
+          a.foe = k;
+          if (a.state === 'patrol' || a.state === 'zone') {
+            a.state = 'engage';
+            a.lost = 0;
+            d.fireT = Math.max(d.fireT, 0.55);
+          }
+        } else if (!playerDown) {
+          a.lastSeen = { x: camera.position.x, z: camera.position.z };
+          a.foe = 'player';
+          if (a.state === 'patrol') engageNow(d);
+        }
       }
       a.hpSeen = d.hp;
       a.shieldSeen = d.shield;
@@ -12374,10 +13648,57 @@ export default function BattleRoyaleGame() {
       if (a.lookT <= 0) {
         a.lookT = 0.25;
         a.sees = aiSees(d);
-        if (a.sees) a.lastSeen = { x: camera.position.x, z: camera.position.z };
+        if (a.sees && !playerDown) a.lastSeen = { x: camera.position.x, z: camera.position.z };
+        if (brOn) {
+          // hunt the nearest enemy — you OR another bot
+          const nf = aiPickFoe(d);
+          if (nf) {
+            const already = a.foe === nf;
+            a.foe = nf;
+            if (!already && (a.state === 'patrol' || a.state === 'zone')) {
+              a.state = 'engage';
+              a.lost = 0;
+              a.seen = 0;
+              d.fireT = Math.max(d.fireT, 0.45 + Math.random() * 0.3);
+            }
+          }
+        }
       }
       const p = d.group.position;
-      const ang = Math.atan2(camera.position.x - p.x, camera.position.z - p.z);
+      const foePos = a.foe === 'player' || !a.foe ? camera.position : a.foe.group.position;
+      const ang = Math.atan2(foePos.x - p.x, foePos.z - p.z);
+
+      // the storm outranks everything but a live firefight — and a
+      // LETHAL storm (late stages) outranks even that
+      const stormLethal = brOn && brZone.dps >= 14;
+      if (brOn && (stormLethal || (a.state !== 'engage' && a.state !== 'cover')) && outsideZone(p.x, p.z)) {
+        if (a.state !== 'zone' || !a.target || Math.hypot(a.target.x - brZone.cx, a.target.z - brZone.cz) > brZone.r * 0.5) {
+          const inner = Math.max(30, brZone.r * 0.55);
+          const za = Math.random() * Math.PI * 2;
+          const zd = Math.sqrt(Math.random()) * inner;
+          a.state = 'zone';
+          a.target = { x: brZone.cx + Math.sin(za) * zd, z: brZone.cz + Math.cos(za) * zd };
+        }
+      }
+      if (a.state === 'zone') {
+        if (!outsideZone(p.x, p.z)) {
+          a.state = 'patrol';
+          a.idle = 0.2;
+          a.target = null;
+        } else if (a.target) {
+          const r = aiStep(d, a.target.x, a.target.z, AI.run, dt);
+          if (r === 'blocked' || r === 'arrived') {
+            a.state = 'patrol';
+            a.idle = 0.3;
+            a.target = null;
+          }
+        } else {
+          a.state = 'patrol';
+          a.idle = 0.3;
+        }
+        setBody(d, true);
+        return;
+      }
 
       if (a.state === 'patrol') {
         a.seen = a.sees ? a.seen + dt : Math.max(0, a.seen - dt);
@@ -12386,7 +13707,11 @@ export default function BattleRoyaleGame() {
         else if (!updateLootAI(d, dt)) aiWander(d, dt);
       }
       if (a.state === 'engage') {
-        a.lost = a.sees ? 0 : a.lost + dt;
+        // a bot foe keeps the duel alive while it stands nearby; the
+        // player needs actual line of sight
+        const botFoe = a.foe !== 'player' && a.foe ? a.foe : null;
+        const foeVisible = a.sees || (botFoe && Math.hypot(botFoe.group.position.x - p.x, botFoe.group.position.z - p.z) < 55);
+        a.lost = foeVisible ? 0 : a.lost + dt;
         if (a.lost > AI.lost) {
           a.state = 'patrol';
           a.search = a.lastSeen;
@@ -12394,16 +13719,17 @@ export default function BattleRoyaleGame() {
           a.seen = 0;
           a.idle = 0;
           a.lost = 0;
+          a.foe = null;
         } else if (d.hp <= AI.coverAt * d.lifeMax && a.coverCool <= 0) {
-          const spot = aiCover(d) || aiRetreat(d);
+          const spot = aiCover(d, foePos.x, foePos.z) || aiRetreat(d, foePos.x, foePos.z);
           if (spot) {
             a.state = 'cover';
             a.target = spot;
             a.travelT = 6;
             a.blockedT = 0;
             a.hideT = AI.hide;
-          } else aiEngage(d, dt);
-        } else aiEngage(d, dt);
+          } else aiEngage(d, dt, foePos.x, foePos.z);
+        } else aiEngage(d, dt, foePos.x, foePos.z);
       }
       if (a.state === 'cover') {
         if (a.target) {
@@ -12436,6 +13762,8 @@ export default function BattleRoyaleGame() {
         placed += 1;
       }
     }
+    // (spawnRangeBots owns the statics + showcase boot; the 3 AI duelers
+    // spawn HERE — AI_DUMMIES and friends are consts initialized above)
     spawnAIDummies();
 
     // ----------------------------------------------------
@@ -12449,12 +13777,27 @@ export default function BattleRoyaleGame() {
       updateMicrobots(dt); // the swarm orbits player + dummies, runs tasks
       updatePendingBuilds(dt); // timed construction: ghosts print into pieces
       updateRockets(dt); // rocket launcher rounds fly + detonate
+      updateBr(dt); // BR heartbeat: drones, storm, alive pool, LOD
+      // Spatial grids feed aiFree/aiCover in BOTH modes — range too
+      brGridT -= dt;
+      if (brGridT <= 0) {
+        brGridT = 0.45;
+        rebuildDummyGrid();
+        rebuildSolidGrid();
+        if (brOn) {
+          refreshBotLod();
+          gateBotFields();
+        }
+      }
       if (playerDown) {
-        respawnT -= dt;
-        if (respawnT <= 0) respawn();
+        if (!brOn) {
+          respawnT -= dt;
+          if (respawnT <= 0) respawn();
+        }
         for (const d of dummies) {
           updateDummy(d, dt);
           updateAI(d, dt);
+          if (brOn) updateShooter(d, dt); // bot-vs-bot keeps resolving behind the end card
         }
         updateTurret(dt);
         updateGrenades(dt);
@@ -12473,10 +13816,21 @@ export default function BattleRoyaleGame() {
       } else {
         autoShoot();
       }
-      for (const d of dummies) {
-        updateDummy(d, dt);
-        updateAI(d, dt);
-        updateShooter(d, dt);
+      // 200 combatants: near bots think every frame, far bots on a
+      // 1/4 cadence with a 4x step (dt-scaled logic keeps the pace)
+      const heavy = brOn && dummies.length > 30;
+      for (let i = 0; i < dummies.length; i++) {
+        const d = dummies[i];
+        if (!heavy || d.lod !== 0) {
+          updateDummy(d, dt);
+          updateAI(d, dt);
+          updateShooter(d, dt);
+        } else if ((brFrameNo + (d.tick ?? 0)) % 4 === 0) {
+          const dt4 = dt * 4;
+          updateDummy(d, dt4);
+          updateAI(d, dt4);
+          updateShooter(d, dt4);
+        }
       }
       updateTurret(dt);
       updateAntenna(dt);
@@ -12583,9 +13937,10 @@ export default function BattleRoyaleGame() {
         <kbd className="minimap-key">M</kbd>
       </div>
 
-      {/* Top HUD: Downs and credits */}
+      {/* Top HUD: Downs/Kills and credits */}
       <div className="hud downs">
-        Downs<span id="downs">0</span>
+        <span id="downsLabel">Downs</span>
+        <span id="downs">0</span>
         <span className="credits">
           &middot; <b id="credits">300</b> cr
         </span>
@@ -12593,6 +13948,14 @@ export default function BattleRoyaleGame() {
           Inventory
         </span>
       </div>
+
+      {/* Battle Royale HUD: alive pool, storm clock, kill feed, drop prompt */}
+      <div className="hud br-alive" id="aliveChip">
+        ALIVE <b id="aliveNum">200</b>
+      </div>
+      <div className="hud zonechip" id="zoneChip" />
+      <div className="hud killfeed" id="killFeed" aria-live="polite" />
+      <div className="hud dropprompt" id="dropPrompt" hidden />
 
       {/* Vitals HUD */}
       <div className="hud vitals" aria-label="Shield and life">
@@ -12645,6 +14008,20 @@ export default function BattleRoyaleGame() {
           <div className="downed-sub">
             Respawning in <span id="downedTimer">3</span>
           </div>
+        </div>
+      </div>
+
+      {/* Battle Royale end card — victory / placement */}
+      <div className="overlay br-end" id="brEnd" hidden>
+        <div className="card br-card">
+          <div className="br-end-title" id="brEndTitle">
+            #1 — VICTORY
+          </div>
+          <div className="br-end-sub" id="brEndSub" />
+          <div className="br-end-stats" id="brEndStats" />
+          <button type="button" className="btn play" id="brEndBtn">
+            Return to menu
+          </button>
         </div>
       </div>
 
@@ -13275,7 +14652,7 @@ export default function BattleRoyaleGame() {
                 </button>
                 <button className="mode" type="button" role="radio" aria-checked="false" data-mode="harbor">
                   <span className="mode-name">Harbor</span>
-                  <span className="mode-tag">Naval Basin</span>
+                  <span className="mode-tag">Battle Royale</span>
                 </button>
                 <button className="mode" type="button" role="radio" aria-checked="false" data-mode="quarry" disabled>
                   <span className="mode-name">Quarry</span>

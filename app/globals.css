@@ -2532,3 +2532,144 @@ body.touch .minimap-key {
     height: min(88vw, 420px);
   }
 }
+
+/* ================= Battle Royale HUD ================= */
+/* Alive pool — top centre */
+.br-alive {
+  top: 14px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: none;
+  padding: 7px 14px;
+  font: 800 0.78rem/1 var(--font-display);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  border: 1px solid rgba(148, 163, 184, 0.28);
+}
+.br-alive b {
+  margin-left: 7px;
+  font-size: 1.25rem;
+  color: #7dd3fc;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Storm clock — under the alive pool */
+.zonechip {
+  top: 54px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: none;
+  padding: 4px 11px;
+  font: 700 0.68rem/1 var(--font-display);
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+  color: #c4b5fd;
+  border: 1px solid rgba(139, 92, 246, 0.42);
+}
+.zonechip.closing {
+  color: #fecaca;
+  border-color: rgba(248, 113, 113, 0.6);
+  animation: low-pulse 1.05s ease-in-out infinite;
+}
+
+/* Kill feed — right edge, newest on top */
+.killfeed {
+  display: none;
+  top: 112px;
+  right: 14px;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 5px;
+  background: none;
+  border-radius: 0;
+  padding: 0;
+}
+.kf {
+  background: rgba(9, 13, 20, 0.78);
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  border-left: 3px solid #f43f5e;
+  border-radius: 8px;
+  padding: 5px 11px;
+  font: 600 0.74rem/1.2 var(--font-body);
+  color: #e2e8f0;
+  white-space: nowrap;
+  animation: kf-in 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+}
+.kf b { color: #7dd3fc; }
+@keyframes kf-in {
+  from { opacity: 0; transform: translateX(26px); }
+  to { opacity: 1; transform: none; }
+}
+
+/* Skydive prompt — bottom centre, tap-able on mobile */
+.dropprompt {
+  display: block;
+  bottom: 17%;
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 11px 24px;
+  font: 800 1rem/1 var(--font-display);
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+  color: #fde68a;
+  background: rgba(9, 13, 20, 0.82);
+  border: 1px solid rgba(253, 230, 138, 0.45);
+  pointer-events: auto;
+  animation: deploy-breathe 1.7s ease-in-out infinite;
+}
+.dropprompt[hidden] { display: none; }
+.dropprompt b {
+  font-size: 1.28rem;
+  color: #ffffff;
+  font-variant-numeric: tabular-nums;
+}
+
+/* BR mode toggles the chips on and the respawn card off */
+body.br .br-alive { display: block; }
+body.br .zonechip { display: block; }
+body.br .killfeed { display: flex; }
+body.br .downed { display: none; }
+
+/* BR end card — victory gold / placement */
+.br-end { z-index: 320; }
+.br-end .br-card {
+  text-align: center;
+  padding: 34px 46px;
+}
+.br-end-title {
+  font: 900 2.3rem/1.1 var(--font-display);
+  letter-spacing: 0.04em;
+  background: linear-gradient(92deg, #fde68a, #f59e0b 55%, #fbbf24);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+.br-end-sub {
+  margin: 10px 0 4px;
+  font: 500 0.95rem/1.45 var(--font-body);
+  color: #cbd5e1;
+}
+.br-end-stats {
+  margin: 8px 0 20px;
+  font: 700 1rem/1 var(--font-display);
+  color: #e2e8f0;
+}
+.br-end-stats b { color: #7dd3fc; }
+.br-end .btn.play { margin: 0 auto; }
+
+@media (max-width: 640px) {
+  .br-alive { top: 10px; padding: 5px 10px; }
+  .br-alive b { font-size: 1.05rem; }
+  .zonechip { top: 44px; }
+  .killfeed { top: 96px; right: 10px; }
+  .kf { font-size: 0.66rem; padding: 4px 9px; }
+  .dropprompt { font-size: 0.85rem; padding: 9px 16px; }
+  .br-end .br-card { padding: 24px 22px; }
+  .br-end-title { font-size: 1.5rem; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .kf,
+  .dropprompt,
+  .zonechip.closing { animation: none; }
+}
