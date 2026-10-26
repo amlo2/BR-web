@@ -101,8 +101,8 @@ canvas#game {
 }
 
 .downs {
-  top: 68px; /* below the top compass strip so neither blocks the other */
-  left: 16px;
+  top: 16px; /* right of the fullscreen corner button */
+  left: 68px;
   padding: 6px 10px;
   font: 800 0.8rem/1 var(--font-display);
   letter-spacing: 0.08em;
@@ -122,7 +122,7 @@ canvas#game {
 }
 
 .hint {
-  top: 68px; /* below the compass strip, aligned with the Downs plate */
+  top: 16px;
   right: 16px;
   font: 500 0.85rem/1.3 var(--font-body);
   max-width: 480px;
@@ -299,7 +299,7 @@ body.aiming .crosshair {
 }
 
 .vitals {
-  top: 108px; /* tucked under the Downs plate, clear of the compass */
+  top: 60px; /* tucked under the Downs plate */
   left: 16px;
   width: min(200px, calc(100vw - 32px));
   padding: 7px 9px;
@@ -537,15 +537,14 @@ body.aiming .crosshair {
 
 body:not(.touch) .touch-ui { display: none; }
 body.touch .ammo {
-  top: 16px;
-  right: 16px;
+  /* right column: ability button (top) -> minimap -> ammo plate */
+  top: calc(240px + env(safe-area-inset-top, 0px));
+  right: 14px;
   bottom: auto;
   max-width: 170px;
 }
 
-@media (orientation: portrait) {
-  body.touch .ammo { top: 166px; }
-}
+
 
 body.touch .hint { display: none; }
 
@@ -661,47 +660,6 @@ body.touch .hint { display: none; }
 
 .tracker[data-state="on"] .tracker-dir { display: none; }
 
-.pick {
-  position: fixed;
-  z-index: 1;
-  pointer-events: none;
-  right: calc(32px + env(safe-area-inset-right, 0px));
-  bottom: calc(212px + env(safe-area-inset-bottom, 0px));
-  width: 104px;
-  height: 56px;
-  border-radius: 14px;
-  display: grid;
-  place-content: center;
-  justify-items: center;
-  gap: 3px;
-  background: var(--accent);
-  color: var(--on-accent);
-  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
-  transition: transform 0.06s, opacity 0.15s;
-}
-
-.pick.off {
-  background: var(--hud);
-  color: var(--hud-ink);
-  opacity: 0.35;
-  box-shadow: none;
-}
-
-.pick.is-pressed { transform: scale(0.94); }
-
-.pick-label {
-  font: 800 0.95rem/1 var(--font-display);
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-}
-
-.pick-name {
-  font: 600 0.62rem/1 var(--font-body);
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  opacity: 0.9;
-  white-space: nowrap;
-}
 
 .slots {
   position: fixed;
@@ -1626,7 +1584,6 @@ body:not(.touch) .touch-only, body.touch .keys-only { display: none; }
 /* --- HUD entrance on every deploy --- */
 @keyframes hud-l { from { opacity: 0; transform: translateX(-30px); } to { opacity: 1; transform: none; } }
 @keyframes hud-r { from { opacity: 0; transform: translateX(30px); } to { opacity: 1; transform: none; } }
-@keyframes compass-in { from { opacity: 0; transform: translate(-50%, -16px); } to { opacity: 1; transform: translate(-50%, 0); } }
 
 body.playing .hud.downs { animation: hud-l 0.55s cubic-bezier(0.16, 1, 0.3, 1) 0.08s backwards; }
 body.playing .hud.vitals { animation: hud-l 0.55s cubic-bezier(0.16, 1, 0.3, 1) 0.16s backwards; }
@@ -1637,7 +1594,8 @@ body.playing .hud.hint { animation: hud-r 0.55s cubic-bezier(0.16, 1, 0.3, 1) 0.
 body.playing .hud.minimap { animation: hud-r 0.55s cubic-bezier(0.16, 1, 0.3, 1) 0.14s backwards; }
 body.playing .slots { animation: hud-r 0.55s cubic-bezier(0.16, 1, 0.3, 1) 0.24s backwards; }
 body.playing .hud.ammo { animation: hud-r 0.55s cubic-bezier(0.16, 1, 0.3, 1) 0.3s backwards; }
-body.playing .hud.compass { animation: compass-in 0.55s cubic-bezier(0.16, 1, 0.3, 1) backwards; }
+body.playing .gbtn { animation: hud-r 0.55s cubic-bezier(0.16, 1, 0.3, 1) 0.12s backwards; }
+body.playing .touch-build { animation: hud-l 0.55s cubic-bezier(0.16, 1, 0.3, 1) 0.2s backwards; }
 
 /* --- Live HUD feedback --- */
 @keyframes pop-scale {
@@ -1778,8 +1736,10 @@ body.reloading .ammo .count { animation: reload-pulse 0.9s ease-in-out infinite;
   position: fixed;
   z-index: 1;
   pointer-events: none;
-  left: calc(176px + env(safe-area-inset-left, 0px));
-  bottom: calc(20px + env(safe-area-inset-bottom, 0px));
+  /* Portrait overhaul: the grenade/ability button owns the top-right
+     corner (was bottom-left) — clears the joystick cluster entirely. */
+  top: calc(14px + env(safe-area-inset-top, 0px));
+  right: calc(14px + env(safe-area-inset-right, 0px));
   width: 72px;
   height: 72px;
   border-radius: 50%;
@@ -1878,12 +1838,7 @@ body.reloading .ammo .count { animation: reload-pulse 0.9s ease-in-out infinite;
 body:not(.touch) .gbtn, body:not(.touch) .inventorybtn { display: none; }
 body.touch .gplate { display: none; }
 
-@media (orientation: portrait) {
-  body.touch .gbtn {
-    left: calc(20px + env(safe-area-inset-left, 0px));
-    bottom: calc(164px + env(safe-area-inset-bottom, 0px));
-  }
-}
+
 
 .gplate {
   left: 16px;
@@ -1898,27 +1853,6 @@ body.touch .gplate { display: none; }
   letter-spacing: 0.04em;
 }
 
-/* ---------- Wood purse (build material) ---------- */
-/* Stacks above the grenade plate on desktop; pinned below the minimap
-   on touch (the grenade plate itself is desktop-only). */
-.woodplate {
-  bottom: 150px;
-  min-width: 118px;
-  border-left: 3px solid #b5813f;
-}
-
-.woodplate .t-state {
-  color: #d9a05b;
-}
-
-body.touch .woodplate {
-  display: grid;
-  left: auto;
-  right: calc(16px + env(safe-area-inset-right, 0px));
-  bottom: auto;
-  top: 296px;
-  min-width: 92px;
-}
 
 .smoke-fx {
   position: fixed;
@@ -1957,11 +1891,17 @@ body.touch .woodplate {
 .inventory-head h1 { margin: 0; }
 
 .inventory-cr {
+  display: flex;
+  gap: 18px;
+  align-items: flex-end;
   font: 800 1.7rem/1 var(--font-display);
   letter-spacing: 0.03em;
   font-variant-numeric: tabular-nums;
   text-align: right;
 }
+
+/* The wood purse moved here from the HUD plate */
+.inventory-wood span { color: #d9a05b; }
 
 .inventory-cr small {
   display: block;
@@ -2122,8 +2062,11 @@ body.touch .woodplate {
 
 .touch-build {
   position: fixed;
-  left: calc(20px + env(safe-area-inset-left, 0px));
-  bottom: calc(236px + env(safe-area-inset-bottom, 0px));
+  /* Portrait overhaul: build button sits top-left under the fullscreen
+     toggle (was bottom-left above the joystick). */
+  left: calc(14px + env(safe-area-inset-left, 0px));
+  top: calc(62px + env(safe-area-inset-top, 0px));
+  bottom: auto;
   width: 54px;
   height: 54px;
   border-radius: 50%;
@@ -2159,200 +2102,6 @@ body.touch .woodplate {
 body.touch .build-plate { display: none; }
 body:not(.touch) .touch-build { display: none; }
 
-/* ---------------------------------------------------------------
-   Top compass: scrolling N/E/S/W strip + harbor landmark chips
-   --------------------------------------------------------------- */
-.compass {
-  top: 12px;
-  left: 50%;
-  transform: translateX(-50%);
-  width: min(440px, 44vw);
-  padding: 0;
-  overflow: hidden;
-}
-
-.compass-window {
-  position: relative;
-  height: 48px;
-  overflow: hidden;
-}
-
-.compass-strip {
-  position: absolute;
-  top: 4px;
-  left: 0;
-  height: 40px;
-  width: 4320px;
-  will-change: transform;
-}
-
-.compass-tick {
-  position: absolute;
-  bottom: 6px;
-  width: 1px;
-  height: 6px;
-  background: rgba(245, 247, 250, 0.38);
-}
-
-.compass-tick.mid {
-  height: 8px;
-  background: rgba(245, 247, 250, 0.6);
-}
-
-.compass-tick.major {
-  width: 2px;
-  height: 11px;
-  background: var(--hud-ink);
-}
-
-.compass-card {
-  position: absolute;
-  top: 2px;
-  transform: translateX(-50%);
-  font: 800 0.92rem/1 var(--font-display);
-  letter-spacing: 0.05em;
-  color: var(--hud-ink);
-  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.55);
-}
-
-.compass-card.minor {
-  font-size: 0.7rem;
-  opacity: 0.75;
-  letter-spacing: 0.02em;
-}
-
-.compass-card.n { color: var(--danger); }
-
-.compass-caret {
-  position: absolute;
-  top: 0;
-  left: 50%;
-  width: 0;
-  height: 0;
-  margin-left: -5px;
-  border-left: 5px solid transparent;
-  border-right: 5px solid transparent;
-  border-top: 6px solid var(--accent);
-  z-index: 2;
-}
-
-.compass-deg {
-  position: absolute;
-  bottom: 3px;
-  left: 50%;
-  transform: translateX(-50%);
-  font: 700 0.66rem/1 var(--font-body);
-  letter-spacing: 0.08em;
-  color: var(--accent);
-  font-variant-numeric: tabular-nums;
-  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.7);
-  z-index: 2;
-}
-
-.compass-marks {
-  position: absolute;
-  inset: 0;
-  pointer-events: none;
-  z-index: 3;
-}
-
-.compass-mark {
-  position: absolute;
-  top: 12px;
-  left: 50%;
-  display: grid;
-  justify-items: center;
-  gap: 1px;
-  padding: 2px 6px 1px;
-  border-radius: 6px;
-  background: rgba(6, 9, 14, 0.66);
-  border: 1px solid rgba(245, 247, 250, 0.25);
-  white-space: nowrap;
-  will-change: transform;
-}
-
-.compass-mark b {
-  font: 800 0.68rem/1 var(--font-display);
-  letter-spacing: 0.1em;
-}
-
-.compass-mark small {
-  font: 600 0.58rem/1 var(--font-body);
-  opacity: 0.8;
-  font-variant-numeric: tabular-nums;
-}
-
-.compass-mark.c-pier { border-color: rgba(231, 192, 122, 0.55); }
-.compass-mark.c-pier b { color: #e7c07a; }
-.compass-mark.c-yard { border-color: rgba(230, 135, 60, 0.55); }
-.compass-mark.c-yard b { color: #e6873c; }
-.compass-mark.c-crane { border-color: rgba(157, 184, 214, 0.55); }
-.compass-mark.c-crane b { color: #9db8d6; }
-.compass-mark.c-whse { border-color: rgba(103, 232, 249, 0.55); }
-.compass-mark.c-whse b { color: #67e8f9; }
-.compass-mark.c-dock { border-color: rgba(163, 177, 138, 0.6); }
-.compass-mark.c-dock b { color: #a3b18a; }
-.compass-mark.c-light { border-color: rgba(252, 211, 77, 0.6); }
-.compass-mark.c-light b { color: #fcd34d; }
-.compass-mark.c-vill { border-color: rgba(224, 176, 137, 0.6); }
-.compass-mark.c-vill b { color: #e0b089; }
-.compass-mark.c-farm { border-color: rgba(200, 180, 94, 0.6); }
-.compass-mark.c-farm b { color: #c8b45e; }
-.compass-mark.c-fuel { border-color: rgba(224, 94, 94, 0.6); }
-.compass-mark.c-fuel b { color: #e05e5e; }
-.compass-mark.c-site { border-color: rgba(245, 162, 93, 0.6); }
-.compass-mark.c-site b { color: #f5a25d; }
-.compass-mark.c-camp { border-color: rgba(127, 196, 127, 0.6); }
-.compass-mark.c-camp b { color: #7fc47f; }
-.compass-mark.c-mast { border-color: rgba(180, 140, 224, 0.6); }
-.compass-mark.c-mast b { color: #b48ce0; }
-.compass-mark.c-ruin { border-color: rgba(168, 159, 148, 0.6); }
-.compass-mark.c-ruin b { color: #a89f94; }
-.compass-mark.c-outp { border-color: rgba(127, 178, 217, 0.6); }
-.compass-mark.c-outp b { color: #7fb2d9; }
-.compass-mark.c-tow { border-color: rgba(94, 207, 201, 0.6); }
-.compass-mark.c-tow b { color: #5ecfc9; }
-.compass-mark.c-vtow { border-color: rgba(244, 114, 182, 0.6); }
-.compass-mark.c-vtow b { color: #f472b6; }
-.compass-mark.c-ship { border-color: rgba(239, 68, 68, 0.65); }
-.compass-mark.c-ship b { color: #ef4444; }
-
-/* Off-screen landmarks go compact: label only, no distance row */
-.compass-mark.pinned {
-  padding: 3px 5px;
-}
-
-.compass-mark.pinned small {
-  display: none;
-}
-
-.compass-mark.pinned b {
-  font-size: 0.58rem;
-  letter-spacing: 0.05em;
-}
-
-/* Pinned to the strip edge: the target is off-screen — turn that way */
-.compass-mark.pin-l::before,
-.compass-mark.pin-r::after {
-  font: 800 0.7rem/1 var(--font-display);
-  color: var(--hud-ink);
-  opacity: 0.9;
-}
-
-.compass-mark.pin-l::before {
-  content: "\2039";
-  margin-right: 3px;
-}
-
-.compass-mark.pin-r::after {
-  content: "\203a";
-  margin-left: 3px;
-}
-
-body.touch .compass {
-  top: calc(8px + env(safe-area-inset-top, 0px));
-  width: min(440px, 72vw);
-}
 
 /* ---------- Antenna character: minimap + tactical map ---------- */
 .minimap {
@@ -2402,8 +2151,8 @@ body.touch .compass {
 }
 
 body.touch .minimap {
-  top: 76px;
-  right: 12px;
+  top: calc(90px + env(safe-area-inset-top, 0px));
+  right: 14px;
   padding: 6px;
 }
 
@@ -2575,7 +2324,7 @@ body.touch .minimap-key {
 /* Kill feed — right edge, newest on top */
 .killfeed {
   display: none;
-  top: 112px;
+  top: 292px; /* below the antenna minimap (top 92 + 176 canvas) */
   right: 14px;
   flex-direction: column;
   align-items: flex-end;
@@ -2672,4 +2421,84 @@ body.br .downed { display: none; }
   .kf,
   .dropprompt,
   .zonechip.closing { animation: none; }
+}
+
+/* ----------------------------------------------------
+   Portrait HUD overhaul (Task K):
+   - compass strip removed; minimap (antenna) is the only nav
+   - pick-up button removed — tap the item itself (mobile)
+   - wood purse lives in the Inventory sheet
+   - ability button top-right, build button top-left
+   - right column: ability -> minimap -> ammo; kill feed left
+   ---------------------------------------------------- */
+body.touch .downs {
+  /* clears the fullscreen button + build button that own the corner */
+  left: calc(126px + env(safe-area-inset-left, 0px));
+  top: calc(16px + env(safe-area-inset-top, 0px));
+}
+
+body.touch .vitals {
+  /* below the build button (fsBtn 14-58, build 62-116) */
+  left: calc(14px + env(safe-area-inset-left, 0px));
+  top: calc(128px + env(safe-area-inset-top, 0px));
+}
+
+/* BR chips slot under the top row on touch screens */
+body.touch .br-alive { top: calc(54px + env(safe-area-inset-top, 0px)); }
+body.touch .zonechip { top: calc(94px + env(safe-area-inset-top, 0px)); }
+
+/* Kill feed moves to the LEFT column on touch — the right edge is
+   the minimap + ammo stack now. Height-capped, oldest clip away. */
+body.touch .killfeed {
+  left: calc(14px + env(safe-area-inset-left, 0px));
+  right: auto;
+  top: calc(252px + env(safe-area-inset-top, 0px));
+  align-items: flex-start;
+  max-height: calc(100dvh - 268px);
+  overflow: hidden;
+}
+body.touch .kf {
+  border-left: none;
+  border-right: 3px solid #f43f5e;
+  animation-name: kf-in-left;
+}
+@keyframes kf-in-left {
+  from { opacity: 0; transform: translateX(-26px); }
+  to { opacity: 1; transform: none; }
+}
+
+/* Portrait phones: a smaller minimap disc clears the zone chip */
+@media (orientation: portrait) {
+  body.touch .minimap canvas { width: 96px; height: 96px; }
+}
+
+/* Desktop keeps the F key for offers — a small chip under the crosshair.
+   Mobile never sees it: taps pick the item up directly. */
+.pickhint {
+  top: calc(50% + 52px);
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 5px 12px;
+  border-radius: 999px;
+  background: var(--hud);
+  border: 1px solid rgba(56, 189, 248, 0.5);
+  color: #7dd3fc;
+  font: 700 0.72rem/1 var(--font-body);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+body.touch .pickhint { display: none; }
+
+/* Grenade sheet opens DOWNWARD from the top-right button */
+.gpick.below { flex-direction: column; }
+
+/* Portrait ammo plate: the fire-mode segment keeps its full labels
+   ("AUTO" / "MANUAL") inside the narrow right column */
+@media (max-width: 480px) {
+  body.touch .fire-mode-btn {
+    font-size: 0.54rem;
+    letter-spacing: 0.02em;
+    padding: 2px 4px;
+  }
 }

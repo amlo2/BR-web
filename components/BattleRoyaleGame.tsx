@@ -72,8 +72,7 @@ export default function BattleRoyaleGame() {
     });
     const sliderEl = $('slider');
     const sliderKnobEl = $('sliderKnob');
-    const pickBtn = $('pick');
-    const pickNameEl = $('pickName');
+    const pickHintEl = $('pickHint');
     const shieldRow = $('shieldRow');
     const shieldFill = $('shieldFill');
     const lifeFill = $('lifeFill');
@@ -1531,16 +1530,13 @@ export default function BattleRoyaleGame() {
     const PIECE_COST: Record<string, number> = { wall: 10, door: 12, floor: 10, ramp: 10, ladder: 15 };
 
     function refreshWood() {
-      const el = $('woodCount');
+      // The wood purse lives in the Inventory sheet now — the old
+      // top-right HUD plate crowded portrait screens.
+      const el = $('inventoryWood');
       if (el) {
         const txt = String(Math.floor(woodRes));
-        if (el.textContent !== txt) {
-          el.textContent = txt;
-          popEl(el);
-        }
+        if (el.textContent !== txt) el.textContent = txt;
       }
-      const plate = $('woodPlate');
-      if (plate) plate.hidden = !terrainOn;
     }
 
     function grantWood(n: number, at?: THREE.Vector3) {
@@ -3649,6 +3645,10 @@ export default function BattleRoyaleGame() {
       killer?: any; // DummyObject | 'storm' | 'sea' | 'ground'
       lod?: 0 | 1; // 1 = full IK figure, 0 = far instanced silhouette
       tick?: number; // stagger bucket for far-tier updates
+      devourT?: number; // 3.5 s corpse-devour countdown (permanent deaths)
+      worms?: THREE.Group | null; // devour swarm visual, near tier only
+      consumed?: boolean; // corpse un-rendered — zero render / memory cost
+      mats?: THREE.Material[]; // per-figure unique materials, freed on devour end
     }
     const dummies: DummyObject[] = [];
     const spots: Array<{ x: number; z: number }> = [];
@@ -3909,6 +3909,7 @@ export default function BattleRoyaleGame() {
         return m;
       };
       d.bodyMat = bodyMat;
+      d.mats = [bodyMat, jointMat, headMat]; // freed when the worms finish
       d.gait = 0;
       d.walkAmp = 0;
       d.lastX = d.group.position.x;
@@ -5025,10 +5026,12 @@ export default function BattleRoyaleGame() {
     // Clearing radius around the port — no vegetation and no POIs inside
     // it. planHarbor grows it to cover the whole platform footprint.
     let portClearR = 330;
-    // Landmark chips the top compass tracks in Harbor mode. buildHarbor
-    // swaps in a fresh array each entry; the compass reconfigures on change.
+    // Landmark chips the minimap + tactical map track in Harbor mode.
+    // buildHarbor swaps in a fresh array each entry; both maps redraw
+    // it. (The compass strip is gone — portrait HUD overhaul.)
     type HarborMark = { x: number; z: number; label: string; cls: string };
     let harborMarks: HarborMark[] = [];
+    const COMPASS_CARD8 = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW']; // bearing names for the debug hook
 
     function clearHarbor() {
       harborGroup.traverse((o: any) => {
@@ -7667,7 +7670,7 @@ export default function BattleRoyaleGame() {
       const cx = camera.position.x;
       const cz = camera.position.z;
       for (const d of dummies) {
-        if (!d.ai) continue; // range figures always full
+        if (!d.ai || d.consumed) continue; // range figures always full; devoured corpses stay gone
         const dd = (d.group.position.x - cx) ** 2 + (d.group.position.z - cz) ** 2;
         d.lod = dd < BR_LOD2 ? 1 : 0;
         d.group.visible = d.lod === 1;
@@ -7690,7 +7693,7 @@ export default function BattleRoyaleGame() {
           brCol.setHex(d.charColor ?? 0x9aa4b2);
           brFar.setColorAt(fi, brCol);
           fi++;
-        } else if (d.state !== 'up' && d.lod === 0 && ci < 220) {
+        } else if (d.state !== 'up' && !d.consumed && d.lod === 0 && ci < 220) {
           brE.set(Math.PI / 2, d.group.rotation.y, 0);
           brQ.setFromEuler(brE);
           brM4.compose(brV.set(p.x, p.y + 0.4, p.z), brQ, brS);
@@ -7879,163 +7882,6 @@ export default function BattleRoyaleGame() {
       rebuildDummyGrid();
     }
 
-    // ----------------------------------------------------
-    // Top compass: a scrolling N/E/S/W strip at the top of the
-    // HUD that tracks the camera yaw. In Harbor mode it also
-    // carries landmark chips (PIER / YARD / CRANE / WHSE) with
-    // live bearing and distance, so the facilities are easy to
-    // find. Chips pin to the strip edge (with ‹ › arrows) when
-    // the landmark is off-screen — turn that way to reach it.
-    // ----------------------------------------------------
-    const compassEl = $('compass');
-    const compassWin = $('compassWindow');
-    const compassStrip = $('compassStrip');
-    const compassMarksEl = $('compassMarks');
-    const compassDegEl = $('compassDeg');
-    const COMPASS_PX = 4; // pixels per degree of bearing
-    const COMPASS_PERIOD = 360 * COMPASS_PX; // one full ring of the strip
-    const CARD8 = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
-
-    if (compassStrip) {
-      // Three copies of the tick ring so the strip can scroll through
-      // the 0/360 seam without ever showing a gap.
-      for (let copy = 0; copy < 3; copy++) {
-        for (let d = 0; d < 360; d += 15) {
-          const x = copy * COMPASS_PERIOD + d * COMPASS_PX;
-          const tick = document.createElement('i');
-          tick.className = 'compass-tick' + (d % 90 === 0 ? ' major' : d % 45 === 0 ? ' mid' : '');
-          tick.style.left = x + 'px';
-          compassStrip.appendChild(tick);
-          if (d % 45 === 0) {
-            const card = document.createElement('b');
-            const name = CARD8[d / 45];
-            card.className = 'compass-card' + (d % 90 === 0 ? '' : ' minor') + (name === 'N' ? ' n' : '');
-            card.textContent = name;
-            card.style.left = x + 'px';
-            compassStrip.appendChild(card);
-          }
-        }
-      }
-    }
-
-    // Up to six landmark chips, reconfigured to the NEAREST marks
-    // whenever the set changes or the player travels 40+ m — with the
-    // port complex and every POI carrying a chip, the closest six are
-    // always the ones worth navigating by.
-    const compassChips: HTMLSpanElement[] = [];
-    if (compassMarksEl) {
-      for (let i = 0; i < 6; i++) {
-        const chip = document.createElement('span');
-        chip.className = 'compass-mark';
-        chip.style.display = 'none';
-        const lbl = document.createElement('b');
-        const dist = document.createElement('small');
-        chip.appendChild(lbl);
-        chip.appendChild(dist);
-        compassMarksEl.appendChild(chip);
-        compassChips.push(chip);
-      }
-    }
-    let compassChipsFor: HarborMark[] | null = null;
-    let compassSelFor: HarborMark[] | null = null;
-    let compassSelPx = NaN;
-    let compassSelPz = NaN;
-    let compassSel: HarborMark[] = [];
-
-    function compassSelection(): HarborMark[] {
-      const p = camera.position;
-      if (harborMarks !== compassSelFor || Math.hypot(p.x - compassSelPx, p.z - compassSelPz) > 40) {
-        compassSelFor = harborMarks;
-        compassSelPx = p.x;
-        compassSelPz = p.z;
-        compassSel = harborMarks
-          .map((m) => ({ m, d: Math.hypot(m.x - p.x, m.z - p.z) }))
-          .sort((a, b) => a.d - b.d)
-          .slice(0, compassChips.length)
-          .map((q) => q.m);
-      }
-      return compassSel;
-    }
-
-    function updateCompass() {
-      if (!compassEl || !compassWin || !compassStrip) return;
-      if (!running()) {
-        if (!compassEl.hidden) compassEl.hidden = true; // menu / pause / inventory
-        return;
-      }
-      if (compassEl.hidden) compassEl.hidden = false;
-      const w = compassWin.clientWidth || 1;
-      // Yaw 0 faces -Z (north); turning right lowers yaw, so compass
-      // bearing is -yaw wrapped to 0..360 (N -> E -> S -> W clockwise).
-      const bearing = (((-yaw * 180) / Math.PI) % 360 + 360) % 360;
-      compassStrip.style.transform = `translateX(${w / 2 - (COMPASS_PERIOD + bearing * COMPASS_PX)}px)`;
-      if (compassDegEl) {
-        const txt = `${CARD8[Math.round(bearing / 45) % 8]} ${Math.round(bearing)}\u00b0`;
-        if (compassDegEl.textContent !== txt) compassDegEl.textContent = txt;
-      }
-      const sel = compassSelection();
-      if (sel !== compassChipsFor) {
-        compassChipsFor = sel;
-        for (let i = 0; i < compassChips.length; i++) {
-          const chip = compassChips[i];
-          const m = sel[i];
-          chip.style.display = m ? '' : 'none';
-          if (!m) continue;
-          chip.className = 'compass-mark ' + m.cls;
-          const lbl = chip.querySelector('b');
-          if (lbl) lbl.textContent = m.label;
-        }
-      }
-      if (!compassChips.length) return;
-      const maxOff = w / 2 - 26;
-      const p = camera.position;
-      // Chip half-widths, read once per frame (single reflow).
-      const hws = compassChips.map((c) => (c.offsetWidth || 36) / 2);
-      const placed: { c: number; hw: number }[] = [];
-      for (let i = 0; i < compassChips.length; i++) {
-        const chip = compassChips[i];
-        const m = sel[i];
-        if (!m) continue;
-        const hw = hws[i];
-        const dx = m.x - p.x;
-        const dz = m.z - p.z;
-        const dist = Math.round(Math.hypot(dx, dz));
-        const rel = (((Math.atan2(dx, -dz) * 180) / Math.PI - bearing + 540) % 360) - 180;
-        const relPx = rel * COMPASS_PX;
-        const offScreen = relPx < -maxOff || relPx > maxOff;
-        let off = Math.max(-maxOff, Math.min(maxOff, relPx));
-        // Landmarks that share a bearing fan out along the strip so chips
-        // never overlap: the first chip keeps the exact bearing, later
-        // ones step toward the strip centre by measured chip width.
-        const collide = (x: number) => placed.some((q) => Math.abs(x - q.c) < hw + q.hw + 14);
-        if (collide(off)) {
-          const dir = off >= 0 ? -1 : 1;
-          const step = hw * 2 + 14;
-          const tryFan = (allowCross: boolean) => {
-            let c = off;
-            for (let t = 0; t < 8; t++) {
-              c += dir * step;
-              if (Math.abs(c) > maxOff || (!allowCross && c * off < 0)) return null;
-              if (!collide(c)) return c;
-            }
-            return null;
-          };
-          off = tryFan(false) ?? tryFan(true) ?? off;
-        }
-        placed.push({ c: off, hw });
-        // Off-screen landmarks go compact (label only); an edge arrow marks
-        // the chip still sitting exactly at the strip border.
-        let cls = 'compass-mark ' + m.cls + (offScreen ? ' pinned' : '');
-        if (off <= -maxOff + 0.5) cls += ' pin-l';
-        else if (off >= maxOff - 0.5) cls += ' pin-r';
-        if (chip.className !== cls) chip.className = cls;
-        chip.style.transform = `translate(calc(${off}px - 50%), 0px)`;
-        const dTxt = dist + 'm';
-        const sm = chip.querySelector('small');
-        if (sm && sm.textContent !== dTxt) sm.textContent = dTxt;
-      }
-    }
-
     // Main menu & Character Pick
     let character = 'bulwark';
     const modeBtns = Array.from(document.querySelectorAll('.mode')) as HTMLButtonElement[];
@@ -8150,7 +7996,7 @@ export default function BattleRoyaleGame() {
       else if (selectedMode !== 'range') return;
       else {
         enterRangeIfNeeded(); // returning from a Harbor match rebuilds the range
-        refreshWood(); // Test Range: free builds — hide the wood plate
+        refreshWood(); // Test Range: free builds — inventory purse is irrelevant but harmless
       }
       deploying = true;
       // Deploy = battle: claim the whole screen. The click is the user
@@ -8230,6 +8076,8 @@ export default function BattleRoyaleGame() {
                   lod: o.lod,
                   air: !!o.air,
                   chute: o.air ? o.air.chute : undefined,
+                  dv: o.devourT === undefined ? null : +o.devourT.toFixed(2),
+                  eaten: !!o.consumed,
                   x: +o.group.position.x.toFixed(1),
                   y: +o.group.position.y.toFixed(1),
                   z: +o.group.position.z.toFixed(1),
@@ -8755,7 +8603,69 @@ export default function BattleRoyaleGame() {
                 z: +p.z.toFixed(0),
                 poi: (p.group.userData as any).poi,
                 taken: p.taken,
+                gone: p.gone,
+                dropped: !!p.dropped,
+                vis: p.group.visible,
               })),
+            // Task K: corpse-devour bookkeeping (worms -> un-render)
+            devourInfo: () => {
+              let consumed = 0;
+              let detached = 0;
+              let devouring = 0;
+              let worms = 0;
+              for (const d of dummies) {
+                if (d.consumed) {
+                  consumed++;
+                  if (!d.group.parent) detached++;
+                } else if (d.devourT !== undefined) {
+                  devouring++;
+                  if (d.worms) worms++;
+                }
+              }
+              return { consumed, detached, devouring, worms };
+            },
+            // Task K: distance-culling state of the three culled registries
+            cullInfo: () => {
+              let hid = 0;
+              let shown = 0;
+              for (const c of harborGroup.children) {
+                if (c.visible) shown++;
+                else hid++;
+              }
+              let ph = 0;
+              let ps = 0;
+              for (const w of warProps) {
+                if (w.group.visible) ps++;
+                else ph++;
+              }
+              let lh = 0;
+              let ls = 0;
+              for (const p of pickups) {
+                if (p.taken || p.gone) continue;
+                if (p.group.visible) ls++;
+                else lh++;
+              }
+              return { harbor: { hidden: hid, shown }, props: { hidden: ph, shown: ps }, loot: { hidden: lh, shown: ls } };
+            },
+            // Task K: tap-to-loot entry point (screen coords) for e2e
+            tapPick: (x: number, y: number) => {
+              tryTapPickup(x, y);
+              return 'tapped';
+            },
+            // Task K: drop a test item ~2 m ahead of the camera; returns
+            // the screen point to tap (for the tap-to-loot e2e)
+            dropTest: (kind = 'smg') => {
+              const dir = camera.getWorldDirection(new THREE.Vector3());
+              dropAt(kind, camera.position.x + dir.x * 2.2, camera.position.z + dir.z * 2.2);
+              const p = pickups.filter((q) => q.dropped && !q.gone).pop();
+              if (!p) return { sx: -1, sy: -1 };
+              const v = p.group.position.clone().add(new THREE.Vector3(0, 0.45, 0));
+              v.project(camera);
+              return {
+                sx: Math.round(((v.x + 1) / 2) * window.innerWidth),
+                sy: Math.round(((-v.y + 1) / 2) * window.innerHeight),
+              };
+            },
             pois: () =>
               pois.map((p) => ({
                 id: p.id,
@@ -8778,13 +8688,14 @@ export default function BattleRoyaleGame() {
               pickups: pickups.length,
               marks: harborMarks.length,
             }),
+            // Bearing readout for e2e / debug: the compass strip is gone,
+            // but landmark data (minimap + tactical map) still needs it.
             compassInfo: () => {
               const b = (((-yaw * 180) / Math.PI) % 360 + 360) % 360;
               const p = camera.position;
               return {
                 bearing: +b.toFixed(1),
-                facing: CARD8[Math.round(b / 45) % 8],
-                visible: !!compassEl && !compassEl.hidden,
+                facing: COMPASS_CARD8[Math.round(b / 45) % 8],
                 marks: harborMarks.map((m) => ({
                   label: m.label,
                   dist: Math.round(Math.hypot(m.x - p.x, m.z - p.z)),
@@ -8906,6 +8817,7 @@ export default function BattleRoyaleGame() {
     // ----------------------------------------------------
     // Touch controls
     // ----------------------------------------------------
+    const nowMs = () => performance.now();
     function setStick(x: number, y: number) {
       if (!stickBase || !stickKnob) return;
       const r = stickBase.getBoundingClientRect();
@@ -8964,10 +8876,6 @@ export default function BattleRoyaleGame() {
       if (near($('touchBuildBtn'), 1.2)) return 'build';
       if (inRect(gBtnEl, x, y, 12)) return 'grenade';
       if (inRect(inventoryBtnEl, x, y, 6)) return 'inventory';
-      if (pickOffer && pickBtn) {
-        const r = pickBtn.getBoundingClientRect();
-        if (x >= r.left - 8 && x <= r.right + 8 && y >= r.top - 8 && y <= r.bottom + 8) return 'pick';
-      }
       if (inRect(sliderEl, x, y, 6)) return 'slider';
       if (slotAt(x, y) >= 0) return 'slot';
       return 'look';
@@ -9043,7 +8951,15 @@ export default function BattleRoyaleGame() {
         if (role === 'aim' && aimId !== null) role = 'look';
         if (role === 'slider' && sliderTouch !== null) role = 'look';
         const slot = role === 'slot' ? slotAt(t.clientX, t.clientY) : -1;
-        touches.set(t.identifier, { role, x: t.clientX, y: t.clientY, slot });
+        touches.set(t.identifier, {
+          role,
+          x: t.clientX,
+          y: t.clientY,
+          x0: t.clientX,
+          y0: t.clientY,
+          t0: nowMs(),
+          slot,
+        });
         if (role === 'stick') {
           stickId = t.identifier;
           setStick(t.clientX, t.clientY);
@@ -9056,11 +8972,6 @@ export default function BattleRoyaleGame() {
         if (role === 'slot' && slot >= 0) {
           pressSlot(slot);
           slotEls[slot]?.classList.add('is-pressed');
-        }
-        if (role === 'pick') {
-          forcePick();
-          pickBtn?.classList.add('is-pressed');
-          setTimeout(() => pickBtn?.classList.remove('is-pressed'), 120);
         }
         if (role === 'slider') sliderStart(t);
         if (role === 'turret') {
@@ -9119,6 +9030,16 @@ export default function BattleRoyaleGame() {
         if (tc?.role === 'slot' && tc.slot >= 0) {
           releaseSlot(tc.slot);
           slotEls[tc.slot]?.classList.remove('is-pressed');
+        }
+        // Tap-to-loot: a short, still 'look' tap tries to grab the
+        // weapon pickup the tap landed on — no dedicated button needed.
+        if (
+          tc &&
+          tc.role === 'look' &&
+          Math.hypot(t.clientX - tc.x0, t.clientY - tc.y0) < 14 &&
+          nowMs() - tc.t0 < 350
+        ) {
+          tryTapPickup(t.clientX, t.clientY);
         }
         touches.delete(t.identifier);
       }
@@ -9617,12 +9538,48 @@ export default function BattleRoyaleGame() {
     }
 
     const DOWN_CREDITS = 50;
+
+    // ----------------------------------------------------
+    // Death loot: a BR bot drops what it carried — its weapon and a
+    // pouch of matching ammo — so every corpse pays out like a
+    // proper battle royale. Sea graves keep their loot (nothing
+    // washes ashore), and a litter ceiling recycles the oldest
+    // drops so end-game floors can't stack hundreds of groups.
+    // ----------------------------------------------------
+    const DROP_CAP = 120;
+
+    function dropAt(kind: string, x: number, z: number) {
+      if (!(kind in WEAPONS) && !(kind in GREN) && kind !== 'light' && kind !== 'heavy') return;
+      const gy = groundAt(x, z);
+      if (gy < WATER_Y + 0.2) return; // no loot under the tide line
+      const group = pickupMesh(kind);
+      group.position.set(x, gy, z);
+      scene.add(group);
+      pickups.push({ kind, x, z, group, taken: false, timer: 0, dropped: true, armed: false, gone: false });
+    }
+
+    function dropBotLoot(d: DummyObject) {
+      if (!brOn || !d.ai) return; // range dummies carry nothing
+      const p = d.group.position;
+      if (groundAt(p.x, p.z) < WATER_Y + 0.2) return; // drowned at sea
+      const kind = d.weaponKind && d.weaponKind in WEAPONS ? d.weaponKind : 'pistol';
+      const w = WEAPONS[kind];
+      const ang = Math.random() * Math.PI * 2;
+      const sc = 0.45 + Math.random() * 0.75;
+      dropAt(kind, p.x + Math.cos(ang) * sc, p.z + Math.sin(ang) * sc);
+      dropAt(w.ammo, p.x + Math.cos(ang + 2.2) * sc, p.z + Math.sin(ang + 2.2) * sc);
+      // Litter ceiling: past the cap the oldest corpse-drops despawn
+      const dropped = pickups.filter((q) => q.dropped && !q.gone);
+      for (let i = 0; i < dropped.length - DROP_CAP; i++) dropped[i].gone = true;
+    }
+
     function dummyDown(d: DummyObject) {
       d.state = 'falling';
       if (brOn) {
         // BR accounting: the alive pool shrinks no matter who died, but
         // only YOUR eliminations pay. Every death gets a feed line.
         setBrAlive(brAlive - 1);
+        dropBotLoot(d); // the corpse gives up its gun + ammo pouch
         const kName = brKillerName(d.killer);
         if (!d.killer) {
           // player sources never set a killer — turret, guns, grenades
@@ -11060,7 +11017,8 @@ export default function BattleRoyaleGame() {
           }
           continue;
         }
-        p.group.rotation.y += dt * 1.2;
+        // Culled items don't spin — the culling pass owns their visibility
+        if (p.group.visible) p.group.rotation.y += dt * 1.2;
         const near = Math.hypot(p.x - camera.position.x, p.z - camera.position.z) < PICKUP_RADIUS;
         if (p.dropped && !p.armed) {
           if (!near) p.armed = true;
@@ -11089,9 +11047,12 @@ export default function BattleRoyaleGame() {
     function setOffer(p: PickupItem | null) {
       if (p === pickOffer) return;
       pickOffer = p;
-      pickBtn?.classList.toggle('off', !p);
-      pickBtn?.setAttribute('aria-disabled', String(!p));
-      if (pickNameEl) pickNameEl.textContent = p ? WEAPONS[p.kind]?.name || '' : '';
+      // The dedicated pick-up button is gone — desktop keeps the F key
+      // with a crosshair-adjacent chip; mobile taps the item itself.
+      if (pickHintEl) {
+        pickHintEl.hidden = !p;
+        if (p) pickHintEl.textContent = 'F \u00b7 pick up ' + (WEAPONS[p.kind]?.name || p.kind);
+      }
     }
 
     function forcePick() {
@@ -11099,6 +11060,71 @@ export default function BattleRoyaleGame() {
       const p = pickOffer;
       setOffer(null);
       collect(p);
+    }
+
+    // ----------------------------------------------------
+    // Tap-to-loot (mobile). The pick-up button is gone: a short,
+    // still tap on the world raycasts the screen point against
+    // nearby pickup meshes — tap the spinning rifle, own the rifle.
+    // A deliberate tap also bypasses the drop-arm grace (the rule
+    // that stops walk-over pickup from instantly re-collecting the
+    // weapon you just swapped out).
+    // ----------------------------------------------------
+    const TAP_PICK_R = 7; // reach: farther than walk-over, shorter than aim firefights
+    const TAP_PICK_PX = 56; // fat-finger radius: a tap is not a pixel
+    const tapRay = new THREE.Raycaster();
+    const tapNdc = new THREE.Vector2();
+    const tapRoot = new Map<THREE.Object3D, PickupItem>();
+    const tapV = new THREE.Vector3();
+
+    function tryTapPickup(cx: number, cy: number) {
+      if (!running() || playerDown) return;
+      const px = camera.position.x;
+      const pz = camera.position.z;
+      tapRoot.clear();
+      const groups: THREE.Object3D[] = [];
+      const cands: PickupItem[] = [];
+      for (const p of pickups) {
+        if (p.gone || p.taken) continue;
+        if (Math.hypot(p.x - px, p.z - pz) > TAP_PICK_R) continue;
+        groups.push(p.group);
+        cands.push(p);
+        p.group.traverse((o) => tapRoot.set(o, p));
+      }
+      if (!cands.length) return;
+      let picked: PickupItem | null = null;
+      // precise first: the ray through the tap point through real geometry
+      tapNdc.set((cx / window.innerWidth) * 2 - 1, -(cy / window.innerHeight) * 2 + 1);
+      tapRay.setFromCamera(tapNdc, camera);
+      const hits = tapRay.intersectObjects(groups, true);
+      if (hits.length) picked = tapRoot.get(hits[0].object) ?? null;
+      // fat-finger fallback: a finger is not a pixel — spinning thin guns
+      // dodge a dead-centre ray, so accept the candidate whose projected
+      // bubble is nearest the tap
+      if (!picked) {
+        let bestD = Infinity;
+        for (const p of cands) {
+          tapV.set(p.x, p.group.position.y + 0.45, p.z).project(camera);
+          const sx = ((tapV.x + 1) / 2) * window.innerWidth;
+          const sy = ((-tapV.y + 1) / 2) * window.innerHeight;
+          const dd = Math.hypot(sx - cx, sy - cy);
+          if (dd < bestD) {
+            bestD = dd;
+            picked = p;
+          }
+        }
+        if (bestD > TAP_PICK_PX) picked = null;
+      }
+      if (!picked) return;
+      const p = picked;
+      if (p.kind in GREN && gTotal() >= carryCap()) {
+        showMessage('Grenades full: ' + carryCap() + ' carried', 1.2);
+        return;
+      }
+      if (pickOffer === p) setOffer(null);
+      collect(p);
+      // confirmation flash where the button press used to be
+      showHit();
     }
 
     // ----------------------------------------------------
@@ -11607,8 +11633,8 @@ export default function BattleRoyaleGame() {
       refreshPicker();
     }
 
-    function pickSlot(bottomY: number, y: number) {
-      const i = Math.floor((bottomY - y) / PICK_PITCH);
+    function pickSlot(refY: number, y: number, down = false) {
+      const i = down ? Math.floor((y - refY) / PICK_PITCH) : Math.floor((refY - y) / PICK_PITCH);
       return i < 0 ? null : Math.min(i, GREN_KINDS.length - 1);
     }
 
@@ -11631,11 +11657,25 @@ export default function BattleRoyaleGame() {
       const anchor = document.body.classList.contains('touch') ? gBtnEl : gPlateEl;
       if (!anchor) return;
       const r = anchor.getBoundingClientRect();
-      gPickEl.style.left = Math.max(8, r.left + r.width / 2 - 60) + 'px';
-      gPickEl.style.bottom = window.innerHeight - r.top + 12 + 'px';
-      p.bottomY = r.top - 12;
+      gPickEl.style.left = Math.max(8, Math.min(window.innerWidth - 128, r.left + r.width / 2 - 60)) + 'px';
+      // The grenade button now lives at the TOP-RIGHT (portrait HUD
+      // overhaul), so the sheet opens DOWNWARD from it and the flick
+      // gesture runs down the rows. Desktop's bottom-left plate and any
+      // future bottom anchor keep the old open-above behaviour.
+      const below = r.top < 200;
+      gPickEl.classList.toggle('below', below);
+      if (below) {
+        gPickEl.style.bottom = 'auto';
+        gPickEl.style.top = r.bottom + 12 + 'px';
+        p.bottomY = r.bottom + 12; // flick reference: the sheet's top row
+      } else {
+        gPickEl.style.top = 'auto';
+        gPickEl.style.bottom = window.innerHeight - r.top + 12 + 'px';
+        p.bottomY = r.top - 12;
+      }
+      p.down = below;
       p.open = true;
-      p.pending = p.src === 'touch' ? pickSlot(p.bottomY, p.y) : null;
+      p.pending = p.src === 'touch' ? pickSlot(p.bottomY, p.y, below) : null;
       gPickEl.classList.add('open');
       refreshPicker();
     }
@@ -11650,7 +11690,7 @@ export default function BattleRoyaleGame() {
       if (!gPress || gPress.src !== 'touch' || gPress.id !== id) return;
       gPress.y = y;
       if (gPress.open) {
-        gPress.pending = pickSlot(gPress.bottomY, y);
+        gPress.pending = pickSlot(gPress.bottomY, y, gPress.down);
         refreshPicker();
       }
     }
@@ -11670,7 +11710,7 @@ export default function BattleRoyaleGame() {
         showMessage('Grenade cancelled', 1.2);
         return;
       }
-      gPress = { src, id, kind: 'hold', t: 0, open: false, pending: null, y: y ?? 0, bottomY: 0 };
+      gPress = { src, id, kind: 'hold', t: 0, open: false, pending: null, y: y ?? 0, bottomY: 0, down: false };
     }
 
     function grenadeUp(src: string, id: any) {
@@ -12337,6 +12377,7 @@ export default function BattleRoyaleGame() {
       mouseHeld = aimMouse = false;
       releaseTouch();
       resetRun();
+      setOffer(null); // the F-chip must not outlive the match
     }
 
     inventoryCloseEl?.addEventListener('click', closeInventory);
@@ -13074,9 +13115,15 @@ export default function BattleRoyaleGame() {
     }
 
     function updateDummy(d: DummyObject, dt: number) {
+      // Devoured: the worms own the body until it un-renders
+      if (d.consumed) return;
       // Airborne in the drop: the chute owns the motion until touchdown
       if (d.air) {
         updateBrChute(d, dt);
+        return;
+      }
+      if (d.devourT !== undefined) {
+        updateDevour(d, dt);
         return;
       }
       if (brOn && d.lod === 0) {
@@ -13096,6 +13143,8 @@ export default function BattleRoyaleGame() {
             releaseField(d.bots);
             d.bots = undefined;
           }
+          // permanent death: worms take it, then the corpse un-renders
+          startDevour(d);
         }
         return;
       }
@@ -13127,15 +13176,16 @@ export default function BattleRoyaleGame() {
           d.timer = 3;
         }
       } else if (d.state === 'down') {
-        // Harbor mode: a bot's death is PERMANENT — the island only has
-        // so many patrols to lose. The swarm disbands and the body stays
-        // where it fell. (Range training dummies still respawn — they
-        // are range equipment.)
+        // Harbor mode: a bot's death is PERMANENT — the worms devour
+        // the body and it un-renders after 3.5 s, paying its memory back.
+        // (Range training dummies still respawn — they are range
+        // equipment, so no worm ever eats them.)
         if (d.ai && terrainOn) {
           if (d.bots) {
             releaseField(d.bots);
             d.bots = undefined;
           }
+          startDevour(d);
           return;
         }
         d.timer -= dt;
@@ -13146,6 +13196,97 @@ export default function BattleRoyaleGame() {
           d.quiet = 99;
           d.group.rotation.x = 0;
         }
+      }
+    }
+
+    // ----------------------------------------------------
+    // Corpse devour — permanent deaths don't linger. Once a bot's
+    // body settles, a 3.5 s worm swarm crawls over it (near tier
+    // only), the corpse sinks into the churned ground, and the
+    // figure is UN-RENDERED: group detached, unique geometries and
+    // figure materials disposed, shootable entries stripped. A
+    // 200-combatant match cannot afford permanent corpses.
+    // ----------------------------------------------------
+    const DEVOUR_T = 3.5;
+    const wormMat = new THREE.MeshLambertMaterial({ color: 0xd98c8c });
+    const wormGeoA = new THREE.BoxGeometry(0.1, 0.05, 0.17);
+    const wormGeoB = new THREE.BoxGeometry(0.085, 0.045, 0.12);
+    const WORM_N = 7;
+
+    function startDevour(d: DummyObject) {
+      if (d.devourT !== undefined) return; // already feasting
+      d.devourT = DEVOUR_T;
+      // Far-tier corpses are a 16-float instanced matrix — worms would
+      // never be seen out there, so only the near figure gets the show.
+      if (d.lod !== 0 && d.group.parent) {
+        const g = new THREE.Group();
+        g.position.set(d.group.position.x, d.group.position.y, d.group.position.z);
+        for (let i = 0; i < WORM_N; i++) {
+          const w = new THREE.Group();
+          (w as any).userData = {
+            r: 0.28 + Math.random() * 0.5,
+            a: (i / WORM_N) * Math.PI * 2 + Math.random(),
+            sp: 1.6 + Math.random() * 2.1,
+            ph: Math.random() * 6.28,
+          };
+          const seg1 = new THREE.Mesh(wormGeoA, wormMat);
+          seg1.position.z = 0.07;
+          const seg2 = new THREE.Mesh(wormGeoB, wormMat);
+          seg2.position.z = -0.05;
+          seg2.rotation.x = 0.45;
+          const seg3 = new THREE.Mesh(wormGeoA, wormMat);
+          seg3.position.z = -0.16;
+          seg3.rotation.x = -0.55;
+          w.add(seg1, seg2, seg3);
+          g.add(w);
+        }
+        scene.add(g);
+        d.worms = g;
+      }
+    }
+
+    function updateDevour(d: DummyObject, dt: number) {
+      d.devourT = (d.devourT ?? DEVOUR_T) - dt;
+      // The corpse sinks into the burrow as the swarm works — slow at
+      // first, then the churn swallows it whole.
+      const left = Math.max(0, d.devourT);
+      if (d.devourT > 0) {
+        const p = d.group.position;
+        p.y -= dt * (0.12 + 0.5 * (1 - left / DEVOUR_T));
+        if (d.worms) {
+          for (const w of d.worms.children) {
+            const u: any = w.userData;
+            u.a += u.sp * dt;
+            w.position.set(Math.cos(u.a) * u.r, Math.abs(Math.sin(u.a * 2.6 + u.ph)) * 0.045, Math.sin(u.a) * u.r);
+            w.rotation.y = -u.a + Math.PI / 2;
+          }
+        }
+      }
+      if (d.devourT <= 0) finishDevour(d);
+    }
+
+    function finishDevour(d: DummyObject) {
+      d.devourT = undefined;
+      d.consumed = true;
+      if (d.worms) {
+        scene.remove(d.worms);
+        d.worms = null;
+      }
+      // Un-render: detach the figure and hand its GPU memory back.
+      d.group.parent?.remove(d.group);
+      const partSet = new Set<THREE.Mesh>(d.parts);
+      for (let i = shootable.length - 1; i >= 0; i--) {
+        if (partSet.has(shootable[i] as THREE.Mesh)) shootable.splice(i, 1);
+      }
+      const sharedGeo = new Set<THREE.BufferGeometry>(Object.values(figGeo));
+      d.group.traverse((o: any) => {
+        if (o.isMesh && o.geometry && !sharedGeo.has(o.geometry)) o.geometry.dispose();
+      });
+      for (const m of d.mats ?? []) m.dispose();
+      d.parts.length = 0;
+      if (d.bots) {
+        releaseField(d.bots);
+        d.bots = undefined;
       }
     }
 
@@ -13769,9 +13910,44 @@ export default function BattleRoyaleGame() {
     // ----------------------------------------------------
     // Main Game Loop
     // ----------------------------------------------------
+    // Distance culling — the harbor is 4 km wide but the fog wall
+    // ends at 660 m, so every structure drawn past ~700 m is
+    // invisible AND still costs draw-call submission + shadow
+    // frustum tests. This pass (every ~0.35 s, no per-frame work)
+    // flips .visible on the port's structure groups, the scattered
+    // war props and ground loot by camera distance. POIs already
+    // stream in/out (700 m build / 980 m reclaim), terrain tiles
+    // stream, far bots are instanced silhouettes, and three.js
+    // frustum-culls whatever remains — this closes the last gap.
+    const CULL_R = 700; // just past the fog: nothing pops in view
+    let cullT = 0;
+    function cullingPass(dt: number) {
+      cullT -= dt;
+      if (cullT > 0) return;
+      cullT = 0.35;
+      const px = camera.position.x;
+      const pz = camera.position.z;
+      const r2 = CULL_R * CULL_R;
+      const isFar = (x: number, z: number) => (x - px) ** 2 + (z - pz) ** 2 > r2;
+      for (const child of harborGroup.children) {
+        const vis = !isFar(child.position.x, child.position.z);
+        if (child.visible !== vis) child.visible = vis;
+      }
+      for (const wp of warProps) {
+        const vis = !isFar(wp.x, wp.z);
+        if (wp.group.visible !== vis) wp.group.visible = vis;
+      }
+      for (const p of pickups) {
+        if (p.taken || p.gone) continue;
+        const vis = !isFar(p.x, p.z);
+        if (p.group.visible !== vis) p.group.visible = vis;
+      }
+    }
+
     function update(dt: number) {
       streamTerrain();
       streamPois();
+      cullingPass(dt);
       updateGrenadePress(dt);
       updateShield(dt);
       updateMicrobots(dt); // the swarm orbits player + dummies, runs tasks
@@ -13862,7 +14038,6 @@ export default function BattleRoyaleGame() {
         }
       }
       applyView();
-      updateCompass();
       updateTracker();
       updateAntTracker();
       renderAntennaHud();
@@ -13918,19 +14093,9 @@ export default function BattleRoyaleGame() {
       <div className="smoke-fx" id="smokeFx" aria-hidden="true" />
       <div className="water-fx" id="waterFx" aria-hidden="true" />
 
-      {/* Top compass: N/E/S/W strip + harbor landmark chips */}
-      <div className="hud compass" id="compass" role="img" aria-label="Compass" hidden>
-        <div className="compass-window" id="compassWindow">
-          <div className="compass-strip" id="compassStrip" aria-hidden="true" />
-          <div className="compass-marks" id="compassMarks" aria-hidden="true" />
-          <span className="compass-caret" aria-hidden="true" />
-          <span className="compass-deg" id="compassDeg">
-            N 0&deg;
-          </span>
-        </div>
-      </div>
-
-      {/* Antenna minimap (passive — tap it or M for the tactical map) */}
+      {/* Antenna minimap (passive — tap it or M for the tactical map).
+          The compass strip is gone: portrait screens are too narrow for
+          it, and the minimap already carries an N needle + bearing. */}
       <div className="hud minimap" id="minimap" hidden aria-label="Minimap — open the tactical map">
         <canvas id="minimapCanvas" width={352} height={352} />
         <span className="minimap-n">N</span>
@@ -14034,6 +14199,7 @@ export default function BattleRoyaleGame() {
 
       {/* Crosshair & Hitmarker */}
       <div className="hud crosshair" />
+      <div className="hud pickhint" id="pickHint" hidden />
       <div className="hud hitmark" id="hitmark" />
       <div className="scope" id="scope" aria-hidden="true">
         <div className="lens" />
@@ -14074,16 +14240,6 @@ export default function BattleRoyaleGame() {
         </div>
         <div className="t-state" id="gCount">
           0 left
-        </div>
-      </div>
-
-      {/* Wood purse — harvested from voxelized trees, spent on builds */}
-      <div className="hud gplate woodplate" id="woodPlate" hidden>
-        <div className="t-name">
-          Wood <span id="woodCount">60</span>
-        </div>
-        <div className="t-state" id="woodHint">
-          chop trees to build
         </div>
       </div>
 
@@ -14144,11 +14300,6 @@ export default function BattleRoyaleGame() {
         <div className="slider" id="slider" aria-hidden="true">
           <div className="slider-knob" id="sliderKnob" />
         </div>
-        <div className="pick off" id="pick" aria-disabled="true">
-          <span className="pick-label">Pick up</span>
-          <small className="pick-name" id="pickName" />
-        </div>
-
         <div className="aim" id="aim">
           Aim
         </div>
@@ -14843,8 +14994,14 @@ export default function BattleRoyaleGame() {
               <h1 id="inventoryTitle">Inventory</h1>
             </div>
             <div className="inventory-cr">
-              <span id="inventoryCredits">300</span>
-              <small>credits</small>
+              <div className="inventory-wood">
+                <span id="inventoryWood">60</span>
+                <small>wood</small>
+              </div>
+              <div className="inventory-credits">
+                <span id="inventoryCredits">300</span>
+                <small>credits</small>
+              </div>
             </div>
           </div>
           <div className="inventory-body">
