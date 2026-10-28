@@ -6,13 +6,16 @@
  *  - pbrMaterial(): converts flat Lambert-style params into a full
  *    MeshStandardMaterial with a cached PROCEDURAL PBR texture set
  *    (albedo + roughness + normal maps) built from tileable FBM noise.
- *  - makeGerstnerWater(): GPU ocean/pool shader — four summed Gerstner
+ *  - makeGerstnerWater(): GPU ocean/pool shader — summed Gerstner
  *    waves displace the mesh vertically AND horizontally, fragment
  *    normals carry small-scale ripple detail, Schlick-Fresnel blends
- *    the deep body colour with the sky, crests foam over, and the
- *    sun paints a specular glint. Fog-aware (FogExp2 + ACES).
+ *    the deep body colour with the sky, swells glow with a faint
+ *    subsurface teal at their tops, and only genuinely compressed
+ *    crests foam over. Sun glints stay tight sparkles. Fog-aware
+ *    (FogExp2 + ACES).
  *  - makeSkyDome(): atmospheric gradient sky (warm horizon → deep
- *    zenith + sun disc & glow), optionally tone-mapped.
+ *    zenith + sun disc & glow) with DRIFTING procedural cumulus
+ *    clouds, optionally tone-mapped.
  *  - buildEnvironment(): bakes the sky into a PMREM cubemap so every
  *    PBR material gets image-based ambient light and metals reflect.
  *  - makeLeafAtlas(): a 2x2 atlas of leaf-cluster sprites (lush, dry,
@@ -279,6 +282,8 @@ export function makeSkyDome(opts: {
     uGround: { value: new THREE.Color(opts.ground) },
     uSunColor: { value: new THREE.Color(opts.sunColor) },
     uSunDir: { value: opts.sunDir.clone().normalize() },
+    uTime: { value: 0 },
+    uNoise: { value: makeNoiseTexture() },
   };
   const toneTail =
     opts.toneMapped === false
@@ -290,6 +295,8 @@ export function makeSkyDome(opts: {
     uniform vec3 uGround;
     uniform vec3 uSunColor;
     uniform vec3 uSunDir;
+    uniform float uTime;
+    uniform sampler2D uNoise;
     varying vec3 vDir;
     void main() {
       vec3 d = normalize(vDir);
@@ -297,6 +304,19 @@ export function makeSkyDome(opts: {
       vec3 col = h >= 0.0
         ? mix(uHorizon, uZenith, pow(h, 0.55))
         : mix(uHorizon, uGround, pow(-h, 0.5));
+      // DRIFTING CUMULUS: project the view ray onto a virtual cloud
+      // plane, sample two scrolling noise octaves and shade the cloud
+      // tops with the sun's colour. The band fades clouds out at the
+      // horizon and near the zenith so the dome stays a gradient first.
+      if (d.y > 0.015) {
+        vec2 cp = d.xz / (d.y + 0.12);
+        float c1 = texture2D(uNoise, cp * 0.014 + vec2(uTime * 0.0042, uTime * 0.0017)).r;
+        float c2 = texture2D(uNoise, cp * 0.052 - vec2(uTime * 0.0058, uTime * 0.0009)).r;
+        float cov = smoothstep(0.52, 0.8, c1 * 0.72 + c2 * 0.38);
+        float band = smoothstep(0.015, 0.09, d.y) * (1.0 - smoothstep(0.5, 0.95, d.y));
+        vec3 ccol = mix(vec3(0.98, 0.99, 1.03), uSunColor, 0.2);
+        col = mix(col, ccol * (0.84 + 0.32 * c2), cov * band * 0.82);
+      }
       float sd = max(dot(d, normalize(uSunDir)), 0.0);
       col += uSunColor * (pow(sd, 900.0) * 3.0 + pow(sd, 9.0) * 0.18);
       gl_FragColor = vec4(col, 1.0);${toneTail}
@@ -339,7 +359,10 @@ export function buildEnvironment(
 }
 
 // ---------------------------------------------------------------------------
-// Gerstner Waves + Fresnel water
+// Gerstner Waves + Fresnel water — tuned for believable open water:
+// gentle rolling swell, tight sun sparkles, a whisper of teal light
+// breathing through the wave tops, and foam ONLY where crests
+// genuinely compress. (No milk.)
 // ---------------------------------------------------------------------------
 
 export interface GerstnerWave {
@@ -360,7 +383,11 @@ export interface GerstnerStyle {
 export function makeGerstnerWater(width: number, depth: number, segments: number, style: GerstnerStyle) {
   const geo = new THREE.PlaneGeometry(width, depth, segments, segments);
   geo.rotateX(-Math.PI / 2); // baked: mesh transform stays identity
-  const waves = style.waves.slice(0, 4);
+  // up to four waves; missing slots become zero-steepness ghosts so the
+  // shader uniforms always exist (fewer waves = calmer seas by design)
+  const waves = [0, 1, 2, 3].map(
+    (i) => style.waves[i] ?? ({ dirDeg: 0, steepness: 0, wavelength: 60 } as GerstnerWave)
+  );
   const asVec4 = (w: GerstnerWave) => {
     const a = (w.dirDeg * Math.PI) / 180;
     return new THREE.Vector4(Math.cos(a), Math.sin(a), w.steepness, w.wavelength);
@@ -443,24 +470,33 @@ export function makeGerstnerWater(width: number, depth: number, segments: number
         vec3 V = normalize(cameraPosition - vWorld);
         vec3 N = normalize(vN);
         if (!gl_FrontFacing) N = -N;
+        // distance fade for the fine detail: ripple normals + glints
+        // alias into shimmer mush far out, where fog takes over anyway
+        float dR = clamp(1.0 - vFogDepth / 700.0, 0.15, 1.0);
         // small-scale ripple detail from scrolling tileable noise
         float n1 = texture2D(uNoise, vWorld.xz * 0.045 + vec2(uTime * 0.021, uTime * 0.013)).r;
-        float n2 = texture2D(uNoise, vWorld.xz * 0.11 - vec2(uTime * 0.03, uTime * 0.017)).r;
-        N = normalize(N + vec3(n1 * 2.0 - 1.0, 0.0, n2 * 2.0 - 1.0) * 0.3);
-        // Schlick fresnel, F0 = 0.02 for water
+        float n2 = texture2D(uNoise, vWorld.xz * 0.085 - vec2(uTime * 0.03, uTime * 0.017)).r;
+        N = normalize(N + vec3(n1 * 2.0 - 1.0, 0.0, n2 * 2.0 - 1.0) * 0.22 * dR);
+        // Schlick fresnel, F0 = 0.02 for water. Mix is COMPRESSED so even
+        // grazing water keeps some body colour instead of reading as a
+        // pale sky-milk sheet all the way to the horizon.
         float fres = 0.02 + 0.98 * pow(1.0 - max(dot(N, V), 0.0), 5.0);
-        vec3 col = mix(uDeep, uSky, clamp(fres * 1.15 + 0.12, 0.0, 1.0));
-        // sun glint
+        vec3 col = mix(uDeep, uSky, clamp(fres * 0.62 + 0.03, 0.0, 1.0));
+        // sun glint — tight sparkle on ripple facets, gentle broad sheen
         vec3 R = reflect(-normalize(uSunDir), N);
-        float spec = pow(max(dot(R, V), 0.0), 60.0);
+        float spec = pow(max(dot(R, V), 0.0), 110.0);
         float sheen = pow(max(dot(R, V), 0.0), 12.0);
-        col += uSunColor * (spec * 2.4 + sheen * 0.35);
+        col += uSunColor * (spec * 1.05 * dR + sheen * 0.12);
         // subtle body scatter variation
-        col += (n1 - 0.5) * 0.05;
-        // foam on compressed crests, broken up by noise
-        float foam = smoothstep(0.35, 0.7, vCrest) * smoothstep(0.3, 0.7, n2);
-        col = mix(col, vec3(0.93, 0.96, 0.98), foam * 0.85);
-        float alpha = clamp(uOpacity + fres * 0.22 + foam * 0.25, 0.0, 1.0);
+        col += (n1 - 0.5) * 0.05 * dR;
+        // subsurface teal glow where the swell thickens toward its top —
+        // light passing through the wave instead of white milk on it
+        col += (uDeep * vec3(0.55, 1.35, 1.15) + vec3(0.015, 0.05, 0.04))
+               * smoothstep(0.2, 0.9, vCrest) * 0.16;
+        // foam ONLY on genuinely compressed crests, heavily broken up by noise
+        float foam = smoothstep(0.58, 0.96, vCrest) * smoothstep(0.52, 0.86, n2) * dR;
+        col = mix(col, vec3(0.93, 0.96, 0.98), foam * 0.5);
+        float alpha = clamp(uOpacity + fres * 0.22 + foam * 0.1, 0.0, 1.0);
         gl_FragColor = vec4(col, alpha);
         #include <fog_fragment>
         #include <tonemapping_fragment>
@@ -543,7 +579,15 @@ export function makeLeafAtlasTexture(): THREE.Texture {
 }
 
 let leafMaterial: THREE.MeshStandardMaterial | null = null;
-/** Shared alpha-tested foliage material for the crossed 2D leaf planes. */
+const leafSwayUniform = { value: 0 };
+/** Advances the shared wind clock that bends every leaf card. */
+export function tickLeafSway(t: number) {
+  leafSwayUniform.value = t;
+}
+/** Shared alpha-tested foliage material for the crossed 2D leaf planes.
+ * WIND SWAY: each card vertex carries an `aSway` weight (0 at the
+ * branch, 1 at the tip) injected through onBeforeCompile — the whole
+ * forest breathes in a light breeze for the cost of two sines. */
 export function makeLeafMaterial(): THREE.MeshStandardMaterial {
   if (leafMaterial) return leafMaterial;
   leafMaterial = new THREE.MeshStandardMaterial({
@@ -554,6 +598,22 @@ export function makeLeafMaterial(): THREE.MeshStandardMaterial {
     roughness: 0.88,
     metalness: 0,
   });
+  leafMaterial.onBeforeCompile = (shader) => {
+    shader.uniforms.uSwayT = leafSwayUniform;
+    shader.vertexShader = shader.vertexShader
+      .replace(
+        '#include <common>',
+        '#include <common>\nattribute float aSway;\nuniform float uSwayT;'
+      )
+      .replace(
+        '#include <begin_vertex>',
+        `vec3 transformed = vec3( position );
+        float swPh = uSwayT * 1.9 + position.x * 0.31 + position.z * 0.23;
+        transformed.x += ( sin( swPh ) + sin( swPh * 1.71 + 1.3 ) * 0.5 ) * 0.05 * aSway;
+        transformed.z += cos( swPh * 0.83 + 0.7 ) * 0.035 * aSway;`
+      );
+  };
+  leafMaterial.customProgramCacheKey = () => 'leaf-sway';
   return leafMaterial;
 }
 
@@ -599,6 +659,78 @@ export function makeContactShadowMaterial(): THREE.MeshBasicMaterial {
 // ---------------------------------------------------------------------------
 // Water noise + misc
 // ---------------------------------------------------------------------------
+
+let muzzleTex: THREE.Texture | null = null;
+/** Muzzle-flash sprite: white-hot core, orange shell, radial streaks. */
+export function makeMuzzleTexture(): THREE.Texture {
+  if (muzzleTex) return muzzleTex;
+  const S = 128;
+  const cv = document.createElement('canvas');
+  cv.width = cv.height = S;
+  const ctx = cv.getContext('2d')!;
+  const c = S / 2;
+  // streaks first (behind the core)
+  ctx.translate(c, c);
+  for (let i = 0; i < 9; i++) {
+    const a = (i / 9) * Math.PI * 2 + 0.31;
+    const len = c * (i % 2 ? 0.94 : 0.62);
+    const grd = ctx.createLinearGradient(0, 0, Math.cos(a) * len, Math.sin(a) * len);
+    grd.addColorStop(0, 'rgba(255,214,140,0.95)');
+    grd.addColorStop(1, 'rgba(255,140,40,0)');
+    ctx.strokeStyle = grd;
+    ctx.lineWidth = 5 + (i % 3) * 3;
+    ctx.beginPath();
+    ctx.moveTo(0, 0);
+    ctx.lineTo(Math.cos(a) * len, Math.sin(a) * len);
+    ctx.stroke();
+  }
+  const g = ctx.createRadialGradient(0, 0, 0, 0, 0, c * 0.5);
+  g.addColorStop(0, 'rgba(255,255,244,1)');
+  g.addColorStop(0.35, 'rgba(255,226,150,0.9)');
+  g.addColorStop(0.75, 'rgba(255,150,54,0.35)');
+  g.addColorStop(1, 'rgba(255,120,30,0)');
+  ctx.fillStyle = g;
+  ctx.beginPath();
+  ctx.arc(0, 0, c * 0.5, 0, Math.PI * 2);
+  ctx.fill();
+  const t = new THREE.CanvasTexture(cv);
+  t.colorSpace = THREE.SRGBColorSpace;
+  t.needsUpdate = true;
+  muzzleTex = t;
+  return t;
+}
+
+let birdTex: THREE.Texture | null = null;
+/** Distant gull glyph (alpha-tested) for the ambient sky birds. */
+export function makeBirdTexture(): THREE.Texture {
+  if (birdTex) return birdTex;
+  const cv = document.createElement('canvas');
+  cv.width = 128;
+  cv.height = 64;
+  const ctx = cv.getContext('2d')!;
+  ctx.strokeStyle = '#f7f9fb';
+  ctx.lineCap = 'round';
+  // two swept wings meeting at a small body
+  ctx.lineWidth = 9;
+  ctx.beginPath();
+  ctx.moveTo(6, 26);
+  ctx.quadraticCurveTo(40, 4, 64, 24);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(122, 26);
+  ctx.quadraticCurveTo(88, 4, 64, 24);
+  ctx.stroke();
+  ctx.lineWidth = 6;
+  ctx.fillStyle = '#f7f9fb';
+  ctx.beginPath();
+  ctx.ellipse(64, 26, 9, 4.5, 0, 0, Math.PI * 2);
+  ctx.fill();
+  const t = new THREE.CanvasTexture(cv);
+  t.colorSpace = THREE.SRGBColorSpace;
+  t.needsUpdate = true;
+  birdTex = t;
+  return t;
+}
 
 let noiseTex: THREE.Texture | null = null;
 /** Tileable grayscale FBM noise for the water shader's ripples/foam. */

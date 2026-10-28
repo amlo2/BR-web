@@ -22,6 +22,9 @@ import {
   buildEnvironment,
   makeLeafMaterial,
   makeContactShadowMaterial,
+  makeMuzzleTexture,
+  makeBirdTexture,
+  tickLeafSway,
   setLitePBR,
   type PBRKind,
 } from '@/lib/pbr-graphics';
@@ -197,6 +200,57 @@ export default function BattleRoyaleGame() {
     }
 
     // ----------------------------------------------------
+    // AMBIENT SKY LIFE. The dome itself now drifts with procedural
+    // cumulus (makeSkyDome + uTime), and a handful of distant gulls
+    // circle the island on lazy arcs — the sky reads ALIVE from the
+    // deploy pad instead of a painted backdrop. Seven quads with one
+    // shared alpha-tested glyph, wingbeat faked through scale.
+    // ----------------------------------------------------
+    let ambT = 0;
+    const gulls: Array<{ m: THREE.Mesh; cx: number; cz: number; r: number; sp: number; ph: number; y: number; fl: number; base: number }> = [];
+    {
+      const gullMat = new THREE.MeshBasicMaterial({
+        map: makeBirdTexture(),
+        alphaTest: 0.3,
+        side: THREE.DoubleSide,
+        toneMapped: false,
+      });
+      const gullGeo = new THREE.PlaneGeometry(1.35, 0.6);
+      const rndG = (() => {
+        let s = 20261028;
+        return () => ((s = (Math.imul(s, 1664525) + 1013904223) >>> 0) / 4294967295);
+      })();
+      for (let i = 0; i < 7; i++) {
+        const m = new THREE.Mesh(gullGeo, gullMat);
+        const base = 0.8 + rndG() * 0.7;
+        m.scale.setScalar(base);
+        scene.add(m);
+        gulls.push({
+          m,
+          cx: (rndG() - 0.5) * 1500,
+          cz: (rndG() - 0.5) * 1500,
+          r: 45 + rndG() * 95,
+          sp: 0.1 + rndG() * 0.14,
+          ph: rndG() * Math.PI * 2,
+          y: 54 + rndG() * 36,
+          fl: 2.4 + rndG() * 2.2,
+          base,
+        });
+      }
+    }
+    function updateAmbientSky() {
+      skyMat.uniforms.uTime.value = ambT;
+      for (const g of gulls) {
+        const a = g.ph + ambT * g.sp;
+        g.m.position.set(g.cx + Math.cos(a) * g.r, g.y + Math.sin(ambT * 0.5 + g.ph) * 2.2, g.cz + Math.sin(a) * g.r);
+        g.m.rotation.y = -a - Math.PI / 2; // face along the arc
+        g.m.rotation.z = 0.24; // lazy bank into the turn
+        const flap = Math.sin(ambT * g.fl + g.ph);
+        g.m.scale.y = g.base * (0.5 + 0.5 * Math.abs(flap)); // wingbeat
+      }
+    }
+
+    // ----------------------------------------------------
     // PBR material factory: every surface in the world goes through
     // MAT() — a drop-in MeshLambertMaterial replacement that returns a
     // MeshStandardMaterial wired with procedural noise albedo,
@@ -284,13 +338,14 @@ export default function BattleRoyaleGame() {
       basin.receiveShadow = true;
 
       // Gerstner ripple pool: small-scale waves + Schlick-Fresnel sky
-      // reflection replace the old flat blue plane.
+      // reflection replace the old flat blue plane. Crest sensitivity
+      // kept LOW so the pool water never milks over.
       const poolWater = makeGerstnerWater(POOL_END - x0, z1 - z0, 24, {
         deep: 0x14586e,
-        sky: 0xbdd7ea,
+        sky: 0x86aecd,
         sunColor: 0xfff1d0,
         opacity: 0.6,
-        crest: 4,
+        crest: 1.4,
         waves: [
           { dirDeg: 15, steepness: 0.1, wavelength: 3.4 },
           { dirDeg: 74, steepness: 0.08, wavelength: 2.2 },
@@ -644,23 +699,27 @@ export default function BattleRoyaleGame() {
     const TILE_CLIFF = new THREE.Color(0x4c4f55); // bare dark cliff rock
     const tiles = new Map<string, { mesh: THREE.Mesh; cx: number; cz: number; veg?: THREE.Mesh | null; leaf?: THREE.Mesh | null; blob?: THREE.Mesh | null; vegSolids?: SolidBox[]; vegTreeVox?: VoxelBox[] }>();
 
-    // GERSTNER OCEAN: three summed Gerstner waves displace the surface
-    // vertically AND horizontally (pinched crests), the fragment stage
-    // layers scrolling noise ripples, fresnel sky-blend, sun glint and
-    // crest foam. Plane rotation is baked into the geometry so the
-    // shader works in world space directly.
+    // GERSTNER OCEAN: rolling open-water swell (gentle steepness, no
+    // lumps), tight sun sparkles, a whisper of subsurface teal at the
+    // swell tops and foam only where crests genuinely compress — the
+    // shader retuned so it reads as WATER, not whale milk. Plane
+    // rotation is baked into the geometry so the shader works in world
+    // space directly.
     const SEA_SIZE = 2 * (HARBOR_HALF + TERRAIN_MARGIN);
-    const seaWater = makeGerstnerWater(SEA_SIZE, SEA_SIZE, isHeadless ? 80 : 220, {
-      deep: 0x1d5580,
-      sky: 0xbdd7ea,
+    // headless gets 120 segments (not 80): 80 left the swell visibly
+    // blocky in e2e screenshots (60 m cells vs a 100 m wave aliased
+    // into lumps) — 120 keeps the software rasterizer budget while
+    // reading as water instead of a low-poly milk sheet.
+    const seaWater = makeGerstnerWater(SEA_SIZE, SEA_SIZE, isHeadless ? 120 : 256, {
+      deep: 0x134e70,
+      sky: 0x86aecd,
       sunColor: 0xfff1d0,
-      opacity: 0.86,
-      crest: 0.45,
+      opacity: 0.88,
+      crest: 0.13,
       waves: [
-        { dirDeg: 24, steepness: 0.1, wavelength: 240 },
-        { dirDeg: 77, steepness: 0.12, wavelength: 150 },
-        { dirDeg: 151, steepness: 0.14, wavelength: 100 },
-        { dirDeg: 233, steepness: 0.16, wavelength: 60 },
+        { dirDeg: 24, steepness: 0.05, wavelength: 240 },
+        { dirDeg: 77, steepness: 0.06, wavelength: 150 },
+        { dirDeg: 151, steepness: 0.07, wavelength: 100 },
       ],
     });
     const seaMesh = seaWater.mesh;
@@ -1027,6 +1086,19 @@ export default function BattleRoyaleGame() {
       },
     };
 
+    // A part is crown foliage when green-dominant. TREE_SHAPES keeps
+    // trunk parts FIRST for the voxel palette tests; this colour test
+    // splits trunk wood from foliage so leafy crowns can render as
+    // PURE 2D leaf planes (the trunk stays 3D, the boxy green crown
+    // mesh goes away — no more double 3D + 2D leaves).
+    const isCrownPart = (p: TreePart) => {
+      const r = (p.c >> 16) & 255;
+      const g = (p.c >> 8) & 255;
+      const b = p.c & 255;
+      return g > r && g >= b;
+    };
+    const TRK = '#trunk'; // veg-lib key suffix for trunk-only stamp defs
+
     interface StampRec {
       def: VegDef;
       x: number;
@@ -1050,9 +1122,11 @@ export default function BattleRoyaleGame() {
     // 2D-PLANE FOLIAGE. Leaves and bushes render as multiple
     // alpha-tested crossed planes (a leaf-cluster sprite atlas) —
     // the classic billboard-card technique: far cheaper than blob
-    // meshes and dramatically lusher on screen. Tree crowns keep
-    // their chunky box silhouettes (the voxel-destructible
-    // identity) and gain leaf cards wrapped around the crown.
+    // meshes and dramatically lusher on screen. Leafy tree crowns
+    // render ONLY as these planes (the trunk stays 3D); the crown
+    // mass lives on inside the voxel lattice, so a blasted tree
+    // still reveals chunky green foliage voxels right where the
+    // cards float.
     // ----------------------------------------------------
     interface LeafCard {
       x: number;
@@ -1080,6 +1154,33 @@ export default function BattleRoyaleGame() {
       palm: 2,
       acacia: 1,
     };
+
+    // Crown bounds (SHAPE units, before the s scale) measured from
+    // the shape's own green parts — the 2D card crown replaces the
+    // 3D crown exactly where the foliage mass was, automatically
+    // correct for any tree added to TREE_SHAPES in the future.
+    const crownCache: Record<string, { lo: number; hi: number; r: number }> = {};
+    function crownBounds(name: string): { lo: number; hi: number; r: number } {
+      if (crownCache[name]) return crownCache[name];
+      const shape = TREE_SHAPES[name];
+      let lo = Infinity;
+      let hi = -Infinity;
+      let r = 0;
+      for (const p of shape.parts) {
+        if (!isCrownPart(p)) continue;
+        lo = Math.min(lo, p.y - p.h / 2);
+        hi = Math.max(hi, p.y + p.h / 2);
+        r = Math.max(r, Math.abs(p.x) + p.w / 2, Math.abs(p.z) + p.d / 2);
+      }
+      if (!isFinite(lo)) {
+        lo = shape.top * 0.4;
+        hi = shape.top;
+        r = shape.ex;
+      }
+      const out = { lo: lo - 0.15, hi: hi + 0.25, r: r * 1.12 };
+      crownCache[name] = out;
+      return out;
+    }
 
     function bushLeafCards(
       x: number,
@@ -1110,7 +1211,6 @@ export default function BattleRoyaleGame() {
 
     function treeLeafCards(
       name: string,
-      shape: TreeShape,
       x: number,
       baseY: number,
       z: number,
@@ -1119,62 +1219,70 @@ export default function BattleRoyaleGame() {
       rnd: () => number
     ): LeafCard[] {
       const quad = TREE_LEAF_QUAD[name] ?? 0;
-      const cy = baseY + shape.top * 0.55 * s;
-      // cards are ~65% WIDER than the boxy crown so the foliage plane
-      // silhouette breaks out of the chunky box instead of hiding inside it
-      const cw = shape.ex * 3.3 * s;
-      const ch = Math.max(1.1, shape.top * 0.7 * s);
+      const cb = crownBounds(name);
+      const chh = cb.hi - cb.lo;
+      const cym = (cb.lo + cb.hi) / 2;
+      const cw = cb.r * 2;
       const cards: LeafCard[] = [];
       if (name === 'palm') {
-        for (let i = 0; i < 3; i++) {
+        // wide fanned frond cards right where the 3D fronds used to
+        // be; the small coconut cubes stay 3D beneath the fan
+        const ph = Math.max(0.9, chh * 1.35);
+        for (let i = 0; i < 4; i++) {
           cards.push({
             x,
-            y: cy - ch * 0.1,
+            y: baseY + (cym - ph * 0.38) * s,
             z,
-            w: cw * 0.85,
-            h: ch * 0.55,
-            yaw: (i / 3) * Math.PI + rnd() * 0.7,
-            tilt: (rnd() - 0.5) * 0.55,
+            w: cw * 1.28 * s,
+            h: ph * s,
+            yaw: (i / 4) * Math.PI + rnd() * 0.6,
+            tilt: (rnd() - 0.5) * 0.5,
             quad,
             tint,
           });
         }
         return cards;
       }
-      // two crossed bands: lower pair wraps the crown mid, upper pair
-      // caps the crown — read as layered foliage from any angle
-      for (let i = 0; i < 2; i++) {
-        cards.push({
-          x,
-          y: cy - ch * 0.42,
-          z,
-          w: cw * (0.85 + rnd() * 0.25),
-          h: ch * 0.95,
-          yaw: i * Math.PI + rnd() * 0.8,
-          tilt: (rnd() - 0.5) * 0.3,
-          quad,
-          tint,
-        });
-      }
-      for (let i = 0; i < 2; i++) {
-        cards.push({
-          x,
-          y: cy + ch * 0.1,
-          z,
-          w: cw * (0.7 + rnd() * 0.25),
-          h: ch * 0.85,
-          yaw: i * Math.PI + Math.PI / 2 + rnd() * 0.8,
-          tilt: (rnd() - 0.5) * 0.35,
-          quad,
-          tint,
-        });
+      // Three crossed bands span the whole crown: conifers stack a
+      // tapering cone, broadleaf/kapok/acacia fill a rounded dome —
+      // all sized from the shape's own crown bounds.
+      const cone = name === 'pine' || name === 'spruce';
+      const bands: Array<[number, number, number]> = cone
+        ? [
+            [0.1, 1.02, 0.55],
+            [0.46, 0.74, 0.5],
+            [0.82, 0.42, 0.42],
+          ]
+        : [
+            [0.06, 0.92, 0.56],
+            [0.5, 1.06, 0.6],
+            [0.9, 0.66, 0.42],
+          ];
+      for (const [f, wf, hf] of bands) {
+        const bh = chh * hf;
+        const by = cym + (f - 0.5) * chh - bh * 0.42;
+        for (let i = 0; i < 2; i++) {
+          cards.push({
+            x,
+            y: baseY + by * s,
+            z,
+            w: cw * wf * (0.88 + rnd() * 0.24) * s,
+            h: bh * s,
+            yaw: i * Math.PI + rnd() * 0.85,
+            tilt: (rnd() - 0.5) * 0.3,
+            quad,
+            tint,
+          });
+        }
       }
       return cards;
     }
 
     /** One crossed plane = 2 triangles (6 verts), non-indexed, UVs
-     *  mapped to the card's atlas quadrant with a small inset. */
-    function pushLeafCard(c: LeafCard, P: number[], N: number[], C: number[], U: number[]) {
+     *  mapped to the card's atlas quadrant with a small inset. Each
+     *  vertex carries an aSway weight (0 at the branch, 1 at the
+     *  tip) used by the wind shader to bend the card. */
+    function pushLeafCard(c: LeafCard, P: number[], N: number[], C: number[], U: number[], S: number[]) {
       leafEuler.set(c.tilt, c.yaw, 0);
       leafQuat.setFromEuler(leafEuler);
       const qw = c.w / 2;
@@ -1196,6 +1304,7 @@ export default function BattleRoyaleGame() {
         N.push(leafTmp.x, leafTmp.y, leafTmp.z);
         C.push(c.tint, c.tint, c.tint);
         U.push(u0 + fu * 0.44, v0 + fv * 0.44);
+        S.push(ly / h); // wind-bend weight: 0 base → 1 tip
       }
     }
 
@@ -1232,12 +1341,13 @@ export default function BattleRoyaleGame() {
       return uv;
     }
 
-    function buildLeafGeometry(P: number[], N: number[], C: number[], U: number[]) {
+    function buildLeafGeometry(P: number[], N: number[], C: number[], U: number[], S: number[]) {
       const geo = new THREE.BufferGeometry();
       geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(P), 3));
       geo.setAttribute('normal', new THREE.BufferAttribute(new Float32Array(N), 3));
       geo.setAttribute('color', new THREE.BufferAttribute(new Float32Array(C), 3));
       geo.setAttribute('uv', new THREE.BufferAttribute(new Float32Array(U), 2));
+      geo.setAttribute('aSway', new THREE.BufferAttribute(new Float32Array(S), 1));
       return geo;
     }
 
@@ -1262,9 +1372,10 @@ export default function BattleRoyaleGame() {
       const LN: number[] = [];
       const LC: number[] = [];
       const LU: number[] = [];
+      const LS: number[] = [];
       for (const st of rec.stamps) {
         if (st.skip) continue;
-        if (st.leaf) for (const lc of st.leaf) pushLeafCard(lc, LP, LN, LC, LU);
+        if (st.leaf) for (const lc of st.leaf) pushLeafCard(lc, LP, LN, LC, LU, LS);
         if (!st.leafOnly) stampVeg(st.def, st.x, st.y, st.z, st.yaw, st.s, st.tint, P, N, C);
       }
       rec.mesh.geometry.dispose();
@@ -1276,7 +1387,7 @@ export default function BattleRoyaleGame() {
       rec.mesh.geometry = geo;
       if (rec.leafMesh) {
         rec.leafMesh.geometry.dispose();
-        rec.leafMesh.geometry = buildLeafGeometry(LP, LN, LC, LU);
+        rec.leafMesh.geometry = buildLeafGeometry(LP, LN, LC, LU, LS);
       }
     }
 
@@ -1349,11 +1460,18 @@ export default function BattleRoyaleGame() {
       // Woody plants are VOXEL TREES: chunky box-built silhouettes
       // generated from TREE_SHAPES (see the voxelized-trees block
       // above). The same shape data drives the per-voxel brown/green
-      // palette, so the merged stamp and the damaged-chunky reveal
-      // match part for part.
+      // palette, so the trunk stamp and the damaged-chunky reveal
+      // match part for part. LEAFY trees stamp their TRUNK-ONLY twin
+      // (def + TRK) — the crown renders as 2D leaf cards; dead trees
+      // keep their full bare silhouette.
       for (const [name, shape] of Object.entries(TREE_SHAPES)) {
         lib[name] = vegMerge(
           shape.parts.map((p) => P(new THREE.BoxGeometry(p.w, p.h, p.d), p.x, p.y, p.z, p.c, p.rx ?? 0, p.ry ?? 0))
+        );
+        lib[name + TRK] = vegMerge(
+          shape.parts
+            .filter((p) => !isCrownPart(p))
+            .map((p) => P(new THREE.BoxGeometry(p.w, p.h, p.d), p.x, p.y, p.z, p.c, p.rx ?? 0, p.ry ?? 0))
         );
       }
       if (!treeVoxMat) {
@@ -1473,6 +1591,7 @@ export default function BattleRoyaleGame() {
       const LN: number[] = [];
       const LC: number[] = [];
       const LU: number[] = [];
+      const LS: number[] = []; // per-vertex wind-sway weights
       const BP: number[] = [];
       const BU: number[] = [];
       let inst = 0;
@@ -1639,6 +1758,13 @@ export default function BattleRoyaleGame() {
           }
         }
         if (!def) continue;
+        // LEAFY TREES stamp TRUNK-ONLY: the crown renders purely as
+        // 2D leaf cards (rec.leaf below) — the boxy 3D crown is gone so
+        // 3D + 2D leaves never overlap again. Dead trees keep their
+        // full bare silhouette.
+        if (treeName && treeName !== 'deadtree' && def === lib[treeName]) {
+          def = lib[treeName + TRK];
+        }
         const yaw = rnd() * Math.PI * 2;
         const tint = 0.86 + rnd() * 0.26;
         const rec: StampRec = { def, x: vx, y: h - 0.06, z: vz, yaw, s, tint, vox: null };
@@ -1664,10 +1790,12 @@ export default function BattleRoyaleGame() {
           // merged stamp above is swapped for the chunky voxels.
           const shape = TREE_SHAPES[treeName];
           const base = h - 0.06;
-          // Crown leaf cards: crossed 2D leaf planes wrapped around
-          // the crown soften the chunky silhouette (deadwood stays bare).
+          // Crown leaf cards: the WHOLE crown is crossed 2D leaf planes
+          // now (deadwood stays bare) — sized from the shape's own
+          // crown bounds so the card canopy sits exactly where the
+          // 3D crown used to be.
           if (treeName !== 'deadtree') {
-            rec.leaf = treeLeafCards(treeName, shape, vx, base, vz, s, tint, rnd);
+            rec.leaf = treeLeafCards(treeName, vx, base, vz, s, tint, rnd);
             verts += rec.leaf.length * 6;
           }
           const sb: SolidBox = {
@@ -1704,7 +1832,7 @@ export default function BattleRoyaleGame() {
         }
         // Leaf planes into the tile's card buffers.
         if (rec.leaf) {
-          for (const lc of rec.leaf) pushLeafCard(lc, LP, LN, LC, LU);
+          for (const lc of rec.leaf) pushLeafCard(lc, LP, LN, LC, LU, LS);
         }
         // Vertex-contact AO blobs: soft contact shadows under every
         // plant that visually touches the terrain.
@@ -1729,13 +1857,13 @@ export default function BattleRoyaleGame() {
       mesh.castShadow = true;
       mesh.receiveShadow = false;
       tileRec.mesh = mesh;
-      // Leaf cards: one merged alpha-tested mesh per tile. Cards never
-      // cast shadows (their box crowns already do) — solid quad
-      // shadows would look wrong.
+      // Leaf cards: one merged alpha-tested mesh per tile. The cards
+      // ARE the tree crown now, so they cast real dappled shadows —
+      // three.js pierces them through the leaf atlas via alphaTest.
       let leafMesh: THREE.Mesh | null = null;
       if (LP.length) {
-        leafMesh = new THREE.Mesh(buildLeafGeometry(LP, LN, LC, LU), leafMat);
-        leafMesh.castShadow = false;
+        leafMesh = new THREE.Mesh(buildLeafGeometry(LP, LN, LC, LU, LS), leafMat);
+        leafMesh.castShadow = true;
         tileRec.leafMesh = leafMesh;
       }
       // Contact-AO decals: one merged transparent mesh per tile.
@@ -8892,6 +9020,10 @@ export default function BattleRoyaleGame() {
                 .map((v) => {
                   const cx = v.x0 + (v.nx * v.sx) / 2;
                   const cz = v.z0 + (v.nz * v.sz) / 2;
+                  // Task M: did this tree's stamp get pulled from the tile
+                  // (with its 2D leaf cards) on first hit? Direct registry
+                  // read — immune to tile-streaming sampling noise.
+                  const myStamps = (v.vegTile?.stamps || []).filter((s) => s.vox === v);
                   return {
                     x: +cx.toFixed(1),
                     z: +cz.toFixed(1),
@@ -8901,6 +9033,8 @@ export default function BattleRoyaleGame() {
                     total: v.total,
                     inst: !!v.inst,
                     gone: v.gone,
+                    skipped: myStamps.length > 0 && myStamps.every((s) => s.skip),
+                    leafCards: myStamps.reduce((a, s) => a + (s.skip ? s.leaf?.length ?? 0 : 0), 0),
                     d: Math.round(Math.hypot(cx - camera.position.x, cz - camera.position.z)),
                   };
                 })
@@ -9068,13 +9202,36 @@ export default function BattleRoyaleGame() {
             gfxInfo: () => {
               let leafMeshes = 0;
               let leafTris = 0;
+              let leafSwayAttr = 0;
               let blobMeshes = 0;
+              let vegGreen = 0;
+              let vegHighGreen = 0;
               for (const t of tiles.values()) {
                 if (t.leaf && t.leaf.visible) {
                   leafMeshes++;
                   leafTris += (t.leaf.geometry.getAttribute('position') as THREE.BufferAttribute).count / 3;
+                  if (t.leaf.geometry.getAttribute('aSway')) leafSwayAttr++;
                 }
                 if (t.blob && t.blob.visible) blobMeshes++;
+                if (t.veg) {
+                  // crown proof: leafy crowns are GONE from the merged 3D
+                  // veg mesh — only low ground plants stay green in 3D.
+                  // Height is measured RELATIVE TO THE TERRAIN under each
+                  // vertex (hills would otherwise read every fern as tall).
+                  const ca = t.veg.geometry.getAttribute('color') as THREE.BufferAttribute | undefined;
+                  const pa = t.veg.geometry.getAttribute('position') as THREE.BufferAttribute;
+                  if (ca) {
+                    for (let i = 0; i < ca.count; i++) {
+                      const r = ca.getX(i);
+                      const gg = ca.getY(i);
+                      const b = ca.getZ(i);
+                      if (gg > r && gg > b) {
+                        vegGreen++;
+                        if (pa.getY(i) > terrainHeight(pa.getX(i), pa.getZ(i)) + 3) vegHighGreen++;
+                      }
+                    }
+                  }
+                }
               }
               let voxInst = 0;
               let voxCulled = 0;
@@ -9097,8 +9254,25 @@ export default function BattleRoyaleGame() {
                 headless: isHeadless,
                 skyDomePos: { x: +skyDome.position.x.toFixed(0), y: +skyDome.position.y.toFixed(0), z: +skyDome.position.z.toFixed(0) },
                 sea: seaMesh.visible
-                  ? { shader: seaMat.type, waves: [seaMat.uniforms.uWaveA.value.x !== undefined ? 1 : 0, seaMat.uniforms.uWaveB ? 1 : 0, seaMat.uniforms.uWaveC ? 1 : 0, seaMat.uniforms.uWaveD ? 1 : 0], uTime: seaMat.uniforms.uTime ? +seaMat.uniforms.uTime.value.toFixed(2) : -1, verts: (seaMesh.geometry.getAttribute('position') as THREE.BufferAttribute).count }
+                  ? {
+                      shader: seaMat.type,
+                      waves: (['uWaveA', 'uWaveB', 'uWaveC', 'uWaveD'] as const).map((k) => {
+                        const vv = seaMat.uniforms[k]?.value as THREE.Vector4 | undefined;
+                        return { steep: +((vv && vv.z) || 0).toFixed(3), len: (vv && vv.w) || 0 };
+                      }),
+                      crest: seaMat.uniforms.uCrest ? seaMat.uniforms.uCrest.value : null,
+                      deep: seaMat.uniforms.uDeep ? '#' + (seaMat.uniforms.uDeep.value as THREE.Color).getHexString() : null,
+                      uTime: seaMat.uniforms.uTime ? +seaMat.uniforms.uTime.value.toFixed(2) : -1,
+                      verts: (seaMesh.geometry.getAttribute('position') as THREE.BufferAttribute).count,
+                    }
                   : null,
+                poolCrest: waters[0] ? waters[0].uniforms.uCrest.value : null,
+                vegMesh: { greenVerts: vegGreen, highGreenVerts: vegHighGreen },
+                leafSwayAttr: leafMeshes ? leafSwayAttr / leafMeshes : 0,
+                muzzle: {
+                  isSprite: !!(current && (current.flare as unknown as THREE.Sprite)?.isSprite),
+                  additive: !!(current && (current.flare as any)?.material && (current.flare as any).material.blending === 2),
+                },
                 waterSurfaces: waters.length,
                 // diagnostics: sample the ACTUAL pixels of the generated
                 // grass map canvas (is the noise field non-uniform?)
@@ -9136,8 +9310,23 @@ export default function BattleRoyaleGame() {
                 voxInst,
                 voxCulled,
                 tiles: tiles.size,
+                // Task M: wind sway / ambient sky / trunk-only crowns
+                leafSwayT: +waterT.toFixed(2),
+                sky: {
+                  uTime: +ambT.toFixed(2),
+                  gulls: gulls.length,
+                  gullX: gulls.length ? +gulls[0].m.position.x.toFixed(1) : null,
+                  gullScaleY: gulls.length ? +gulls[0].m.scale.y.toFixed(2) : null,
+                },
+                treeCrowns: vegLib ? { trunkOnly: true, defs: Object.keys(vegLib).filter((k) => k.includes(TRK)).length } : null,
               };
             },
+            // Task M: HUD overlap resolver — force a pass, then read state
+            hudResolve: () => {
+              const culled = resolveHudOverlaps();
+              return { ...hudOverlapInfo(), lastCulled: culled };
+            },
+            hudOverlapInfo: () => hudOverlapInfo(),
             // Task K: tap-to-loot entry point (screen coords) for e2e
             tapPick: (x: number, y: number) => {
               tryTapPickup(x, y);
@@ -9595,8 +9784,21 @@ export default function BattleRoyaleGame() {
       build(g);
       const muzzle = new THREE.Object3D();
       muzzle.position.set(0, 0.02, cfg.muzzleZ);
-      const flare = new THREE.Mesh(new THREE.SphereGeometry(0.05, 8, 6), new THREE.MeshBasicMaterial({ toneMapped: false, color: 0xfde68a }));
+      // Muzzle flash: additive camera-facing sprite (radial streaks
+      // + hot core texture), random roll + size pulse per shot — far
+      // punchier than the old tiny flat sphere.
+      const flare = new THREE.Sprite(
+        new THREE.SpriteMaterial({
+          map: makeMuzzleTexture(),
+          color: 0xffe6b8,
+          blending: THREE.AdditiveBlending,
+          transparent: true,
+          depthWrite: false,
+          toneMapped: false,
+        })
+      );
       flare.position.copy(muzzle.position);
+      flare.scale.setScalar(0.24);
       flare.visible = false;
       g.add(muzzle, flare);
       g.position.copy(cfg.grip).negate();
@@ -10179,6 +10381,12 @@ export default function BattleRoyaleGame() {
       w.loaded -= 1;
       cooldown = w.delay;
       flashT = 0.05;
+      if (w.flare) {
+        // every shot rolls and resizes its flash so rapid fire reads
+        // as living light, not a strobe
+        (w.flare.material as THREE.SpriteMaterial).rotation = Math.random() * Math.PI;
+        w.flare.scale.setScalar(0.19 + Math.random() * 0.1);
+      }
       refreshHud();
       applyView();
       raycaster.setFromCamera(centre, camera);
@@ -10327,7 +10535,11 @@ export default function BattleRoyaleGame() {
       const w = current;
       cooldown = Math.max(0, cooldown - dt);
       flashT -= dt;
-      if (w) w.flare.visible = flashT > 0;
+      if (w) {
+        const on = flashT > 0;
+        w.flare.visible = on;
+        if (on) w.flare.scale.setScalar(w.flare.scale.x * (1 - 2.4 * dt)); // quick decay
+      }
       kick *= Math.exp(-12 * dt);
       if (slotHold && !slotHold.held) {
         slotHold.t += dt;
@@ -14465,9 +14677,12 @@ export default function BattleRoyaleGame() {
       streamTerrain();
       streamPois();
       cullingPass(dt);
-      // Gerstner water: advance the shared wave-clock.
+      // Gerstner water: advance the shared wave-clock. The same clock
+      // drives the leaf-card wind sway (the world's breeze pauses with
+      // the world itself — only the sky runs on its own ambient clock).
       waterT += dt;
       for (const wm of waters) wm.uniforms.uTime.value = waterT;
+      tickLeafSway(waterT);
       updateGrenadePress(dt);
       updateShield(dt);
       updateMicrobots(dt); // the swarm orbits player + dummies, runs tasks
@@ -14534,6 +14749,126 @@ export default function BattleRoyaleGame() {
       updateVitals();
     }
 
+    // ----------------------------------------------------
+    // HUD OVERLAP RESOLVER — "if two things are overlapping, the
+    // less important one is removed." Every listed HUD element
+    // carries a PRIORITY; a periodic layout pass measures real DOM
+    // rects and any element colliding with a higher-priority kept
+    // box is hidden (class hud-culled). It returns automatically
+    // once the overlap goes away — rotating back to landscape or
+    // closing the map brings culled elements straight back. Modal
+    // overlays, menus and the fx layers never participate.
+    // ----------------------------------------------------
+    const HUD_RULES: Array<[string, number]> = [
+      // core controls — the game is unplayable without these
+      ['#stick', 100],
+      ['#aim', 100],
+      ['#fsBtn', 98],
+      ['.hud.vitals', 96],
+      ['#gPick', 96], // active interaction while open (skipped when closed)
+      ['#slots', 94],
+      ['.hud.ammo', 94],
+      ['#gBtn', 92],
+      ['#touchBuildBtn', 92],
+      ['#minimap', 90],
+      ['#dropPrompt', 88],
+      ['#aliveChip', 86],
+      ['#zoneChip', 86],
+      ['#turret', 84],
+      ['#gPlate', 84],
+      ['#buildWallBtn', 84],
+      ['.hud.downs', 82],
+      ['#killFeed', 80],
+      ['#tracker', 78],
+      ['#antTracker', 78],
+      ['#pickHint', 76],
+      ['.hud.hint', 70],
+      // NOTE: crosshair + hitmark are deliberately NOT listed — they sit
+      // at screen centre by design and must never compete (or the hit
+      // feedback would lose to the crosshair every pass).
+    ];
+    const HUD_EXCLUDE = '.overlay, .menu, .downed, .scope, .shield-fx, .hurt-fx, .smoke-fx, .water-fx';
+    const hudCulled = new Set<Element>();
+    let hudPasses = 0;
+    let hudT = 0;
+
+    // Stable readable key for reports: id when present, else the class
+    // chain minus our own marker (".hud.downs", never ".hud.downs.hud-culled").
+    const hudKey = (el: Element) =>
+      el.id ||
+      '.' +
+        Array.from(el.classList)
+          .filter((c) => c !== 'hud-culled')
+          .join('.');
+
+    function resolveHudOverlaps(): string[] {
+      const root = containerRef.current;
+      if (!root) return [];
+      // un-cull everything this system hid, then re-apply from scratch
+      for (const el of hudCulled) el.classList.remove('hud-culled');
+      hudCulled.clear();
+      const seen = new Set<Element>();
+      const parts: Array<{ el: Element; prio: number; r: DOMRect }> = [];
+      for (const [sel, prio] of HUD_RULES) {
+        for (const el of root.querySelectorAll(sel)) {
+          if (seen.has(el) || el.closest(HUD_EXCLUDE)) continue;
+          // the grenade picker only participates while it is actually open
+          if (el.id === 'gPick' && !el.classList.contains('open')) continue;
+          seen.add(el);
+          const r = (el as HTMLElement).getBoundingClientRect();
+          if (r.width < 4 || r.height < 4) continue; // hidden by game logic
+          parts.push({ el, prio, r });
+        }
+      }
+      // highest priority first: each element keeps its box; anything
+      // colliding with an already-kept box loses (M = near-miss margin)
+      parts.sort((a, b) => b.prio - a.prio);
+      const M = 6;
+      const kept: Array<{ el: Element; prio: number; r: DOMRect }> = [];
+      const report: string[] = [];
+      for (const p of parts) {
+        let clash = false;
+        for (const k of kept) {
+          if (
+            p.r.left < k.r.right - M &&
+            p.r.right > k.r.left + M &&
+            p.r.top < k.r.bottom - M &&
+            p.r.bottom > k.r.top + M
+          ) {
+            clash = true;
+            break;
+          }
+        }
+        if (clash) {
+          p.el.classList.add('hud-culled');
+          hudCulled.add(p.el);
+          report.push(hudKey(p.el));
+        } else {
+          kept.push(p);
+        }
+      }
+      hudPasses++;
+      return report;
+    }
+
+    function hudOverlapInfo() {
+      return {
+        passes: hudPasses,
+        culled: [...hudCulled].map(hudKey),
+        rules: HUD_RULES.length,
+      };
+    }
+
+    // A resize / orientation flip re-solves immediately (debounced) so
+    // the layout settles before the player can read it.
+    let hudResizeTimer: ReturnType<typeof setTimeout> | null = null;
+    const onHudResize = () => {
+      if (hudResizeTimer) clearTimeout(hudResizeTimer);
+      hudResizeTimer = setTimeout(() => resolveHudOverlaps(), 150);
+    };
+    window.addEventListener('resize', onHudResize);
+    window.addEventListener('orientationchange', onHudResize);
+
     renderer.autoClear = false;
     scene.traverse((o: any) => {
       if (o.isLight) o.layers.enable(1);
@@ -14562,6 +14897,17 @@ export default function BattleRoyaleGame() {
       updateAntTracker();
       renderAntennaHud();
       followSun();
+      // Ambient sky (drifting clouds + gulls) never pauses — it IS
+      // the sky, alive even behind the pause card and the menu.
+      ambT += dt;
+      updateAmbientSky();
+      // HUD overlap resolver: if two controls collide, the less
+      // important one steps aside until there is room again.
+      hudT -= dt;
+      if (hudT <= 0) {
+        hudT = 1.25;
+        resolveHudOverlaps();
+      }
 
       camera.layers.set(0);
       renderer.render(scene, camera);
@@ -14586,6 +14932,8 @@ export default function BattleRoyaleGame() {
       window.removeEventListener('mousemove', onMouseMove);
       window.removeEventListener('blur', onBlur);
       window.removeEventListener('resize', onResize);
+      window.removeEventListener('resize', onHudResize);
+      window.removeEventListener('orientationchange', onHudResize);
       window.removeEventListener('touchstart', onTouchStart);
       window.removeEventListener('touchmove', onTouchMove);
       window.removeEventListener('touchend', onTouchEnd);

@@ -100,6 +100,15 @@ canvas#game {
   padding: 8px 12px;
 }
 
+/* Task M — HUD OVERLAP RESOLVER: when two HUD elements collide on
+   screen (narrow portrait, odd aspect, transient chips), the
+   lower-priority one is auto-hidden with this class. It is removed
+   again automatically as soon as the overlap disappears (rotate
+   back to landscape, close the map, chip times out). */
+.hud-culled {
+  display: none !important;
+}
+
 .downs {
   top: 16px; /* right of the fullscreen corner button */
   left: 68px;
