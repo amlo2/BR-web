@@ -284,6 +284,10 @@ export function makeSkyDome(opts: {
     uSunDir: { value: opts.sunDir.clone().normalize() },
     uTime: { value: 0 },
     uNoise: { value: makeNoiseTexture() },
+    // Task N darkzone: 0 = bright day, 1 = storm-shroud night. The game
+    // lerps this as the camera crosses into the danger zone (or a cave)
+    // so the whole sky — clouds, sun disc and all — dies to near-black.
+    uDark: { value: 0 },
   };
   const toneTail =
     opts.toneMapped === false
@@ -296,6 +300,7 @@ export function makeSkyDome(opts: {
     uniform vec3 uSunColor;
     uniform vec3 uSunDir;
     uniform float uTime;
+    uniform float uDark;
     uniform sampler2D uNoise;
     varying vec3 vDir;
     void main() {
@@ -319,6 +324,11 @@ export function makeSkyDome(opts: {
       }
       float sd = max(dot(d, normalize(uSunDir)), 0.0);
       col += uSunColor * (pow(sd, 900.0) * 3.0 + pow(sd, 9.0) * 0.18);
+      // Darkzone blend: the storm shroud swallows the sky. A whisper of
+      // violet stays so "black" still reads as storm, never as a bug.
+      vec3 darkCol = vec3(0.010, 0.007, 0.024)
+        + 0.012 * vec3(0.30, 0.16, 0.55) * (0.5 + 0.5 * sin(uTime * 0.7 + d.y * 6.0));
+      col = mix(col, darkCol, clamp(uDark, 0.0, 1.0));
       gl_FragColor = vec4(col, 1.0);${toneTail}
     }
   `;

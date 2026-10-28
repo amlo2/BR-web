@@ -408,6 +408,20 @@ body.aiming .crosshair {
   pointer-events: none;
 }
 
+/* Task N — storm-shroud vignette: the screen's own darkness when the
+   camera is inside the dangerzone. Opacity is driven by updateDarkness
+   (never transitions — it lerps in JS with the light rig). */
+.storm-fx {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  opacity: 0;
+  background:
+    radial-gradient(ellipse at 50% 46%, rgba(6, 3, 14, 0.1) 0%, rgba(4, 2, 10, 0.5) 62%, rgba(2, 1, 6, 0.86) 100%),
+    radial-gradient(ellipse at 50% 120%, rgba(88, 46, 160, 0.12) 0%, transparent 60%);
+}
+
 .water-fx {
   position: fixed;
   inset: 0;

@@ -24,6 +24,7 @@ import {
   makeContactShadowMaterial,
   makeMuzzleTexture,
   makeBirdTexture,
+  makeNoiseTexture,
   tickLeafSway,
   setLitePBR,
   type PBRKind,
@@ -137,8 +138,15 @@ export default function BattleRoyaleGame() {
     camera.rotation.order = 'YXZ';
     scene.add(camera);
 
-    scene.add(new THREE.HemisphereLight(0xc7ddf5, 0x6f6a54, 2.1));
+    const hemi = new THREE.HemisphereLight(0xc7ddf5, 0x6f6a54, 2.1);
+    scene.add(hemi);
     const sun = new THREE.DirectionalLight(0xfff2df, 3.1);
+    // Task N baseline light levels — updateDarkness lerps away from these
+    // as the camera crosses into the storm shroud or a cave.
+    const SUN_I = 3.1;
+    const HEMI_I = 2.1;
+    const ENV_I = 0.55;
+    const EXPOSURE_I = 1.12;
     const SUN_OFFSET = new THREE.Vector3(40, 60, 25);
     sun.position.copy(SUN_OFFSET);
     if (!isHeadless) {
@@ -158,6 +166,98 @@ export default function BattleRoyaleGame() {
       sun.target.updateMatrixWorld();
       sun.position.set(camera.position.x + SUN_OFFSET.x, SUN_OFFSET.y, camera.position.z + SUN_OFFSET.z);
       skyDome.position.copy(camera.position);
+    }
+
+    // ----------------------------------------------------
+    // Task N — REAL-TIME DYNAMIC LIGHTS. The darkzone (storm shroud,
+    // caves) kills the sun, so light has to come from somewhere:
+    // gunfire, fire bombs and blast bombs now carry pooled PointLights.
+    // Burst pool: short muzzle-flash / explosion spikes that decay in
+    // well under a second. Sustain pool: fire-zone braziers that live
+    // as long as the flames do. Both are pre-allocated (no GC churn,
+    // bounded shader cost) and re-seize the oldest slot under load.
+    // ----------------------------------------------------
+    const BURST_N = 6;
+    const SUSTAIN_N = 4;
+    interface BurstLight {
+      light: THREE.PointLight;
+      t: number; // elapsed
+      life: number;
+      peak: number;
+    }
+    const burstPool: BurstLight[] = [];
+    let burstFired = 0; // cumulative — e2e proof shots fire light
+    for (let i = 0; i < BURST_N; i++) {
+      const light = new THREE.PointLight(0xffc46b, 0, 18, 2);
+      light.castShadow = false;
+      light.visible = false; // idle lights sit OUT of the render pass — zero shader cost
+      scene.add(light);
+      burstPool.push({ light, t: 1, life: 1, peak: 0 });
+    }
+    const sustainPool: Array<{ light: THREE.PointLight; used: boolean }> = [];
+    for (let i = 0; i < SUSTAIN_N; i++) {
+      const light = new THREE.PointLight(0xff7a18, 0, 26, 2);
+      light.castShadow = false;
+      light.visible = false;
+      scene.add(light);
+      sustainPool.push({ light, used: false });
+    }
+
+    function flashLight(x: number, y: number, z: number, color: number, intensity: number, dist: number, life: number) {
+      // re-seize the most-spent slot — under heavy fire the oldest flash
+      // dies so the newest always reads (classic particle-pool trick)
+      let slot = burstPool[0];
+      for (const b of burstPool) {
+        if (b.t >= b.life) {
+          slot = b;
+          break;
+        }
+        if (b.t / b.life > slot.t / slot.life) slot = b;
+      }
+      slot.light.color.setHex(color);
+      slot.light.distance = dist;
+      slot.light.position.set(x, y, z);
+      slot.t = 0;
+      slot.life = life;
+      slot.peak = intensity;
+      slot.light.intensity = intensity;
+      slot.light.visible = true; // joins the render pass only while alive
+      burstFired++;
+    }
+
+    function claimSustainLight(x: number, y: number, z: number) {
+      const s = sustainPool.find((e) => !e.used) || null;
+      if (!s) return null; // pool full — the flames just burn dark
+      s.used = true;
+      s.light.position.set(x, y, z);
+      s.light.color.setHex(0xff7a18);
+      s.light.distance = 26;
+      s.light.intensity = 46;
+      s.light.visible = true;
+      return s;
+    }
+
+    function releaseSustainLight(s: { light: THREE.PointLight; used: boolean } | null) {
+      if (!s) return;
+      s.used = false;
+      s.light.intensity = 0;
+      s.light.visible = false;
+    }
+
+    function updateLights(dt: number) {
+      for (const b of burstPool) {
+        if (b.t >= b.life) {
+          if (b.light.visible) {
+            b.light.intensity = 0;
+            b.light.visible = false;
+          }
+          continue;
+        }
+        b.t += dt;
+        const k = Math.min(1, b.t / b.life);
+        // quadratic falloff: a hot snap, then a fast dying ember
+        b.light.intensity = b.peak * (1 - k) * (1 - k);
+      }
     }
 
     // ----------------------------------------------------
@@ -515,6 +615,254 @@ export default function BattleRoyaleGame() {
     const flatZones: PoiZone[] = [];
 
     // ----------------------------------------------------
+    // Task N — CAVES. Hillside tunnels carved straight into the
+    // heightfield: a walkable ramp gully dives under an extruded rock
+    // arch, the trench floor IS terrain (groundAt/movement/bullets all
+    // agree on it for free), and the interior sits in permanent gloom —
+    // gunfire and fire bombs are the only light down there. Sited only
+    // on thick mountain flanks, clear of every POI / road / war prop.
+    // ----------------------------------------------------
+    const CAVE_FLAT = 5.5; // flat trench half-width (>= TILE_STEP so the 5 m mesh grid always samples the floor)
+    const CAVE_BLEND = 10.5; // carve blend outer half-width (trench wall)
+    const CAVE_RI = 5.6; // rock arch inner radius (interior clearance)
+    const CAVE_RW = 8.8; // rock arch outer radius (band thickness ~3.2 m)
+    const CAVE_SPRING = 0.6; // arch centre above the floor
+    interface CaveSite {
+      mx: number;
+      mz: number; // mouth (entrance) centre
+      ax: number;
+      az: number; // unit tunnel axis, mouth -> end (into the hill)
+      len: number;
+      mouthY: number; // natural surface at the mouth
+      floorY: number; // flat cave floor height
+    }
+    const caves: CaveSite[] = [];
+    let caveGroup: THREE.Group | null = null;
+    let caveRockMat: THREE.MeshStandardMaterial | null = null;
+    const caveLoot: PickupItem[] = [];
+
+    // Trench floor height along the tunnel axis at (t = along, from the
+    // mouth). t < 0 is the approach gully, rising away from the mouth.
+    function caveFloorAt(c: CaveSite, t: number) {
+      if (t < 0) return c.mouthY - 0.35 + -t * 0.32;
+      const rampIn = 1 - THREE.MathUtils.smoothstep(t, 2, 15); // descend from the mouth
+      const rampOut = THREE.MathUtils.smoothstep(t, c.len - 9, c.len); // rise at the back
+      return c.floorY + (c.mouthY - 0.35 - c.floorY) * rampIn + 2.2 * rampOut;
+    }
+
+    // Project (x,z) onto a cave's axis: t = along (0 mouth, len end),
+    // s = sideways. Both in world metres.
+    function caveAxis(c: CaveSite, x: number, z: number) {
+      const rx = x - c.mx;
+      const rz = z - c.mz;
+      return { t: rx * c.ax + rz * c.az, s: -rx * c.az + rz * c.ax };
+    }
+
+    // Cave footprint for vegetation exclusion (trench + gully + arch).
+    function nearCaveFootprint(x: number, z: number, pad = 2.5) {
+      for (const c of caves) {
+        const { t, s } = caveAxis(c, x, z);
+        if (t > -13 - pad && t < c.len + pad && Math.abs(s) < CAVE_BLEND + pad) return true;
+      }
+      return false;
+    }
+
+    // Is a point INSIDE a cave's dark interior volume?
+    function caveDarkAt(x: number, y: number, z: number) {
+      for (const c of caves) {
+        const { t, s } = caveAxis(c, x, z);
+        if (t > 3 && t < c.len - 3 && Math.abs(s) < CAVE_FLAT - 0.5 && y < c.floorY + CAVE_SPRING + CAVE_RI + 0.2) return c;
+      }
+      return null;
+    }
+
+    function generateCaves() {
+      // Deterministic per seed: same island, same caves.
+      const rnd = mulberry32((terrainSeed ^ 0x9e3779b9) >>> 0);
+      const sites: Array<{ x: number; z: number; ax: number; az: number; score: number }> = [];
+      const G = 48;
+      for (let x = -1250; x <= 1250; x += G) {
+        for (let z = -1250; z <= 1250; z += G) {
+          const jitter = 0.5 + rnd() * 0.9;
+          const px = x + (rnd() - 0.5) * G;
+          const pz = z + (rnd() - 0.5) * G;
+          const h = terrainHeight(px, pz);
+          if (h < 24 || h > 85) continue; // mountain flank, not beach nor snowpeak
+          if (seaDist(px, pz) > -90) continue; // well inland
+          biomeWeights(px, pz, BW);
+          if (BW.lw > 0.25) continue; // never under a lake
+          // Hillside: slope gentle enough to walk, steep enough to tunnel
+          const gx = terrainHeight(px + 7, pz) - terrainHeight(px - 7, pz);
+          const gz = terrainHeight(px, pz + 7) - terrainHeight(px, pz - 7);
+          const slope = Math.hypot(gx, gz) / 14;
+          if (slope < 0.16 || slope > 0.9) continue;
+          // Clear of everything people built
+          let bad = false;
+          for (const f of flatZones) {
+            if (Math.hypot(px - f.x, pz - f.z) < f.r + 45) {
+              bad = true;
+              break;
+            }
+          }
+          if (bad) continue;
+          const np = nearPath(px, pz);
+          if (np && np.d < np.w / 2 + 26) continue;
+          for (const w of warZones) {
+            if (Math.hypot(px - w.x, pz - w.z) < w.r + 25) {
+              bad = true;
+              break;
+            }
+          }
+          if (bad) continue;
+          if (harborAnchor && Math.hypot(px - harborAnchor.x, pz - harborAnchor.z) < portClearR + 60) continue;
+          if (Math.hypot(px - HARBOR_SPAWN.x, pz - HARBOR_SPAWN.z) < 130) continue;
+          for (const s of sites) {
+            if (Math.hypot(px - s.x, pz - s.z) < 260) {
+              bad = true;
+              break;
+            }
+          }
+          if (bad) continue;
+          // Tunnel heads UPHILL into the rock (along the gradient)
+          const inv = 1 / (Math.hypot(gx, gz) || 1);
+          sites.push({ x: px, z: pz, ax: gx * inv, az: gz * inv, score: BW.mw * 2 + jitter * (1 - Math.abs(slope - 0.4)) });
+        }
+      }
+      sites.sort((a, b) => b.score - a.score);
+      const built: CaveSite[] = [];
+      for (const s of sites) {
+        if (built.length >= 3) break;
+        let clash = false;
+        for (const c of built) {
+          if (Math.hypot(s.x - c.mx, s.z - c.mz) < 260) {
+            clash = true;
+            break;
+          }
+        }
+        if (clash) continue;
+        const len = 46 + rnd() * 24;
+        const ex = s.x + s.ax * len;
+        const ez = s.z + s.az * len;
+        const mouthY = terrainHeight(s.x, s.z);
+        const endH = terrainHeight(ex, ez);
+        if (endH - mouthY < len * 0.1) continue; // the hill must keep rising over the tunnel
+        const depth = THREE.MathUtils.clamp(endH - mouthY - 2, 4.5, 8);
+        const floorY = mouthY - depth;
+        // Solid rock above the outer arch at 60% and 85% of the run
+        let solid = true;
+        for (const k of [0.6, 0.85]) {
+          if (terrainHeight(s.x + s.ax * len * k, s.z + s.az * len * k) < floorY + CAVE_SPRING + CAVE_RW - 0.4) solid = false;
+        }
+        if (!solid) continue;
+        built.push({ mx: s.x, mz: s.z, ax: s.ax, az: s.az, len, mouthY, floorY });
+      }
+      caves.length = 0;
+      for (const c of built) caves.push(c);
+      if (!caves.length) return 0;
+      // ---- Rock arches (shared material, one group) ----
+      caveGroup = new THREE.Group();
+      caveRockMat = MAT({ color: 0x6e6a61 }, 'rock');
+      for (const c of caves) {
+        const band = new THREE.Shape();
+        band.moveTo(CAVE_RI, 0);
+        band.absarc(0, 0, CAVE_RI, 0, Math.PI, false);
+        band.lineTo(-CAVE_RW, 0);
+        band.absarc(0, 0, CAVE_RW, Math.PI, 0, true);
+        band.closePath();
+        const roofGeo = new THREE.ExtrudeGeometry(band, { depth: c.len, bevelEnabled: false, curveSegments: 22 });
+        const roof = new THREE.Mesh(roofGeo, caveRockMat);
+        roof.rotation.y = Math.atan2(c.ax, c.az); // local +Z -> tunnel axis
+        roof.position.set(c.mx, c.floorY + CAVE_SPRING, c.mz);
+        roof.castShadow = true;
+        roof.receiveShadow = true;
+        const mid = { x: c.mx + c.ax * c.len * 0.5, z: c.mz + c.az * c.len * 0.5 };
+        roof.userData.wc = mid; // nearShootable pre-filter anchor
+        roof.userData.caveRoof = true; // clearCaves removes it with the map
+        caveGroup.add(roof);
+        shootable.push(roof);
+        // Back wall closes the tube (half-disc at the far end)
+        const disc = new THREE.Shape();
+        disc.absarc(0, 0, CAVE_RI, 0, Math.PI, false);
+        disc.closePath();
+        const backGeo = new THREE.ShapeGeometry(disc, 22);
+        const back = new THREE.Mesh(backGeo, caveRockMat);
+        back.rotation.y = Math.atan2(c.ax, c.az);
+        back.position.set(c.mx + c.ax * (c.len - 0.06), c.floorY + CAVE_SPRING, c.mz + c.az * (c.len - 0.06));
+        back.castShadow = true;
+        back.userData.wc = mid;
+        back.userData.caveRoof = true;
+        caveGroup.add(back);
+        shootable.push(back);
+        // Boulders frame the mouth so the arch reads as bedrock, not a tube
+        for (let b = 0; b < 3; b++) {
+          const side = b === 2 ? 0 : b === 0 ? -1 : 1;
+          const off = side === 0 ? -3.2 : 6.5 + rnd() * 2.4;
+          const bx = c.mx - c.ax * off + -c.az * side * (CAVE_RW + 1.5) * (side ? 1 : 0) + (side === 0 ? -c.az * (rnd() - 0.5) * 6 : 0);
+          const bz = c.mz - c.az * off + c.ax * side * (CAVE_RW + 1.5) * (side ? 1 : 0) + (side === 0 ? c.ax * (rnd() - 0.5) * 6 : 0);
+          const r = 1.4 + rnd() * 1.1;
+          const rock = new THREE.Mesh(new THREE.DodecahedronGeometry(r, 0), caveRockMat);
+          rock.position.set(bx, terrainHeight(bx, bz) + r * 0.25, bz);
+          rock.rotation.set(rnd() * 3, rnd() * 3, rnd() * 3);
+          rock.castShadow = true;
+          rock.receiveShadow = true;
+          rock.userData.wc = { x: bx, z: bz };
+          rock.userData.caveRoof = true;
+          caveGroup.add(rock);
+          shootable.push(rock);
+        }
+        // ---- Loot: a treasure reason to go dark ----
+        const lootKinds = [
+          ['smg', 'sk', 'sniper', 'betgun'][Math.floor(rnd() * 4)],
+          'shield',
+          rnd() < 0.5 ? 'heavy' : 'light',
+        ];
+        lootKinds.forEach((kind, i) => {
+          const t = c.len * (0.45 + 0.25 * i);
+          const s = (i - 1) * 1.6;
+          const lx = c.mx + c.ax * t + -c.az * s;
+          const lz = c.mz + c.az * t + c.ax * s;
+          const group = pickupMesh(kind);
+          group.position.set(lx, caveFloorAt(c, t) + 0.05, lz);
+          group.userData.poi = -1;
+          caveGroup!.add(group);
+          const p: PickupItem = { kind, x: lx, z: lz, group, taken: false, timer: 0 };
+          caveLoot.push(p);
+          pickups.push(p);
+        });
+        // Compass / tactical mark at the mouth
+        harborMarks.push({ x: c.mx - c.ax * 7, z: c.mz - c.az * 7, label: 'CAVE', cls: 'c-cave' });
+      }
+      scene.add(caveGroup);
+      return caves.length;
+    }
+
+    function clearCaves() {
+      if (caveGroup) {
+        scene.remove(caveGroup);
+        caveGroup.traverse((o: any) => {
+          o.geometry?.dispose?.();
+        });
+        caveGroup = null;
+      }
+      caveRockMat?.dispose();
+      caveRockMat = null;
+      caves.length = 0;
+      // loot + roof meshes leave the registries with the map
+      for (const p of caveLoot) {
+        const i = pickups.indexOf(p);
+        if (i >= 0) pickups.splice(i, 1);
+      }
+      caveLoot.length = 0;
+      for (let i = shootable.length - 1; i >= 0; i--) {
+        const o = shootable[i] as any;
+        if (o.userData?.caveRoof) shootable.splice(i, 1);
+      }
+      for (let i = harborMarks.length - 1; i >= 0; i--) {
+        if (harborMarks[i].label === 'CAVE') harborMarks.splice(i, 1);
+      }
+    }
+
+    // ----------------------------------------------------
     // Transition routes: a seeded road network that stitches every
     // POI (and the port gate) together with dust trails, mud tracks
     // and gravel roads. Rendered as terrain-vertex colour overrides
@@ -622,6 +970,23 @@ export default function BattleRoyaleGame() {
           const t = 1 - THREE.MathUtils.smoothstep(fd, f.r - 10, f.r + 22);
           h += (f.baseY - h) * t;
         }
+      }
+      // CAVE TRENCH, applied absolutely last: nothing may re-fill a
+      // tunnel. Inside |s| <= CAVE_FLAT the ground IS the cave floor; the
+      // blend out to CAVE_BLEND raises the near-vertical rock walls. The
+      // flat band is wider than the 5 m mesh grid so the streamed tiles
+      // always sample true floor height (no ridges down the middle).
+      for (const c of caves) {
+        const rx = x - c.mx;
+        const rz = z - c.mz;
+        const t = rx * c.ax + rz * c.az;
+        if (t < -12 || t > c.len + 6) continue;
+        const as = Math.abs(-rx * c.az + rz * c.ax);
+        if (as > CAVE_BLEND) continue;
+        const k = 1 - THREE.MathUtils.smoothstep(as, CAVE_FLAT, CAVE_BLEND);
+        if (k <= 0) continue;
+        const floor = caveFloorAt(c, t);
+        if (h > floor) h += (floor - h) * k;
       }
       return h;
     }
@@ -1625,6 +1990,9 @@ export default function BattleRoyaleGame() {
         // transition routes read as walked corridors, not noise
         const npv = nearPath(vx, vz);
         if (npv && npv.d < npv.w / 2 + 1.5) continue;
+        // Cave mouths own their clearing too — no pine growing through
+        // a rock arch, no boulder plugging the gully ramp
+        if (caves.length && nearCaveFootprint(vx, vz)) continue;
         const h = terrainHeight(vx, vz);
         biomeWeights(vx, vz, VW);
         const pick = rnd();
@@ -4027,6 +4395,12 @@ export default function BattleRoyaleGame() {
 
     function probeSunlit(x: number, z: number, headY: number) {
       if (headY < WATER_Y + 0.25) return 'submerged';
+      // Task N — the storm shroud owns the sky over the dangerzone: the
+      // sun never reaches under it, so the solar swarm CANNOT recharge
+      // outside the circle (and neither can the bots').
+      if (brOn && Math.hypot(x - brZone.cx, z - brZone.cz) > brZone.r) return 'storm';
+      // Caves are underground: the rock overhead eats the daylight.
+      if (caveDarkAt(x, headY, z)) return 'cave';
       if (overheadAt(x, z, headY + 0.4, headY + 90) !== null) return 'roof';
       if (canopyShade(x, z, headY)) return 'canopy';
       return 'sun';
@@ -4931,10 +5305,82 @@ export default function BattleRoyaleGame() {
         if (under) {
           f.color.setHex(SEA_FOG.color);
           f.density = SEA_FOG.density;
+        } else if (darkWhy === 'storm' || darkWhy === 'cave') {
+          // updateDarkness owns the atmosphere above water; the murky
+          // sea only wins while the camera is actually submerged
+          f.color.setHex(darkWhy === 'storm' ? DARK_FOG.color : CAVE_FOG.color);
+          f.density = darkWhy === 'storm' ? DARK_FOG.density : CAVE_FOG.density;
         } else {
           f.color.setHex(AIR_FOG.color);
           f.density = AIR_FOG.density;
         }
+      }
+    }
+
+    // ----------------------------------------------------
+    // Task N — THE DARKZONE STATE MACHINE. One scalar, `dark` (0 = noon,
+    // 1 = pitch black), drives EVERY atmospheric channel in lockstep:
+    // sun, hemisphere sky-light, image-based ambience, exposure, fog
+    // colour + density and the sky-dome shader. Crossing into the storm
+    // shroud or stepping under a cave's rock arch ramps it in ~0.4 s so
+    // darkness feels like weather, not a screen swap. Under the shroud
+    // the only light left is REAL-TIME: gunfire flashes, fire-bomb
+    // braziers and blast-bomb fireballs (the pooled PointLights above).
+    // ----------------------------------------------------
+    const DARK_FOG = { color: 0x050308, density: 0.028 }; // storm: black-violet, ~35 m visibility
+    const CAVE_FOG = { color: 0x06070b, density: 0.05 }; // cave: close, dead air
+    let darkLevel = 0;
+    let darkWhy: 'sun' | 'storm' | 'cave' = 'sun';
+    let stormMsgT = 0;
+    const stormFxEl = $('stormFx');
+    const darkFogColor = new THREE.Color(AIR_FOG.color);
+
+    function updateDarkness(dt: number) {
+      const inCave = !!caveDarkAt(camera.position.x, camera.position.y - eyeH + 0.4, camera.position.z);
+      // Mid-drop the storm has no claim on you — the shroud wall never
+      // bites parachutists (matches the storm-damage exemption).
+      const inStorm = brOn && !brPlayer && Math.hypot(camera.position.x - brZone.cx, camera.position.z - brZone.cz) > brZone.r;
+      const why: 'sun' | 'storm' | 'cave' = inStorm ? 'storm' : inCave ? 'cave' : 'sun';
+      const target = why === 'storm' ? 1 : why === 'cave' ? 0.78 : 0;
+      if (why !== darkWhy) {
+        darkWhy = why;
+        // snap-lerp baseline so leaving the dark re-reads AIR_FOG exactly
+        if (why === 'storm' && stormMsgT <= 0 && !playerDown) {
+          stormMsgT = 9;
+          showMessage('🌑 The storm shroud blocks the sun — no solar recharge out here', 2.8);
+        }
+      }
+      stormMsgT = Math.max(0, stormMsgT - dt);
+      darkLevel += (target - darkLevel) * Math.min(1, 2.6 * dt);
+      if (darkLevel < 0.002 && target === 0) darkLevel = 0;
+      const d = darkLevel;
+      // Light rig: sun dies to a sliver, sky-light to a whisper, the
+      // image-based ambience to nothing. Tone-mapping exposure follows so
+      // the dark reads as NIGHT, not as underexposed noon.
+      sun.intensity = SUN_I * (1 - 0.97 * d);
+      hemi.intensity = HEMI_I * (1 - 0.94 * d);
+      if (scene.environment) scene.environmentIntensity = ENV_I * (1 - d);
+      renderer.toneMappingExposure = EXPOSURE_I - 0.55 * d;
+      (skyMat.uniforms.uDark as { value: number }).value = d;
+      if (stormFxEl) stormFxEl.style.opacity = (why === 'storm' ? d * 0.55 : 0).toFixed(3);
+      // Atmosphere: fog colour/density lerp between AIR and the active
+      // dark target; scene.background follows so the horizon never glows.
+      if (!underFx) {
+        const f = scene.fog as THREE.FogExp2 | null;
+        if (f) {
+          const tgt = why === 'storm' ? DARK_FOG : why === 'cave' ? CAVE_FOG : null;
+          if (tgt) {
+            darkFogColor.setHex(AIR_FOG.color).lerp(new THREE.Color(tgt.color), d);
+            f.color.copy(darkFogColor);
+            f.density = AIR_FOG.density + (tgt.density - AIR_FOG.density) * d;
+          } else {
+            f.color.setHex(AIR_FOG.color);
+            f.density = AIR_FOG.density;
+          }
+        }
+        (scene.background as THREE.Color).setHex(
+          why === 'storm' ? DARK_FOG.color : why === 'cave' ? CAVE_FOG.color : AIR_FOG.color
+        ).lerp(new THREE.Color(AIR_FOG.color), 1 - d);
       }
     }
 
@@ -7441,6 +7887,7 @@ export default function BattleRoyaleGame() {
         (d.group.parent || world).remove(d.group);
       }
       clearPois(); // reclaim any previous map's POIs, pickups and pads
+      clearCaves(); // Task N: the old map's tunnels + loot go with it
       dummies.length = 0;
       releaseAllBotFields(); // every dummy's microbot swarm goes with it
       spots.length = 0;
@@ -7469,6 +7916,7 @@ export default function BattleRoyaleGame() {
       generatePois();
       generatePaths(); // road network paints onto the tiles as they stream
       generateWarProps(); // scattered battlefield dressing, clear of POIs
+      generateCaves(); // Task N: hillside caves — carved before the tiles stream
       woodRes = 60; // fresh harvest purse per match
       refreshWood();
       streamTerrain(true);
@@ -7518,6 +7966,7 @@ export default function BattleRoyaleGame() {
       rangeBackup = null;
       brCleanup(); // end any BR match state if it leaked in
       clearPois();
+      clearCaves(); // the island's tunnels never leak into the range
       // strip every harbor / BR dummy figure
       for (const d of dummies) {
         (d.group.parent || world).remove(d.group);
@@ -7873,10 +8322,56 @@ export default function BattleRoyaleGame() {
     // a drifting centre. Outside it bleeds: bots and you alike.
     // ----------------------------------------------------
     const brZoneWall = new THREE.Mesh(
-      new THREE.CylinderGeometry(1, 1, 340, 64, 1, true),
-      new THREE.MeshBasicMaterial({ toneMapped: false, color: 0x8b5cf6, transparent: true, opacity: 0.14, side: THREE.DoubleSide, depthWrite: false })
+      new THREE.CylinderGeometry(1, 1, 460, 72, 1, true),
+      // Task N — THE SHROUD: the old 14%-violet hint wall became a
+      // wall of DARKNESS. Scrolling storm-noise over a near-black
+      // violet body, fully opaque at eye level (nothing inside the
+      // dangerzone can be seen through it) melting into the sky at the
+      // top, with rare violet lightning crawling through the murk.
+      new THREE.ShaderMaterial({
+        uniforms: {
+          uTime: { value: 0 },
+          uNoise: { value: makeNoiseTexture() },
+        },
+        transparent: true,
+        depthWrite: false,
+        side: THREE.DoubleSide,
+        fog: false,
+        vertexShader: /* glsl */ `
+          varying vec2 vUv;
+          void main() {
+            vUv = uv;
+            gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+          }
+        `,
+        fragmentShader: /* glsl */ `
+          uniform float uTime;
+          uniform sampler2D uNoise;
+          varying vec2 vUv;
+          void main() {
+            // two scrolling noise octaves = churning storm murk
+            float n1 = texture2D(uNoise, vUv * vec2(26.0, 5.0) + vec2(uTime * 0.021, uTime * 0.006)).r;
+            float n2 = texture2D(uNoise, vUv * vec2(58.0, 9.0) - vec2(uTime * 0.034, uTime * 0.011)).r;
+            float churn = n1 * 0.62 + n2 * 0.38;
+            // near-black violet body — darker in the guts, a breath of
+            // violet at the banding so it reads as STORM, not as a hole
+            vec3 body = mix(vec3(0.012, 0.008, 0.030), vec3(0.075, 0.038, 0.155), 0.35 * churn);
+            // rare lightning crawling through: thin flickers, never a strobe
+            float li = smoothstep(0.74, 0.93, n2) * smoothstep(0.45, 0.85, n1);
+            body += vec3(0.34, 0.20, 0.62) * li * (0.35 + 0.4 * sin(uTime * 2.3 + n1 * 31.0));
+            // vertical melt: solid darkness at ground level, dissolving
+            // into the sky near the top so the horizon stays a storm,
+            // never a lid
+            float vFade = 1.0 - smoothstep(0.52, 0.98, vUv.y);
+            float alpha = (0.93 + 0.05 * churn) * vFade;
+            gl_FragColor = vec4(body, alpha);
+          }
+        `,
+      })
     );
     brZoneWall.visible = false;
+    brZoneWall.renderOrder = 500; // draw over the sea + leaf cards it occludes
+    brZoneWall.frustumCulled = false; // spans the whole playfield
     scene.add(brZoneWall);
     const brZone = { cx: 0, cz: 0, r: 2600, stage: 0, phase: 'hold', t: 0, r0: 2600, c0x: 0, c0z: 0, r1: 2600, c1x: 0, c1z: 0, dur: 1, dps: 0 };
     const BR_ZONE_STAGES = [
@@ -7928,9 +8423,14 @@ export default function BattleRoyaleGame() {
       } else {
         brZone.dps = 18; // fully collapsed — permanent storm
       }
-      brZoneWall.position.set(brZone.cx, 150, brZone.cz);
+      brZoneWall.position.set(brZone.cx, 170, brZone.cz);
       brZoneWall.scale.set(brZone.r, 1, brZone.r);
-      (brZoneWall.material as THREE.MeshBasicMaterial).opacity = 0.13 + 0.04 * Math.sin(brT * 1.7);
+      ((brZoneWall.material as THREE.ShaderMaterial).uniforms.uTime as { value: number }).value = brT;
+      // Distance cull: while the circle is huge (drop phase) the wall is
+      // far beyond both the fog and the far plane — skip the fullscreen
+      // transparent pass entirely. It pops in once it matters (< 750 m).
+      const wallGap = Math.abs(Math.hypot(camera.position.x - brZone.cx, camera.position.z - brZone.cz) - brZone.r);
+      brZoneWall.visible = wallGap < 750;
       // the storm ignores altitude but never bites mid-drop
       if (!brPlayer && Math.hypot(camera.position.x - brZone.cx, camera.position.z - brZone.cz) > brZone.r) {
         hurtPlayer(brZone.dps * dt, 0);
@@ -9068,6 +9568,45 @@ export default function BattleRoyaleGame() {
               explode(x, z, r, dmg, 0, undefined, undefined, y);
               return true;
             },
+            // Task N probes — sun/shroud state at any world point, a
+            // fire zone without the throw, and a cave-mouth teleport
+            sunlitAt: (x: number, z: number, y?: number) => probeSunlit(x, z, y ?? groundAt(x, z) + 1.7),
+            fireZoneAt: (x: number, z: number) => {
+              fireZone(x, z);
+              return true;
+            },
+            caveMouth: () => {
+              const c = caves[0];
+              if (!c) return null;
+              return {
+                mouth: { x: +c.mx.toFixed(1), z: +c.mz.toFixed(1), y: +groundAt(c.mx, c.mz).toFixed(1) },
+                mid: { x: +(c.mx + c.ax * c.len * 0.5).toFixed(1), z: +(c.mz + c.az * c.len * 0.5).toFixed(1), y: +(c.floorY + 1.7).toFixed(1) },
+                count: caves.length,
+              };
+            },
+            // Task N — snap the storm circle to a late stage so e2e can
+            // test the darkzone without waiting out the 78 s first hold
+            zoneJump: (stage = 2) => {
+              const cfg = BR_ZONE_STAGES[stage];
+              if (!cfg) return false;
+              brZone.stage = stage;
+              brZone.phase = 'hold';
+              brZone.t = 0;
+              brZone.r = cfg.r;
+              brZone.r0 = cfg.r;
+              brZone.cx = 0;
+              brZone.cz = 0;
+              brZone.dps = cfg.dps;
+              return true;
+            },
+            // Task N — aim the camera at a world point (screenshots of the
+            // shroud wall need to actually face it)
+            lookAt: (x: number, z: number) => {
+              yaw = Math.atan2(-(x - camera.position.x), -(z - camera.position.z));
+              pitch = 0;
+              kick = 0;
+              return true;
+            },
             dummiesInfo: () =>
               dummies.map((d) => ({
                 hp: +d.hp.toFixed(1),
@@ -9248,6 +9787,58 @@ export default function BattleRoyaleGame() {
                 exposure: renderer.toneMappingExposure,
                 shadowType: renderer.shadowMap.type, // 2 = PCFSoft
                 shadowSize: renderer.shadowMap.enabled ? (isHeadless ? 0 : sun.shadow.mapSize.x) : 0,
+                // Task N — darkzone state (storm shroud / cave gloom)
+                dark: {
+                  level: +darkLevel.toFixed(3),
+                  why: darkWhy,
+                  sunI: +sun.intensity.toFixed(2),
+                  hemiI: +hemi.intensity.toFixed(2),
+                  envI: +scene.environmentIntensity.toFixed(3),
+                  skyDark: +((skyMat.uniforms.uDark as { value: number })?.value ?? -1).toFixed(3),
+                },
+                // Task N — dynamic light pools (gunfire / fire / blasts)
+                lights: {
+                  burstPool: burstPool.length,
+                  burstCount: burstFired,
+                  burstActive: burstPool.reduce((n, b) => n + (b.t < b.life ? 1 : 0), 0),
+                  burstPeak: burstPool.reduce((m, b) => Math.max(m, b.light.intensity), 0),
+                  sustainPool: sustainPool.length,
+                  sustainActive: sustainPool.reduce((n, s) => n + (s.used ? 1 : 0), 0),
+                },
+                // Task N — caves: sites, carve proof, interior probe
+                caves: (() => {
+                  const c0 = caves[0];
+                  const probe = c0
+                    ? {
+                        x: +(c0.mx + c0.ax * c0.len * 0.5).toFixed(1),
+                        z: +(c0.mz + c0.az * c0.len * 0.5).toFixed(1),
+                        floor: +groundAt(c0.mx + c0.ax * c0.len * 0.5, c0.mz + c0.az * c0.len * 0.5).toFixed(1),
+                        mouthY: +c0.mouthY.toFixed(1),
+                        sunlit: probeSunlit(c0.mx + c0.ax * c0.len * 0.5, c0.mz + c0.az * c0.len * 0.5, c0.floorY + 1.6),
+                        darkInside: !!caveDarkAt(c0.mx + c0.ax * c0.len * 0.5, c0.floorY + 1.6, c0.mz + c0.az * c0.len * 0.5),
+                      }
+                    : null;
+                  return {
+                    count: caves.length,
+                    loot: caveLoot.filter((p) => !p.taken).length,
+                    sites: caves.map((c) => ({
+                      x: +c.mx.toFixed(0),
+                      z: +c.mz.toFixed(0),
+                      len: +c.len.toFixed(0),
+                      mouthY: +c.mouthY.toFixed(1),
+                      floorY: +c.floorY.toFixed(1),
+                    })),
+                    probe,
+                  };
+                })(),
+                // Task N — the storm shroud wall (dark, shader-driven)
+                zoneWall: {
+                  shader: (brZoneWall.material as THREE.ShaderMaterial).isShaderMaterial === true,
+                  visible: brZoneWall.visible,
+                  height: (brZoneWall.geometry as THREE.CylinderGeometry).parameters.height,
+                  uTime: +((brZoneWall.material as THREE.ShaderMaterial).uniforms.uTime as { value: number })?.value.toFixed(2),
+                  r: Math.round(brZone.r),
+                },
                 fog: f ? { type: f.isFogExp2 ? 'FogExp2' : 'Fog', density: f.density, color: '#' + f.color.getHexString() } : null,
                 env: !!scene.environment,
                 envIntensity: scene.environmentIntensity,
@@ -10190,6 +10781,13 @@ export default function BattleRoyaleGame() {
 
     const tracerMats = new Map<number, THREE.LineBasicMaterial>();
     function tracer(from: THREE.Vector3, to: THREE.Vector3, color = 0xfde68a) {
+      // Task N — every tracer is also a muzzle flash of REAL light: in
+      // the darkzone / caves gunfire is the only illumination, so each
+      // shot spikes a pooled PointLight at the firing position (cheap
+      // distance guard so far-off firefights don't churn the pool).
+      if (from.distanceToSquared(camera.position) < 130 * 130) {
+        flashLight(from.x, from.y, from.z, color, 34, 15, 0.08);
+      }
       let mat = tracerMats.get(color);
       if (!mat) {
         mat = new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.85 });
@@ -10477,6 +11075,8 @@ export default function BattleRoyaleGame() {
       g.position.copy(from);
       g.lookAt(to); // non-camera lookAt: the group's +Z faces the target
       scene.add(g);
+      // launch flash — a rocket leaving the tube is a small sun
+      flashLight(from.x, from.y, from.z, 0xffc46b, 90, 24, 0.16);
       rockets.push({
         mesh: g,
         from: from.clone(),
@@ -12619,6 +13219,10 @@ export default function BattleRoyaleGame() {
       flash.position.set(x, by + 0.35, z);
       scene.add(flash);
       effects.push({ kind: 'flash', mesh: flash, t: 0, life: 0.22, radius: radius * 0.32 });
+      // Task N — the blast bomb becomes a REAL fireball: a pooled
+      // PointLight spikes and dies over a third of a second. In the
+      // darkzone this is the only way to see what you just hit.
+      flashLight(x, by + 0.9, z, 0xffa030, 340, 48, 0.34);
     }
 
     function blast(x: number, z: number, y: number) {
@@ -12644,7 +13248,11 @@ export default function BattleRoyaleGame() {
       }
       g.position.set(x, groundAt(x, z), z);
       scene.add(g);
-      effects.push({ kind: 'fire', group: g, disc, geo, flames, t: 0, life: G.life, x, z });
+      // Task N — fire bombs burn as REAL light: a sustained brazier
+      // light flickers with the flames for the zone's whole life (the
+      // flicker runs in the 'fire' branch of the effects update below).
+      const fl = claimSustainLight(x, groundAt(x, z) + 1.4, z);
+      effects.push({ kind: 'fire', group: g, disc, geo, flames, t: 0, life: G.life, x, z, fl });
     }
 
     function smokeCloud(x: number, z: number) {
@@ -12688,6 +13296,8 @@ export default function BattleRoyaleGame() {
       scene.remove(obj);
       obj.traverse((o: any) => o.material?.dispose?.());
       e.geo?.dispose();
+      // fire-zone braziers return their pooled light with the flames
+      if (e.kind === 'fire' && e.fl) releaseSustainLight(e.fl);
     }
 
     function updateGrenades(dt: number) {
@@ -12767,6 +13377,8 @@ export default function BattleRoyaleGame() {
           e.flames.forEach((f: THREE.Mesh, j: number) => {
             f.scale.y = 0.8 + 0.4 * Math.sin(e.t * 12 + j * 1.7);
           });
+          // brazier flicker — the light breathes with the flames
+          if (e.fl) e.fl.light.intensity = 46 + 16 * Math.sin(e.t * 11) + 9 * Math.sin(e.t * 23 + 1.7);
           e.disc.material.opacity = (0.4 + 0.15 * Math.sin(e.t * 9)) * Math.min(1, (e.life - e.t) / 0.6);
           for (const d of dummies) {
             const dd = Math.hypot(d.group.position.x - e.x, d.group.position.z - e.z);
@@ -13481,6 +14093,7 @@ export default function BattleRoyaleGame() {
       'c-outp': '#facc15',
       'c-tow': '#60a5fa',
       'c-vtow': '#fb7185',
+      'c-cave': '#8b5cf6',
     };
     const mapMarkColor = (cls: string) => MAP_MARK_COLORS[cls] || '#cbd5e1';
     const mapTerrain = typeof document !== 'undefined' ? document.createElement('canvas') : null;
@@ -14717,6 +15330,11 @@ export default function BattleRoyaleGame() {
       }
       movePlayer(dt);
       updateWaterFx();
+      // Task N — darkzone state machine (storm shroud / caves) + the
+      // dynamic light pools' decay. Runs right after the water-fog pass
+      // so underwater tinting still wins while submerged.
+      updateDarkness(dt);
+      updateLights(dt);
       updatePickups(dt);
       updateWeapon(dt);
       if (mouseHeld) shoot();
@@ -14956,6 +15574,7 @@ export default function BattleRoyaleGame() {
         </svg>
       </button>
       <canvas id="game" ref={canvasRef} aria-label="First-person view" />
+      <div className="storm-fx" id="stormFx" aria-hidden="true" />
       <div className="shield-fx" id="shieldFx" aria-hidden="true" />
       <div className="hurt-fx" id="hurtFx" aria-hidden="true" />
       <div className="smoke-fx" id="smokeFx" aria-hidden="true" />
