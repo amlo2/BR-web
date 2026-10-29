@@ -1296,9 +1296,21 @@ body:not(.touch) .touch-only, body.touch .keys-only { display: none; }
 }
 
 /* Glass Play Button */
+/* DEPLOY — permanent dock, bottom-right of the lobby. Lives OUTSIDE the
+   collapsible rails as a direct child of .menu-card, so collapsing the
+   Deployment menu (or squeezing the layout) can never move or hide it. */
+.menu-card > .play {
+  position: absolute;
+  right: calc(var(--g) + env(safe-area-inset-right, 0px));
+  bottom: calc(var(--g) + env(safe-area-inset-bottom, 0px));
+  z-index: 6;
+  pointer-events: auto;
+  /* .btn forces width:100% (it styles the pause-menu buttons); the dock
+     must shrink-wrap its label so it stays a corner button, not a bar. */
+  width: auto;
+}
+
 .play {
-  align-self: flex-end;
-  margin-top: auto;
   position: relative;
   min-width: 220px;
   padding: 18px 44px;
@@ -1588,6 +1600,7 @@ body:not(.touch) .touch-only, body.touch .keys-only { display: none; }
 .menu.deploying .side-menu.side-left { animation: menu-exit-left 0.5s cubic-bezier(0.5, 0, 0.75, 0) 0.05s forwards; }
 .menu.deploying .side-menu.side-right { animation: menu-exit-right 0.5s cubic-bezier(0.5, 0, 0.75, 0) 0.05s forwards; }
 .menu.deploying .lobby-character-figure { animation: hero-exit 0.5s cubic-bezier(0.5, 0, 0.75, 0) forwards; }
+.menu.deploying .play { animation: fade-out 0.35s ease forwards; }
 .menu.deploying .lobby-pedestal,
 .menu.deploying .lobby-char-facing-tag { animation: fade-out 0.4s ease forwards; }
 
@@ -1709,10 +1722,17 @@ body.reloading .ammo .count { animation: reload-pulse 0.9s ease-in-out infinite;
   animation: hit-pop 0.26s cubic-bezier(0.34, 1.56, 0.64, 1);
 }
 
-@media (max-width: 900px) {
+/* Portrait phones stack the rails up / down. LANDSCAPE phones keep them
+   LEFT / RIGHT (Operators left, Deployment right) no matter how narrow the
+   viewport is — the old max-width-only rule used to stack them even in
+   landscape, which is exactly backwards. The absolute Deploy dock owns a
+   reserved lane at the bottom of the stack, so the rails can never
+   slide under it on short screens. */
+@media (max-width: 900px) and (orientation: portrait) {
   .menu-body {
     flex-direction: column;
     justify-content: flex-start;
+    padding-bottom: 78px; /* the permanent Deploy dock's lane */
   }
   .side-menu {
     max-width: 100%;
@@ -1725,6 +1745,27 @@ body.reloading .ammo .count { animation: reload-pulse 0.9s ease-in-out infinite;
   }
 }
 
+/* Landscape phones: the two rails share one short row — compact them so
+   BOTH fit side-by-side with room for the stage between them. */
+@media (orientation: landscape) and (max-height: 520px) {
+  .menu-card { --g: 14px; }
+  .menu-head { padding: 8px 18px; margin-left: 44px; }
+  .menu-head h1 { font-size: 1.5rem; }
+  .menu-head .eyebrow { font-size: 0.68rem; }
+  .menu-body { gap: 14px; padding-top: 8px; }
+  .side-menu { min-width: 232px; max-width: 305px; }
+  .side-head { padding: 10px 13px; font-size: 0.88rem; }
+  .menu-label { font-size: 0.8rem; margin: 0 0 8px; }
+  .char { padding: 8px 12px; gap: 10px; }
+  .char-art { width: 38px; height: 38px; }
+  .char-name { font-size: 0.92rem; }
+  .char-role { font-size: 0.68rem; }
+  .mode { padding: 9px 12px; }
+  .mode-name { font-size: 0.92rem; }
+  .lobby-character-stage { opacity: 0.22; }
+  .play { padding: 12px 26px; font-size: 1.1rem; min-width: 172px; }
+}
+
 @media (max-width: 600px) {
   .menu-card { --g: 16px; }
   .menu-head h1 { font-size: 1.8rem; }
@@ -1733,7 +1774,7 @@ body.reloading .ammo .count { animation: reload-pulse 0.9s ease-in-out infinite;
   .char-name { font-size: 1.1rem; }
   .mode { padding: 12px 14px; }
   .mode-name { font-size: 1.1rem; }
-  .play { width: 100%; min-width: auto; padding: 14px 20px; font-size: 1.2rem; }
+  .play { padding: 12px 22px; font-size: 1.15rem; min-width: 160px; }
 }
 
 @media (max-width: 600px) {

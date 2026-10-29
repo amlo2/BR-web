@@ -484,6 +484,10 @@ export default function BattleRoyaleGame() {
     // Terrain: Harbor Mode
     // ----------------------------------------------------
     let terrainOn = false;
+    // Which world owns the terrain right now — 'range' (flat proving
+    // ground), 'harbor' (the BR island) or 'quarry' (the open-pit mine).
+    // terrainHeight/meshHeight/tiles/veg/bigmap all route on this.
+    let worldKind: 'range' | 'harbor' | 'quarry' = 'range';
     let terrainSeed = 1;
     let HARBOR_SPAWN = { x: 0, z: 0 }; // harbor: beach spawn beside the quay (set by planHarbor)
     const PORT_SEARCH = { x: 0, z: 0 }; // where the coast scan starts (map centre)
@@ -590,7 +594,7 @@ export default function BattleRoyaleGame() {
     const LOAD_R = 780;
     const TILE_BUILDS = 3;
     const TERRAIN_MARGIN = 7 * TILE;
-    const HARBOR_HALF = 2000;
+    const HARBOR_HALF = 1000; // the island measures 2 x 2 km
     const SEA_SPAN = 420;
     const SEA_WARP = 420;
     const SEA_DEPTH = 14;
@@ -681,8 +685,14 @@ export default function BattleRoyaleGame() {
       const rnd = mulberry32((terrainSeed ^ 0x9e3779b9) >>> 0);
       const sites: Array<{ x: number; z: number; ax: number; az: number; score: number }> = [];
       const G = 48;
-      for (let x = -1250; x <= 1250; x += G) {
-        for (let z = -1250; z <= 1250; z += G) {
+      // Scan ONLY the walkable island: the camera clamps at mapHalf, so a
+      // cave sited beyond it would be unreachable — loot, gloom and the
+      // CAVE mark stranded outside the map. Margin keeps the whole tunnel
+      // (mouth + up-to-70 m run + arch) inside the bounds too.
+      const scanR = HARBOR_HALF - 150;
+      const caveEdge = HARBOR_HALF - 70;
+      for (let x = -scanR; x <= scanR; x += G) {
+        for (let z = -scanR; z <= scanR; z += G) {
           const jitter = 0.5 + rnd() * 0.9;
           const px = x + (rnd() - 0.5) * G;
           const pz = z + (rnd() - 0.5) * G;
@@ -743,6 +753,8 @@ export default function BattleRoyaleGame() {
         const len = 46 + rnd() * 24;
         const ex = s.x + s.ax * len;
         const ez = s.z + s.az * len;
+        // the whole tunnel must stay inside the walkable map
+        if (Math.abs(ex) > caveEdge || Math.abs(ez) > caveEdge) continue;
         const mouthY = terrainHeight(s.x, s.z);
         const endH = terrainHeight(ex, ez);
         if (endH - mouthY < len * 0.1) continue; // the hill must keep rising over the tunnel
@@ -932,7 +944,147 @@ export default function BattleRoyaleGame() {
     const MOUNT_PEAK = 62; // crest height above the pedestal
     const LAKE_DEPTH = 6.2; // lake beds sink this far below WATER_Y
 
+    // ----------------------------------------------------
+    // QUARRY — the open-pit mine map. NOT a battle royale: a huge
+    // terraced pit sunk 320 m into a dusty bowl, with one spiral haul
+    // road ramping hundreds of metres down to the floor. Benches are
+    // 16 m rings separated by near-vertical faces (steepBlocked
+    // refuses them, exactly like island cliffs); the spiral road is
+    // the ONLY walking route down — commit to the descent.
+    // ----------------------------------------------------
+    const QUARRY_HALF = 1000; // the quarry map measures 2 x 2 km
+    const Q_RIM = 430; // pit crest radius
+    const Q_DEPTH = 320; // hundreds of metres down
+    const Q_NB = 20; // bench count
+    const Q_BENCH_H = 16; // bench height (and face drop)
+    const Q_BOTTOM_R = 90; // pit floor radius
+    const Q_RW = (Q_RIM - Q_BOTTOM_R) / Q_NB; // radial width of one bench ring
+    const Q_RAMP_HALF = 9; // haul road half-width (18 m — readable from the rim)
+    const Q_TURNS = 3.5; // spiral revolutions, crest -> floor
+    const Q_TH0 = -Math.PI / 2; // the ramp breaks the crest on the NORTH side
+    const Q_YARD_R = Q_RIM + 200; // flat machinery yard around the crest
+    const Q_YARD_Y = 0.5; // yard deck height
+    const QUARRY_SPAWN = { x: 0, z: -(Q_RIM + 120) };
+    // Yard structures + ore heaps register their footprints here so the
+    // vegetation placer keeps scrub from growing through the plant.
+    const quarryDressingSpots: Array<{ x: number; z: number; r: number }> = [];
+
+    function quarryHeight(x: number, z: number) {
+      const r = Math.hypot(x, z);
+      // --- the dusty bowl the mine lives in ---
+      // Rolling scrub plain, walled in by rising ground toward the map
+      // edges, flattening to the machinery yard around the crest.
+      let plain =
+        4.5 +
+        15 * fbm(x / 210, z / 210, terrainSeed + 9) +
+        2.1 * gradNoise(x / 29, z / 29, terrainSeed + 13) +
+        14 * THREE.MathUtils.smoothstep(r, 720, 960);
+      const yardBlend = 1 - THREE.MathUtils.smoothstep(r, Q_YARD_R - 60, Q_YARD_R + 90);
+      plain = THREE.MathUtils.lerp(plain, Q_YARD_Y, yardBlend);
+      if (r > Q_RIM + 2) return plain;
+
+      // --- bench profile: depth steps up in 16 m rings ---
+      const idx = Math.floor((Q_RIM - r) / Q_RW);
+      const bench = -Math.min(Q_NB, idx + 1) * Q_BENCH_H;
+      let h = bench;
+
+      // --- the spiral haul road, carved through the faces ---
+      // Parametrize by s in [0,1]: angle sweeps Q_TURNS turns while the
+      // radius walks the crest down to the floor and the height drops
+      // the full pit depth. At most one turn band covers any (r, theta)
+      // — radial bands are ~97 m apart per turn, far wider than the road.
+      const th = Math.atan2(z, x);
+      const TWO_PI = Math.PI * 2;
+      let frac = (th - Q_TH0) / TWO_PI;
+      frac -= Math.floor(frac); // 0..1 fraction of one revolution
+      for (let k = 0; k <= Math.ceil(Q_TURNS); k++) {
+        const s = k + frac;
+        if (s > 1 + 1e-4) continue;
+        const rs = Q_RIM - s * (Q_RIM - Q_BOTTOM_R);
+        const dr = Math.abs(r - rs);
+        if (dr > Q_RAMP_HALF + 3) continue;
+        const roadH = -s * Q_DEPTH;
+        // on the road: the deck (or the bench floor where the road
+        // merges level with the land); off it: back to the bench wall
+        const edge = THREE.MathUtils.smoothstep(dr, Q_RAMP_HALF - 1.5, Q_RAMP_HALF + 3);
+        const cand = Math.max(bench, roadH);
+        const blended = cand + (bench - cand) * edge;
+        if (blended > h) h = blended;
+      }
+
+      // Eroded floor detail — tiny crumble that never climbs the faces
+      if (h > -Q_DEPTH + 0.3) h += 0.35 * gradNoise(x / 9, z / 9, terrainSeed + 21) * THREE.MathUtils.smoothstep(r, Q_BOTTOM_R, Q_RIM);
+      return h;
+    }
+
+    // Haul-road band test — the SAME math the carve uses, factored so the
+    // tile painter can tint the gravel and the vegetation placer can keep
+    // it bare. Returns the spiral parameter + radial distance when (x,z)
+    // sits on the road corridor, null otherwise.
+    function quarryRoadAt(x: number, z: number, r: number): { s: number; dr: number } | null {
+      const th = Math.atan2(z, x);
+      let frac = (th - Q_TH0) / (Math.PI * 2);
+      frac -= Math.floor(frac);
+      for (let k = 0; k <= Math.ceil(Q_TURNS); k++) {
+        const s = k + frac;
+        if (s > 1 + 1e-4) continue;
+        const rs = Q_RIM - s * (Q_RIM - Q_BOTTOM_R);
+        const dr = Math.abs(r - rs);
+        if (dr <= Q_RAMP_HALF + 3) return { s, dr };
+      }
+      return null;
+    }
+
+    // Quarry terrain palette — mined rock, not island greens.
+    const QCOL_DUST = new THREE.Color(0x9d8c6d); // scrub plain
+    const QCOL_YARD = new THREE.Color(0x8d8880); // machinery gravel
+    const QCOL_BENCH = new THREE.Color(0x8a6f4f); // ochre bench ring
+    const QCOL_RUST = new THREE.Color(0x775640); // rust bench ring
+    const QCOL_FACE = new THREE.Color(0x5b5049); // bare dark rock face
+    const QCOL_ROAD = new THREE.Color(0xb5a486); // light haul gravel
+    const QCOL_FLOOR = new THREE.Color(0x8d7f63); // pit floor dust
+    const qcTmp = new THREE.Color();
+
+    // Vertex colour for one quarry terrain point (slope = |gradient|).
+    function quarryTileColor(vx: number, vz: number, h: number, slope: number, out: THREE.Color): THREE.Color {
+      const r = Math.hypot(vx, vz);
+      if (r > Q_RIM + 2) {
+        out.copy(QCOL_DUST);
+        // flat machinery yard around the crest reads as packed gravel
+        const yard = 1 - THREE.MathUtils.smoothstep(r, Q_YARD_R - 60, Q_YARD_R + 90);
+        out.lerp(QCOL_YARD, yard * 0.85);
+        // dry weed patches + the rim wall rising toward the map edge
+        const weed = 0.5 + 0.5 * fbm(vx / 47, vz / 47, terrainSeed + 31);
+        out.multiplyScalar(0.9 + 0.18 * weed);
+        out.lerp(QCOL_FACE, THREE.MathUtils.smoothstep(r, 750, 940) * 0.55);
+        return out;
+      }
+      const road = quarryRoadAt(vx, vz, r);
+      if (road && road.dr <= Q_RAMP_HALF) {
+        out.copy(QCOL_ROAD);
+        out.multiplyScalar(0.93 + 0.12 * (0.5 + 0.5 * gradNoise(vx / 7, vz / 7, terrainSeed + 63)));
+        return out;
+      }
+      if (r < Q_BOTTOM_R) {
+        out.copy(QCOL_FLOOR);
+        // radial scrape streaks — the floor is one worked-over deck
+        out.multiplyScalar(0.9 + 0.16 * (0.5 + 0.5 * Math.sin(6 * Math.atan2(vz, vx) + gradNoise(vx / 21, vz / 21, terrainSeed + 77) * 5)));
+        return out;
+      }
+      // Benches: alternating ochre / rust strata rings, mineral banding
+      // streaking the faces, dark bare rock where the drop is sheer, and
+      // a gentle depth darkening toward the pit floor.
+      const idx = Math.floor((Q_RIM - r) / Q_RW);
+      out.copy((idx & 1) === 0 ? QCOL_BENCH : QCOL_RUST);
+      const strata = 0.9 + 0.17 * (0.5 + 0.5 * Math.sin(-h * 0.55 + 6 * gradNoise(vx / 60, vz / 60, terrainSeed + 88)));
+      out.multiplyScalar(strata);
+      out.lerp(QCOL_FACE, THREE.MathUtils.smoothstep(slope, 1.05, 2.2));
+      out.multiplyScalar(1 - 0.22 * (Math.min(Q_DEPTH, Math.max(0, -h)) / Q_DEPTH));
+      return out;
+    }
+
     function terrainHeight(x: number, z: number) {
+      if (worldKind === 'quarry') return quarryHeight(x, z);
       const keep = THREE.MathUtils.smoothstep(Math.hypot(x - HARBOR_SPAWN.x, z - HARBOR_SPAWN.z), 8, 60);
       biomeWeights(x, z, BW);
       // Base rolling land — rougher than before, plus a fine detail
@@ -1011,7 +1163,16 @@ export default function BattleRoyaleGame() {
       return c0 + c1 * u + c2 * v;
     }
 
+    // The water surface at (x,z): sea + lake level on the island, the pool
+    // at the range — but the QUARRY pit is bone dry, and its floor sits
+    // 300+ m BELOW sea level, so without this gate the whole pit would read
+    // as one giant phantom lake (wading drag, swimming, underwater fog).
+    function waterLevelAt(x: number, z: number) {
+      return worldKind === 'quarry' ? -1e9 : WATER_Y;
+    }
+
     function surfaceCut(ray: THREE.Ray, maxDist: number) {
+      if (worldKind === 'quarry') return Infinity; // dry pit — no water plane to hit
       const o = ray.origin;
       const d = ray.direction;
       if (o.y <= WATER_Y || d.y >= 0) return Infinity;
@@ -1122,6 +1283,13 @@ export default function BattleRoyaleGame() {
           nor.set([-dx / len, 1 / len, -dz / len], k * 3);
           const vx = x0 + i * TILE_STEP;
           const vz = z0 + j * TILE_STEP;
+          // QUARRY: mined-rock strata instead of island biomes — no
+          // coast sand, no underwater tint (the pit is bone dry).
+          if (worldKind === 'quarry') {
+            quarryTileColor(vx, vz, h, Math.hypot(dx, dz), c);
+            col.set([c.r, c.g, c.b], k * 3);
+            continue;
+          }
           biomeWeights(vx, vz, CW);
           // Convex biome mix (the six weights sum to 1)
           let cr =
@@ -1948,6 +2116,7 @@ export default function BattleRoyaleGame() {
       const x0 = tx * TILE;
       const z0 = tz * TILE;
       const rnd = mulberry32((terrainSeed ^ (tx * 73856093) ^ (tz * 19349663)) >>> 0);
+      if (worldKind === 'quarry') return buildQuarryVegTile(tx, tz);
       const P: number[] = [];
       const N: number[] = [];
       const C: number[] = [];
@@ -2215,6 +2384,29 @@ export default function BattleRoyaleGame() {
           solidRefs.push(sb);
         }
       }
+      return finishVegTile(inst, P, N, C, LP, LN, LC, LU, LS, BP, BU, solidRefs, stamps, treeVox, tileRec);
+    }
+
+    // Shared mesh-assembly tail for BOTH vegetation placers (island +
+    // quarry): one merged vertex-coloured veg mesh, one merged
+    // alpha-tested leaf-card mesh, one merged contact-AO decal mesh.
+    function finishVegTile(
+      inst: number,
+      P: number[],
+      N: number[],
+      C: number[],
+      LP: number[],
+      LN: number[],
+      LC: number[],
+      LU: number[],
+      LS: number[],
+      BP: number[],
+      BU: number[],
+      solidRefs: SolidBox[],
+      stamps: StampRec[],
+      treeVox: VoxelBox[],
+      tileRec: VegTileRec
+    ): { mesh: THREE.Mesh | null; leafMesh: THREE.Mesh | null; blobMesh: THREE.Mesh | null; solidRefs: SolidBox[]; stamps: StampRec[]; treeVox: VoxelBox[] } {
       if (!inst) return { mesh: null, leafMesh: null, blobMesh: null, solidRefs, stamps, treeVox };
       const geo = new THREE.BufferGeometry();
       geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(P), 3));
@@ -2243,6 +2435,112 @@ export default function BattleRoyaleGame() {
         blobMesh = new THREE.Mesh(bg, blobMat);
       }
       return { mesh, leafMesh, blobMesh, solidRefs, stamps, treeVox };
+    }
+
+    // ----------------------------------------------------
+    // QUARRY flora — the mine is stripped land, not jungle. Sparse
+    // dry scrub, boulders and the odd dead tree dot the dusty plain;
+    // rubble and boulders sit on the pit floor; the benches and the
+    // haul road stay BARE so the terraces read as worked rock.
+    // Scenery only — no voxelized trees out here.
+    // ----------------------------------------------------
+    function buildQuarryVegTile(
+      tx: number,
+      tz: number
+    ): {
+      mesh: THREE.Mesh | null;
+      leafMesh: THREE.Mesh | null;
+      blobMesh: THREE.Mesh | null;
+      solidRefs: SolidBox[];
+      stamps: StampRec[];
+      treeVox: VoxelBox[];
+    } {
+      const solidRefs: SolidBox[] = [];
+      const stamps: StampRec[] = [];
+      const treeVox: VoxelBox[] = [];
+      const tileRec: VegTileRec = { mesh: null, leafMesh: null, stamps };
+      if (!vegLib) buildVegLib();
+      const lib = vegLib!;
+      const x0 = tx * TILE;
+      const z0 = tz * TILE;
+      const rnd = mulberry32((terrainSeed ^ (tx * 73856093) ^ (tz * 19349663)) >>> 0);
+      const P: number[] = [];
+      const N: number[] = [];
+      const C: number[] = [];
+      const LP: number[] = [];
+      const LN: number[] = [];
+      const LC: number[] = [];
+      const LU: number[] = [];
+      const LS: number[] = [];
+      const BP: number[] = [];
+      const BU: number[] = [];
+      let inst = 0;
+      let verts = 0;
+      for (let a = 0; a < 150 && inst < VEG_MAX_INST && verts < VEG_MAX_VERTS; a++) {
+        const vx = x0 + rnd() * TILE;
+        const vz = z0 + rnd() * TILE;
+        const r = Math.hypot(vx, vz);
+        // the spawn pad + every yard structure own their clearings
+        if (Math.hypot(vx - QUARRY_SPAWN.x, vz - QUARRY_SPAWN.z) < 42) continue;
+        let bad = false;
+        for (const s of quarryDressingSpots) {
+          if (Math.hypot(vx - s.x, vz - s.z) < s.r) {
+            bad = true;
+            break;
+          }
+        }
+        if (bad) continue;
+        const pick = rnd();
+        let def: VegDef | null = null;
+        let s = 1;
+        let boulder = false;
+        if (r > Q_RIM + 2) {
+          // the dusty plain — a clean gravel apron hugs the crest so
+          // the benches read; structures own their own spots
+          if (r < Q_RIM + 45) continue;
+          if (pick < 0.32) def = lib.tuft;
+          else if (pick < 0.5) def = lib.bushDry;
+          else if (pick < 0.64) def = lib.rock;
+          else if (pick < 0.7) def = lib.deadtree; // bare silhouette, scenery only
+          else continue;
+          s = 0.8 + rnd() * 0.5;
+        } else if (r < Q_BOTTOM_R - 8) {
+          // pit floor: ore rubble + the odd boulder
+          if (pick < 0.34) def = lib.rock;
+          else if (pick < 0.5) {
+            def = lib.rockBig;
+            boulder = true;
+            s = 0.7 + rnd() * 0.6;
+          } else continue;
+        } else continue; // benches + haul road stay bare
+        if (!def) continue;
+        const h = terrainHeight(vx, vz);
+        const yaw = rnd() * Math.PI * 2;
+        const tint = 0.82 + rnd() * 0.3;
+        const rec: StampRec = { def, x: vx, y: h - 0.06, z: vz, yaw, s, tint, vox: null };
+        stamps.push(rec);
+        const isBush = def === lib.bush || def === lib.bushDry;
+        if (isBush) {
+          rec.leafOnly = true;
+          rec.leaf = bushLeafCards(vx, h - 0.06, vz, s, tint, 1, rnd);
+          verts += rec.leaf.length * 6;
+        } else {
+          stampVeg(def, vx, h - 0.06, vz, yaw, s, tint, P, N, C);
+          verts += def.pos.length / 3;
+        }
+        inst++;
+        // contact shadows under everything that visually touches ground
+        if (isBush || boulder || def === lib.rock || def === lib.rockBig) {
+          pushContactBlob(vx, h, vz, (boulder ? 3.6 : def === lib.rockBig ? 3.4 : 1.9) * s, BP, BU);
+        }
+        if (boulder) {
+          const sb: SolidBox = { x: vx, z: vz, hx: 1.75 * s, hz: 1.5 * s, bottom: h - 1.5, top: h + 1.15 * s };
+          solids.push(sb);
+          vegSolids.push(sb);
+          solidRefs.push(sb);
+        }
+      }
+      return finishVegTile(inst, P, N, C, LP, LN, LC, LU, LS, BP, BU, solidRefs, stamps, treeVox, tileRec);
     }
 
     // Per-voxel colour palette + SILHOUETTE MASK for a voxelized tree.
@@ -5284,19 +5582,20 @@ export default function BattleRoyaleGame() {
 
     function waterState() {
       const floor = groundAt(camera.position.x, camera.position.z);
-      const wet = floor < WATER_Y && camera.position.y - eyeH < WATER_Y + 0.05;
-      return { floor, wet, swimming: wet && WATER_Y - floor > SWIM_DEPTH };
+      const wl = waterLevelAt(camera.position.x, camera.position.z);
+      const wet = floor < wl && camera.position.y - eyeH < wl + 0.05;
+      return { floor, wet, swimming: wet && wl - floor > SWIM_DEPTH };
     }
 
     // Underwater screen tint + murky sea fog. The water itself is never a
     // collider: wading applies progressive drag (movePlayer) and swimming
     // floats you at the surface — dive with C, stroke up with Space.
     const waterFxEl = $('waterFx');
-    const AIR_FOG = { color: FOG_COLOR, density: 0.0022 };
+    let AIR_FOG = { color: FOG_COLOR, density: 0.0022 }; // per-world: the quarry swaps in a dust haze
     const SEA_FOG = { color: 0x0f364c, density: 0.1 };
     let underFx = false;
     function updateWaterFx() {
-      const under = camera.position.y < WATER_Y + 0.03 && groundAt(camera.position.x, camera.position.z) < WATER_Y;
+      const under = camera.position.y < waterLevelAt(camera.position.x, camera.position.z) + 0.03 && groundAt(camera.position.x, camera.position.z) < waterLevelAt(camera.position.x, camera.position.z);
       if (under === underFx) return;
       underFx = under;
       if (waterFxEl) waterFxEl.classList.toggle('on', under);
@@ -5334,6 +5633,29 @@ export default function BattleRoyaleGame() {
     let stormMsgT = 0;
     const stormFxEl = $('stormFx');
     const darkFogColor = new THREE.Color(AIR_FOG.color);
+
+    // ----------------------------------------------------
+    // PER-WORLD ATMOSPHERE — the quarry trades the island's blue
+    // haze for a mineral-dust sky: warmer fog, hazier horizon,
+    // dust-tinted dome. updateWaterFx / updateDarkness re-read
+    // AIR_FOG every frame, so a world swap re-tints the air live.
+    // ----------------------------------------------------
+    const SKY_DAY = { zenith: 0x3f78c0, horizon: 0xd2e4f2, ground: 0x8fa9ba };
+    const SKY_QUARRY = { zenith: 0x86a0b8, horizon: 0xd8c5a0, ground: 0xa79a78 };
+    function setWorldAtmo(kind: 'range' | 'harbor' | 'quarry') {
+      const sky = kind === 'quarry' ? SKY_QUARRY : SKY_DAY;
+      AIR_FOG = kind === 'quarry' ? { color: 0xc4b492, density: 0.002 } : { color: FOG_COLOR, density: 0.0022 };
+      (skyMat.uniforms.uZenith.value as THREE.Color).setHex(sky.zenith);
+      (skyMat.uniforms.uHorizon.value as THREE.Color).setHex(sky.horizon);
+      (skyMat.uniforms.uGround.value as THREE.Color).setHex(sky.ground);
+      darkFogColor.setHex(AIR_FOG.color);
+      const f = scene.fog as THREE.FogExp2 | null;
+      if (f && !underFx) {
+        f.color.setHex(AIR_FOG.color);
+        f.density = AIR_FOG.density;
+      }
+      (scene.background as THREE.Color).setHex(AIR_FOG.color);
+    }
 
     function updateDarkness(dt: number) {
       const inCave = !!caveDarkAt(camera.position.x, camera.position.y - eyeH + 0.4, camera.position.z);
@@ -5385,7 +5707,7 @@ export default function BattleRoyaleGame() {
     }
 
     function swimStep(dt: number) {
-      const target = WATER_Y + SWIM_HEAD;
+      const target = waterLevelAt(camera.position.x, camera.position.z) + SWIM_HEAD;
       let want = THREE.MathUtils.clamp((target - camera.position.y) * 4, -SINK_SPEED, SWIM_STROKE);
       if (keys.has('KeyC')) want = -SINK_SPEED;
       else if ((keys.has('Space') || jumpTap) && camera.position.y < target + 0.6) want = SWIM_STROKE;
@@ -5443,7 +5765,7 @@ export default function BattleRoyaleGame() {
       // Water drag: progressive wading slowdown the deeper you go
       // (75% speed at ankle depth down to 40% at swim depth), then a
       // full swim once the floor drops out of reach.
-      const depth = wet ? Math.max(0, WATER_Y - floor) : 0;
+      const depth = wet ? Math.max(0, waterLevelAt(camera.position.x, camera.position.z) - floor) : 0;
       const waterDrag = swimming ? SWIM_SLOW : wet ? THREE.MathUtils.lerp(0.75, 0.4, THREE.MathUtils.clamp(depth / SWIM_DEPTH, 0, 1)) : 1;
 
       const wx = len > 0 ? (-Math.sin(yaw) * f + Math.cos(yaw) * s) / len : 0;
@@ -7868,6 +8190,8 @@ export default function BattleRoyaleGame() {
 
     function enterHarbor() {
       world.visible = false;
+      worldKind = 'harbor';
+      setWorldAtmo('harbor'); // leave the quarry's dust haze behind
       // Snapshot the range world's registries ONCE so a return to the
       // proving ground can restore them (solids/shootable/pickups hold
       // the crate + building + pool registrations; meshes persist in
@@ -7888,6 +8212,8 @@ export default function BattleRoyaleGame() {
       }
       clearPois(); // reclaim any previous map's POIs, pickups and pads
       clearCaves(); // Task N: the old map's tunnels + loot go with it
+      clearQuarry(); // a quarry session's yard plant never leaks into the port
+      brCleanup(); // a leaked BR match ends the moment the island rebuilds
       dummies.length = 0;
       releaseAllBotFields(); // every dummy's microbot swarm goes with it
       spots.length = 0;
@@ -7907,6 +8233,7 @@ export default function BattleRoyaleGame() {
       seaMesh.visible = true;
       ground.visible = false;
       grid.visible = false;
+      harborGroup.visible = false; // no port plant until buildHarbor raises it
       if (inventoryModeEl) inventoryModeEl.textContent = 'Harbor';
       if (dummySecEl) dummySecEl.hidden = true;
       // Plan the whole map BEFORE any terrain tile is built: the port
@@ -7967,6 +8294,7 @@ export default function BattleRoyaleGame() {
       brCleanup(); // end any BR match state if it leaked in
       clearPois();
       clearCaves(); // the island's tunnels never leak into the range
+      clearQuarry(); // neither does the mine's yard plant
       // strip every harbor / BR dummy figure
       for (const d of dummies) {
         (d.group.parent || world).remove(d.group);
@@ -7983,6 +8311,8 @@ export default function BattleRoyaleGame() {
       tiles.clear();
       vegSolids.length = 0;
       // flat proving ground state
+      worldKind = 'range';
+      setWorldAtmo('range');
       terrainOn = false;
       mapHalf = ARENA;
       world.visible = true;
@@ -8018,6 +8348,187 @@ export default function BattleRoyaleGame() {
       grounded = true;
       rebuildDummyGrid();
       rebuildSolidGrid();
+    }
+
+    // ----------------------------------------------------
+    // QUARRY ENTRY — the open-pit mine map. NOT a battle royale:
+    // no drones, no storm, no bots — just the terraced pit, the
+    // spiral haul road and the machinery yard, standing in a
+    // mineral-dust haze. Teardown mirrors enterHarbor exactly so
+    // range ↔ harbor ↔ quarry can chain in any order.
+    // ----------------------------------------------------
+    let quarryGroup: THREE.Group | null = null;
+    let quarryRockMat: THREE.MeshStandardMaterial | null = null;
+    let quarryOreMat: THREE.MeshStandardMaterial | null = null;
+    let quarrySteelMat: THREE.MeshStandardMaterial | null = null;
+
+    function generateQuarryDressing() {
+      if (quarryGroup) return; // already dressed
+      quarryGroup = new THREE.Group();
+      quarryRockMat = pbrMaterial({ color: 0x7d746a }, 'rock');
+      quarryOreMat = pbrMaterial({ color: 0x8a5a36 }, 'sand');
+      quarrySteelMat = pbrMaterial({ color: 0x6f6a5f }, 'metal');
+      quarryDressingSpots.length = 0;
+      const rnd = mulberry32((terrainSeed ^ 0x51a11e5) >>> 0);
+      const mark = (x: number, z: number, r: number) => quarryDressingSpots.push({ x, z, r });
+
+      // ---- MACHINERY YARD, on the flat deck around the crest ----
+      // The deck is exactly flat for r <= Q_YARD_R - 60, so every
+      // structure sits WELL INSIDE it — sheds, silo, water tower,
+      // office, gantry and a guard tower ring the pit rim, all
+      // voxel-destructible via bBox. Angles stay >= 25 degrees off
+      // due north so the haul-road exit lane stays walkable.
+      const yd = Q_YARD_Y;
+      const ang = (deg: number) => (-Math.PI / 2) + (deg * Math.PI) / 180;
+      const yardAt = (deg: number, rad: number) => ({
+        x: Math.cos(ang(deg)) * rad,
+        z: Math.sin(ang(deg)) * rad,
+        rot: Math.floor(rnd() * 4),
+      });
+      let b = yardAt(-38, 520);
+      buildShed(b, yd, quarryGroup); mark(b.x, b.z, 12);
+      b = yardAt(-78, 545);
+      buildShed(b, yd, quarryGroup); mark(b.x, b.z, 12);
+      b = yardAt(-118, 515);
+      buildSilo(b, yd, quarryGroup); mark(b.x, b.z, 14);
+      b = yardAt(42, 530);
+      buildWaterTower(b, yd, quarryGroup); mark(b.x, b.z, 13);
+      b = yardAt(80, 510);
+      buildOffice(b, yd - 0.25, quarryGroup); mark(b.x, b.z, 15);
+      b = yardAt(128, 540);
+      buildGantry(b, yd, 13, 6, quarrySteelMat!, quarryGroup); mark(b.x, b.z, 16);
+      b = yardAt(166, 520);
+      buildGuardTower(b, yd, quarryGroup); mark(b.x, b.z, 13);
+
+      // ---- ORE HEAPS on the pit floor: squashed cones of crushed
+      // rock, shootable like the cave boulders (they soak bullets).
+      for (let i = 0; i < 6; i++) {
+        const hr = 5 + rnd() * 7;
+        const a = rnd() * Math.PI * 2;
+        const rr = rnd() * (Q_BOTTOM_R - 26);
+        const hx = Math.cos(a) * rr;
+        const hz = Math.sin(a) * rr;
+        const heap = new THREE.Mesh(new THREE.ConeGeometry(hr, hr * 0.62, 7), quarryOreMat!);
+        heap.position.set(hx, terrainHeight(hx, hz) + hr * 0.31, hz);
+        heap.rotation.y = rnd() * Math.PI;
+        heap.castShadow = true;
+        heap.receiveShadow = true;
+        heap.userData.wc = { x: hx, z: hz };
+        quarryGroup.add(heap);
+        shootable.push(heap);
+        mark(hx, hz, hr + 3); // no floor boulder sprouting through a heap
+      }
+      // ---- RIM ROCKS dressing the crest so the pit edge reads ----
+      for (let i = 0; i < 10; i++) {
+        const a = rnd() * Math.PI * 2;
+        const rad = Q_RIM + 3 + rnd() * 6;
+        const rx = Math.cos(a) * rad;
+        const rz = Math.sin(a) * rad;
+        const r = 1.2 + rnd() * 1.6;
+        const rock = new THREE.Mesh(new THREE.DodecahedronGeometry(r, 0), quarryRockMat!);
+        rock.position.set(rx, terrainHeight(rx, rz) + r * 0.3, rz);
+        rock.rotation.set(rnd() * 3, rnd() * 3, rnd() * 3);
+        rock.castShadow = true;
+        rock.receiveShadow = true;
+        rock.userData.wc = { x: rx, z: rz };
+        quarryGroup.add(rock);
+        mark(rx, rz, r + 2.5);
+      }
+      scene.add(quarryGroup);
+
+      // ---- Map chips: the yard deck, the ramp break, the pit floor ----
+      harborMarks.push({ x: 0, z: -500, label: 'YARD', cls: 'c-yard' });
+      harborMarks.push({ x: 0, z: -Q_RIM, label: 'RAMP', cls: 'c-crane' });
+      harborMarks.push({ x: 0, z: 0, label: 'FLOOR', cls: 'c-cave' });
+      return quarryDressingSpots.length;
+    }
+
+    function clearQuarry() {
+      if (quarryGroup) {
+        scene.remove(quarryGroup);
+        quarryGroup.traverse((o: any) => {
+          o.geometry?.dispose?.();
+        });
+        quarryGroup = null;
+      }
+      quarryRockMat?.dispose();
+      quarryOreMat?.dispose();
+      quarrySteelMat?.dispose();
+      quarryRockMat = null;
+      quarryOreMat = null;
+      quarrySteelMat = null;
+      quarryDressingSpots.length = 0;
+      // the quarry's own chips leave with the mine
+      for (let i = harborMarks.length - 1; i >= 0; i--) {
+        const lb = harborMarks[i].label;
+        if (lb === 'YARD' || lb === 'RAMP' || lb === 'FLOOR') harborMarks.splice(i, 1);
+      }
+    }
+
+    function enterQuarry() {
+      world.visible = false;
+      worldKind = 'quarry';
+      setWorldAtmo('quarry'); // mineral-dust haze
+      // Snapshot the range registries ONCE (same contract as harbor).
+      if (!rangeBackup) {
+        rangeBackup = {
+          solids: solids.slice(),
+          shootable: shootable.filter((o: any) => !o.userData?.dummy).slice(),
+          pickups: pickups.slice(),
+          spots: spots.slice(),
+          buildings: BUILDINGS.slice(),
+        };
+      }
+      for (const d of dummies) {
+        (d.group.parent || world).remove(d.group);
+      }
+      clearPois();
+      clearCaves();
+      clearQuarry(); // re-entering the mine rebuilds its dressing
+      brCleanup(); // no battle royale out here — end any leaked match
+      dummies.length = 0;
+      releaseAllBotFields();
+      spots.length = 0;
+      solids.length = 0;
+      shootable.length = 0;
+      resetVox();
+      pickups.length = 0;
+      BUILDINGS.length = 0;
+      const wantedSeed = typeof window !== 'undefined' ? new URLSearchParams(window.location.search).get('seed') : null;
+      terrainSeed = wantedSeed ? Math.abs(Math.floor(+wantedSeed)) || 1 : 1 + Math.floor(Math.random() * 1000000);
+      for (const t of tiles.values()) disposeTile(t);
+      tiles.clear();
+      vegSolids.length = 0;
+      mapHalf = QUARRY_HALF;
+      terrainOn = true;
+      seaMesh.visible = false; // the pit is bone dry — no water plane
+      ground.visible = false;
+      grid.visible = false;
+      harborGroup.visible = false;
+      harborMarks.length = 0;
+      if (inventoryModeEl) inventoryModeEl.textContent = 'Quarry';
+      if (dummySecEl) dummySecEl.hidden = true;
+      // The mine's own dressing builds BEFORE the tiles stream so the
+      // veg placer can keep scrub clear of every structure.
+      generateQuarryDressing();
+      woodRes = 60; // fresh build purse per visit
+      refreshWood();
+      streamTerrain(true);
+      spawn = QUARRY_SPAWN;
+      eyeH = EYE;
+      camera.position.set(spawn.x, EYE + groundAt(spawn.x, spawn.z), spawn.z);
+      yaw = Math.PI; // face the crest: the ramp break is straight ahead
+      pitch = -0.18; // eyes down the haul road
+      kick = 0;
+      vy = 0;
+      grounded = true;
+      climb = null;
+      slide = null;
+      roll = null;
+      airCarry = null;
+      slideReq = false;
+      rollReq = 0;
+      showMessage('⛏ Open-pit mine — the haul road spirals ' + Q_DEPTH + ' m down to the pit floor', 4);
     }
 
     // ----------------------------------------------------
@@ -9030,6 +9541,7 @@ export default function BattleRoyaleGame() {
     function startGame() {
       if (deploying) return; // the exit animation is already carrying us out
       if (selectedMode === 'harbor') enterHarbor();
+      else if (selectedMode === 'quarry') enterQuarry();
       else if (selectedMode !== 'range') return;
       else {
         enterRangeIfNeeded(); // returning from a Harbor match rebuilds the range
@@ -9246,6 +9758,12 @@ export default function BattleRoyaleGame() {
                 o: +p.mat.opacity.toFixed(2),
                 s: p.sprite.scale.x.toFixed(1),
               })),
+            }),
+            shieldInfo: () => ({
+              shield: Math.round(shield),
+              max: Math.round(shieldMax()),
+              life: Math.round(life),
+              sunlit: probeSunlit(camera.position.x, camera.position.y - eyeH + 0.6, camera.position.z),
             }),
             voxStats: () => ({
               boxes: voxBoxes.length,
@@ -9839,6 +10357,37 @@ export default function BattleRoyaleGame() {
                   uTime: +((brZoneWall.material as THREE.ShaderMaterial).uniforms.uTime as { value: number })?.value.toFixed(2),
                   r: Math.round(brZone.r),
                 },
+                // Task O — which world owns the terrain right now + the
+                // quarry's structural probes (depth, ramp, dryness).
+                world: (() => {
+                  const rampHeights = [0.2, 0.4, 0.6, 0.8].map((s) => {
+                    const th = Q_TH0 + s * Math.PI * 2;
+                    const rs = Q_RIM - s * (Q_RIM - Q_BOTTOM_R);
+                    const x = Math.cos(th) * rs;
+                    const z = Math.sin(th) * rs;
+                    return { s, x: +x.toFixed(0), z: +z.toFixed(0), y: +terrainHeight(x, z).toFixed(1), want: +(-s * Q_DEPTH).toFixed(1) };
+                  });
+                  return {
+                    kind: worldKind,
+                    mapHalf,
+                    brOn,
+                    fogHex: '#' + new THREE.Color(AIR_FOG.color).getHexString(),
+                    quarry:
+                      worldKind === 'quarry'
+                        ? {
+                            spawn: { x: QUARRY_SPAWN.x, z: QUARRY_SPAWN.z },
+                            spawnY: +terrainHeight(QUARRY_SPAWN.x, QUARRY_SPAWN.z).toFixed(1),
+                            yardY: +terrainHeight(0, -500).toFixed(1),
+                            floorY: +terrainHeight(0, 0).toFixed(1),
+                            depth: +(terrainHeight(QUARRY_SPAWN.x, QUARRY_SPAWN.z) - terrainHeight(0, 0)).toFixed(1),
+                            waterInPit: waterLevelAt(0, 0) < -1e8,
+                            ramp: rampHeights,
+                            dressingSpots: quarryDressingSpots.length,
+                            marks: harborMarks.map((m) => m.label),
+                          }
+                        : null,
+                  };
+                })(),
                 fog: f ? { type: f.isFogExp2 ? 'FogExp2' : 'Fog', density: f.density, color: '#' + f.color.getHexString() } : null,
                 env: !!scene.environment,
                 envIntensity: scene.environmentIntensity,
@@ -13320,7 +13869,8 @@ export default function BattleRoyaleGame() {
             break;
           }
         }
-        if (p.y < WATER_Y && groundAt(p.x, p.z) < WATER_Y) {
+        const wl = waterLevelAt(p.x, p.z);
+        if (p.y < wl && groundAt(p.x, p.z) < wl) {
           const k = Math.exp(-8 * dt);
           p.vx *= k;
           p.vy *= k;
@@ -14101,7 +14651,7 @@ export default function BattleRoyaleGame() {
 
     function ensureTerrainCanvas() {
       if (!mapTerrain) return;
-      const key = (terrainOn ? 'H' : 'R') + '|' + terrainSeed;
+      const key = (terrainOn ? (worldKind === 'quarry' ? 'Q' : 'H') : 'R') + '|' + terrainSeed;
       if (key === mapTerrainKey) return;
       mapTerrainKey = key;
       const N = 144;
@@ -14118,7 +14668,12 @@ export default function BattleRoyaleGame() {
           const z = -half + ((j + 0.5) / N) * 2 * half;
           const h = terrainOn ? terrainHeight(x, z) : groundAt(x, z);
           let col = '#618e54';
-          if (h < WATER_Y) {
+          if (worldKind === 'quarry') {
+            // the pit is DRY — never the sea-blue tint. Same palette the
+            // streamed tiles wear, so the map matches the world.
+            quarryTileColor(x, z, h, 0, qcTmp);
+            col = '#' + qcTmp.getHexString();
+          } else if (h < WATER_Y) {
             const d = THREE.MathUtils.clamp((WATER_Y - h) / 6, 0, 1);
             col = 'rgb(' + Math.round(30 - 10 * d) + ',' + Math.round(84 - 30 * d) + ',' + Math.round(126 - 38 * d) + ')';
           } else if (h < BEACH_Y + 0.15) col = '#d3c493';
@@ -15992,6 +16547,87 @@ export default function BattleRoyaleGame() {
                 <rect x="35" y="-4" width="90" height="10" fill="#d97706" />
               </g>
             </svg>
+
+            {/* Mode Shape 3: Quarry — the open-pit mine: terraced benches,
+                the spiral haul road and a gantry crane against a dust haze */}
+            <svg className="mode-shape mode-shape-quarry" viewBox="0 0 1200 800" preserveAspectRatio="xMidYMid slice">
+              <defs>
+                <linearGradient id="quarrySky" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor="#1b2430" />
+                  <stop offset="45%" stopColor="#4a3f30" />
+                  <stop offset="75%" stopColor="#6e5a3c" />
+                  <stop offset="100%" stopColor="#241c14" />
+                </linearGradient>
+                <radialGradient id="quarryHaze" cx="50%" cy="55%" r="65%">
+                  <stop offset="0%" stopColor="#c4a464" stopOpacity="0.30" />
+                  <stop offset="100%" stopColor="#c4a464" stopOpacity="0" />
+                </radialGradient>
+              </defs>
+              <rect width="1200" height="800" fill="url(#quarrySky)" />
+              <rect width="1200" height="800" fill="url(#quarryHaze)" />
+
+              {/* Dusty horizon band + low sun smear */}
+              <rect x="0" y="430" width="1200" height="90" fill="#8a6f42" opacity="0.25" />
+              <ellipse cx="920" cy="420" rx="180" ry="42" fill="#d8b06a" opacity="0.18" />
+
+              {/* THE PIT: concentric terraced bench rings sinking to the floor */}
+              <ellipse cx="600" cy="560" rx="430" ry="180" fill="#3a2f22" />
+              <ellipse cx="600" cy="572" rx="360" ry="150" fill="#443626" />
+              <ellipse cx="600" cy="584" rx="300" ry="124" fill="#4d3d2a" />
+              <ellipse cx="600" cy="598" rx="245" ry="100" fill="#57452e" />
+              <ellipse cx="600" cy="612" rx="192" ry="78" fill="#614e33" />
+              <ellipse cx="600" cy="626" rx="145" ry="58" fill="#6b563a" />
+              <ellipse cx="600" cy="638" rx="100" ry="40" fill="#755f40" />
+              {/* the worked pit floor */}
+              <ellipse cx="600" cy="646" rx="62" ry="24" fill="#8a724e" />
+
+              {/* The spiral haul road — one bright ramp sweeping down the benches */}
+              <path d="M 600,382 C 760,392 880,470 860,560 C 840,650 720,690 640,660 C 560,630 540,560 600,540 C 660,520 700,560 690,610"
+                fill="none" stroke="#c9b489" strokeWidth="10" opacity="0.85" strokeLinecap="round" />
+              <path d="M 600,382 C 760,392 880,470 860,560 C 840,650 720,690 640,660 C 560,630 540,560 600,540 C 660,520 700,560 690,610"
+                fill="none" stroke="#e8d7ac" strokeWidth="3" opacity="0.6" strokeLinecap="round" strokeDasharray="14 10" />
+
+              {/* Terrace edge highlights so the benches read as cut rock */}
+              <ellipse cx="600" cy="560" rx="430" ry="180" fill="none" stroke="#a8895b" strokeWidth="2" opacity="0.5" />
+              <ellipse cx="600" cy="598" rx="245" ry="100" fill="none" stroke="#a8895b" strokeWidth="2" opacity="0.4" />
+              <ellipse cx="600" cy="638" rx="100" ry="40" fill="none" stroke="#a8895b" strokeWidth="2" opacity="0.35" />
+
+              {/* Excavator + dump truck silhouettes on the mid bench */}
+              <g transform="translate(760, 470)" fill="#151009">
+                <rect x="0" y="26" width="64" height="20" rx="3" />
+                <rect x="10" y="4" width="30" height="24" rx="3" />
+                <rect x="34" y="12" width="34" height="8" transform="rotate(-24 34 12)" />
+                <circle cx="14" cy="50" r="9" />
+                <circle cx="52" cy="50" r="9" />
+              </g>
+              <g transform="translate(430, 560)" fill="#151009">
+                <polygon points="0,34 70,34 62,10 24,10" />
+                <rect x="70" y="18" width="26" height="16" />
+                <circle cx="18" cy="40" r="8" />
+                <circle cx="52" cy="40" r="8" />
+                <circle cx="86" cy="40" r="8" />
+              </g>
+
+              {/* Yard gantry crane on the crest rim, north side */}
+              <g transform="translate(250, 400)">
+                <rect x="30" y="0" width="10" height="120" fill="#1c1610" />
+                <rect x="150" y="0" width="10" height="120" fill="#1c1610" />
+                <rect x="10" y="-16" width="170" height="12" fill="#241c12" />
+                <line x1="95" y1="-4" x2="95" y2="46" stroke="#f2a516" strokeWidth="2" />
+                <rect x="75" y="46" width="40" height="22" rx="2" fill="#0284c7" stroke="#38bdf8" strokeWidth="1.5" />
+              </g>
+
+              {/* Conveyor stack rising from the floor to the crest */}
+              <line x1="920" y1="520" x2="1060" y2="400" stroke="#2a2118" strokeWidth="16" strokeLinecap="round" />
+              <line x1="920" y1="520" x2="1060" y2="400" stroke="#8a6f42" strokeWidth="4" strokeLinecap="round" strokeDasharray="10 12" opacity="0.7" />
+              <circle cx="1060" cy="400" r="10" fill="#241c12" />
+              <circle cx="920" cy="520" r="10" fill="#241c12" />
+
+              {/* Warning signage strung along the crest */}
+              <line x1="120" y1="470" x2="360" y2="452" stroke="#6b563a" strokeWidth="3" opacity="0.8" />
+              <rect x="200" y="424" width="26" height="26" fill="#f2a516" opacity="0.9" transform="rotate(8 200 424)" />
+              <text x="213" y="441" fill="#241c12" fontSize="15" fontWeight="900" textAnchor="middle" transform="rotate(8 213 424)">!</text>
+            </svg>
           </div>
 
           {/* Chosen Character Shown Facing The Background (Back turned to player, looking ahead into arena) */}
@@ -16292,19 +16928,22 @@ export default function BattleRoyaleGame() {
                   <span className="mode-name">Harbor</span>
                   <span className="mode-tag">Battle Royale</span>
                 </button>
-                <button className="mode" type="button" role="radio" aria-checked="false" data-mode="quarry" disabled>
+                <button className="mode" type="button" role="radio" aria-checked="false" data-mode="quarry">
                   <span className="mode-name">Quarry</span>
-                  <span className="mode-tag">Locked</span>
+                  <span className="mode-tag">Open-Pit Mine</span>
                 </button>
                     </div>
-                    <button className="btn play" id="play" type="button">
-                      Deploy
-                    </button>
                   </section>
                 </div>
               </div>
             </aside>
           </div>
+          {/* DEPLOY — its own permanent dock at the bottom-right of the lobby,
+              outside both collapsible rails so it can never be collapsed,
+              squeezed or re-stacked away. */}
+          <button className="btn play" id="play" type="button">
+            Deploy
+          </button>
           {/* Deploy flash — a full-screen burst as the menu launches away */}
           <div className="deploy-fx" aria-hidden="true" />
         </div>
