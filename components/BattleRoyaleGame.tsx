@@ -17,6 +17,7 @@ import {
 } from '@/lib/game-math';
 import {
   pbrMaterial,
+  enablePom,
   makeGerstnerWater,
   makeSkyDome,
   buildEnvironment,
@@ -639,6 +640,8 @@ export default function BattleRoyaleGame() {
       len: number;
       mouthY: number; // natural surface at the mouth
       floorY: number; // flat cave floor height
+      halfW?: number; // Task P — adits are narrower than island caves
+      adit?: boolean; // Task P — quarry adit: teardown belongs to clearQuarry
     }
     const caves: CaveSite[] = [];
     let caveGroup: THREE.Group | null = null;
@@ -675,7 +678,7 @@ export default function BattleRoyaleGame() {
     function caveDarkAt(x: number, y: number, z: number) {
       for (const c of caves) {
         const { t, s } = caveAxis(c, x, z);
-        if (t > 3 && t < c.len - 3 && Math.abs(s) < CAVE_FLAT - 0.5 && y < c.floorY + CAVE_SPRING + CAVE_RI + 0.2) return c;
+        if (t > 3 && t < c.len - 3 && Math.abs(s) < (c.halfW ?? CAVE_FLAT - 0.5) && y < c.floorY + CAVE_SPRING + CAVE_RI + 0.2) return c;
       }
       return null;
     }
@@ -774,6 +777,9 @@ export default function BattleRoyaleGame() {
       // ---- Rock arches (shared material, one group) ----
       caveGroup = new THREE.Group();
       caveRockMat = MAT({ color: 0x6e6a61 }, 'rock');
+      // Task P — the cave arch IS a rock wall you stand under: POM on,
+      // same strict 6-10 m fade as the terrain.
+      enablePom(caveRockMat, 'rock', { depth: 0.06, steps: 8, near: 6, far: 10 });
       for (const c of caves) {
         const band = new THREE.Shape();
         band.moveTo(CAVE_RI, 0);
@@ -969,6 +975,57 @@ export default function BattleRoyaleGame() {
     // vegetation placer keeps scrub from growing through the plant.
     const quarryDressingSpots: Array<{ x: number; z: number; r: number }> = [];
 
+    // ----------------------------------------------------
+    // Task P — the WORKING MINE: tunnel ADITS carved into the
+    // bench walls (real heightfield carves, cave-grade gloom inside),
+    // HEAVY MACHINERY, GIANT ORE TRUCKS, CONVEYOR BELTS (belt texture
+    // scrolls + amber beacons pulse) and OPENABLE WOODEN CRATES on the
+    // terraces + pit floor that spill wood + loot when hit. There are
+    // no harvestable trees in the quarry — the crates ARE the wood
+    // economy out here.
+    // ----------------------------------------------------
+    const ADIT_HALF = 2.2; // flat adit floor half-width (m)
+    const ADIT_BLEND = 4.2; // angular blend outer edge (m)
+    const ADIT_RI = 2.6; // rock arch inner radius (interior clearance)
+    const ADIT_RW = 4.4; // rock arch outer radius (band thickness)
+    const ADIT_SPRING = 0.4; // arch centre above the floor
+    const ADIT_BACK_BLEND = 3.0; // radial metres the tunnel back wall rises over
+    interface QuarryAdit {
+      bench: number;
+      th: number;
+      rf: number; // face radius the adit bores into
+      depth: number; // bore length into the wall
+      x: number; // mouth centre (at the face line)
+      z: number;
+      ax: number; // unit axis: mouth -> INTO the wall (outboard)
+      az: number;
+    }
+    const quarryAdits: QuarryAdit[] = [];
+    interface QuarryCrateRec {
+      x: number;
+      y: number;
+      z: number;
+      hp: number;
+      opened: boolean;
+      solid: SolidBox;
+      wood: number;
+      loot: string[];
+      inAdit: boolean;
+    }
+    const quarryCrates: QuarryCrateRec[] = [];
+    // plant meshes/materials torn down with the map (clearQuarry)
+    const quarryPlantMats: THREE.MeshStandardMaterial[] = [];
+    let quarryCrateBodies: THREE.InstancedMesh | null = null;
+    let quarryCrateLids: THREE.InstancedMesh | null = null;
+    let quarryCrateBodyMat: THREE.MeshStandardMaterial | null = null;
+    let quarryBeltMat: THREE.MeshStandardMaterial | null = null;
+    let quarryBeaconMat: THREE.MeshStandardMaterial | null = null;
+    let quarryMachineryCount = 0; // excavators + ore trucks
+    let quarryConveyorCount = 0;
+    let quarryBeaconT = 0; // beacon pulse phase (updateQuarryPlant)
+    const quarryCrateWood = new THREE.Color(0x8a6a42); // debris + popup tint
+    const CRATE_HP = 55; // one blast bomb or ~4 pistol rounds
+
     function quarryHeight(x: number, z: number) {
       const r = Math.hypot(x, z);
       // --- the dusty bowl the mine lives in ---
@@ -1010,6 +1067,28 @@ export default function BattleRoyaleGame() {
         const cand = Math.max(bench, roadH);
         const blended = cand + (bench - cand) * edge;
         if (blended > h) h = blended;
+      }
+
+      // --- Task P: tunnel ADITS bored into the rising bench walls ---
+      // Each adit keeps the bench-floor height alive straight through
+      // the face for `depth` metres, so the bore floor IS terrain
+      // (movement, bullets, grenade rest — all free). The angular
+      // blend raises the tunnel sides steeper than STEEP_SLOPE (no
+      // accidental stairs onto the next terrace) and the radial back
+      // blend closes the bore with a climb-proof rock wall.
+      for (const a of quarryAdits) {
+        const t = r - a.rf; // metres outboard of the face line
+        if (t < -2 || t > a.depth + ADIT_BACK_BLEND + 1.5) continue;
+        const dth = Math.abs(Math.atan2(Math.sin(th - a.th), Math.cos(th - a.th)));
+        const s = dth * r; // angular distance in metres at this radius
+        if (s > ADIT_BLEND) continue;
+        const sideK = 1 - THREE.MathUtils.smoothstep(s, ADIT_HALF, ADIT_BLEND);
+        if (sideK <= 0) continue;
+        const backK = 1 - THREE.MathUtils.smoothstep(t, a.depth - 1.5, a.depth + ADIT_BACK_BLEND);
+        const k = sideK * backK;
+        if (k <= 0) continue;
+        const aditFloor = -(a.bench + 1) * Q_BENCH_H;
+        if (h > aditFloor) h += (aditFloor - h) * k;
       }
 
       // Eroded floor detail — tiny crumble that never climbs the faces
@@ -1210,7 +1289,12 @@ export default function BattleRoyaleGame() {
       return Math.min(terrainOn ? groundCut(ray, maxDist) : Infinity, surfaceCut(ray, maxDist));
     }
 
+    // Task P — POM on the terraced ground + every rock face the world
+    // wears: ray-marched relief from the terrain height map, fully alive
+    // only within 6 m of the camera and faded to flat by 10 m (8 march
+    // steps — mobile-safe by design). Headless/LITE skips the injection.
     const terrainMat = MAT({ vertexColors: true }, 'terrain');
+    enablePom(terrainMat, 'terrain', { depth: 0.045, steps: 8, near: 6, far: 10 });
     // Biome palette for the terrain tiles — mixed per-vertex by the
     // biome weights, then overridden by rock/snow/sand rules.
     const TILE_GRASS = new THREE.Color(0x7fa050);
@@ -3245,6 +3329,11 @@ export default function BattleRoyaleGame() {
         p.life = 0.9 + Math.random() * 0.7;
         p.s = (0.18 + Math.random() * 0.2) * scale;
         p.mesh.visible = true;
+        // Task P: terrain worlds hide `world` (enterQuarry/enterHarbor
+        // keep it invisible) — debris chips must ride the SCENE there or
+        // crate splinters + blast chips would never render.
+        if (world.visible) world.add(p.mesh);
+        else scene.add(p.mesh);
         p.mesh.position.set(x, y, z);
         p.mesh.rotation.set(Math.random() * 3, Math.random() * 3, Math.random() * 3);
         p.mesh.scale.setScalar(p.s);
@@ -4692,7 +4781,11 @@ export default function BattleRoyaleGame() {
     }
 
     function probeSunlit(x: number, z: number, headY: number) {
-      if (headY < WATER_Y + 0.25) return 'submerged';
+      // Task P fix: gate on the PER-WORLD water level. The dry quarry's
+      // floor sits 300+ m below sea level — the old raw WATER_Y test read
+      // the whole pit (and its adits) as "submerged", silently blocking
+      // solar shield regen out of the open-pit sky.
+      if (headY < waterLevelAt(x, z) + 0.25) return 'submerged';
       // Task N — the storm shroud owns the sky over the dangerzone: the
       // sun never reaches under it, so the solar swarm CANNOT recharge
       // outside the circle (and neither can the bots').
@@ -8366,11 +8459,136 @@ export default function BattleRoyaleGame() {
       if (quarryGroup) return; // already dressed
       quarryGroup = new THREE.Group();
       quarryRockMat = pbrMaterial({ color: 0x7d746a }, 'rock');
+      // Task P — bench-face boulders + the ADIT arches wear ray-marched
+      // rock relief up close (6-10 m fade, 8 steps — mobile butter).
+      enablePom(quarryRockMat, 'rock', { depth: 0.06, steps: 8, near: 6, far: 10 });
       quarryOreMat = pbrMaterial({ color: 0x8a5a36 }, 'sand');
       quarrySteelMat = pbrMaterial({ color: 0x6f6a5f }, 'metal');
       quarryDressingSpots.length = 0;
       const rnd = mulberry32((terrainSeed ^ 0x51a11e5) >>> 0);
       const mark = (x: number, z: number, r: number) => quarryDressingSpots.push({ x, z, r });
+
+      // ----------------------------------------------------
+      // Task P — TUNNEL ADITS, sited FIRST so the heightfield carve
+      // exists before anything below samples terrainHeight. Each adit
+      // bores into the wall a bench is dug against: mouth at the face
+      // line, floor = the bench floor, rock arch roof over the bore,
+      // timber portal, a pitch-black back plug and a CAVE-grade dark
+      // record (caveDarkAt -> no sun, no shield regen, cave gloom).
+      // Siting dodges the haul-road corridor, keeps mouths 26 m apart
+      // and leaves the (0,342)->(0,348) e2e face a face forever.
+      // ----------------------------------------------------
+      quarryAdits.length = 0;
+      quarryCrates.length = 0;
+      quarryMachineryCount = 0;
+      quarryConveyorCount = 0;
+      const angDist = (a: number, b: number) => Math.abs(Math.atan2(Math.sin(a - b), Math.cos(a - b)));
+      for (let want = 8, tries = 0; quarryAdits.length < want && tries < 400; tries++) {
+        const bench = 3 + Math.floor(rnd() * 14); // benches 3..16
+        const th = -Math.PI + rnd() * Math.PI * 2;
+        // the verify_tasko A15 climb probe must stay a sheer face
+        if (bench >= 4 && bench <= 7 && angDist(th, Math.PI / 2) < 0.22) continue;
+        const rf = Q_RIM - bench * Q_RW;
+        const depth = 9 + rnd() * 2.5;
+        let blocked = false;
+        for (let rr = rf - 4; rr <= rf + depth + 4 && !blocked; rr += 2.5) {
+          if (quarryRoadAt(Math.cos(th) * rr, Math.sin(th) * rr, rr)) blocked = true;
+        }
+        for (const o of quarryAdits) {
+          if (Math.hypot(Math.cos(th) * rf - o.x, Math.sin(th) * rf - o.z) < 26) blocked = true;
+        }
+        if (blocked) continue;
+        quarryAdits.push({
+          bench,
+          th,
+          rf,
+          depth,
+          x: Math.cos(th) * (rf + 0.5),
+          z: Math.sin(th) * (rf + 0.5),
+          ax: Math.cos(th),
+          az: Math.sin(th),
+        });
+      }
+      // adit meshes: arch roof + timber portal + back plug + rubble
+      const aditTimberMat = pbrMaterial({ color: 0x5a4630 }, 'plank');
+      const aditDarkMat = pbrMaterial({ color: 0x1d1a16 }, 'rock');
+      quarryPlantMats.push(aditTimberMat, aditDarkMat);
+      const aditArchGeo = new THREE.ExtrudeGeometry(
+        (() => {
+          const band = new THREE.Shape();
+          band.moveTo(ADIT_RI, 0);
+          band.absarc(0, 0, ADIT_RI, 0, Math.PI, false);
+          band.lineTo(-ADIT_RW, 0);
+          band.absarc(0, 0, ADIT_RW, Math.PI, 0, true);
+          band.closePath();
+          return band;
+        })(),
+        { depth: 1, bevelEnabled: false, curveSegments: 16 }
+      );
+      for (const a of quarryAdits) {
+        const fy = -(a.bench + 1) * Q_BENCH_H; // adit floor == bench floor
+        const tx = -a.az;
+        const tz = a.ax; // tangential unit (portal width direction)
+        const yawT = Math.atan2(tx, tz);
+        // rock arch roof: portal hood 1.2 m proud of the face, the far
+        // end buried inside the back wall the carve raises
+        const arch = new THREE.Mesh(aditArchGeo, quarryRockMat!);
+        arch.scale.z = a.depth + 1.6;
+        arch.rotation.y = Math.atan2(a.ax, a.az); // local +Z -> bore axis
+        arch.position.set(a.x - a.ax * 1.2, fy + ADIT_SPRING, a.z - a.az * 1.2);
+        arch.castShadow = true;
+        arch.receiveShadow = true;
+        arch.userData.wc = { x: a.x, z: a.z };
+        arch.userData.quarryAdit = true;
+        quarryGroup!.add(arch);
+        shootable.push(arch);
+        // timber portal: two posts + a lintel framing the mouth
+        for (const side of [-1, 1]) {
+          const post = new THREE.Mesh(new THREE.BoxGeometry(0.24, 3.05, 0.24), aditTimberMat);
+          post.position.set(a.x + tx * side * 1.9 - a.ax * 0.95, fy + 1.52, a.z + tz * side * 1.9 - a.az * 0.95);
+          post.rotation.y = yawT;
+          post.castShadow = true;
+          quarryGroup!.add(post);
+        }
+        const lintel = new THREE.Mesh(new THREE.BoxGeometry(0.3, 0.3, 4.6), aditTimberMat);
+        lintel.position.set(a.x - a.ax * 0.8, fy + 3.05, a.z - a.az * 0.8);
+        lintel.rotation.y = yawT;
+        lintel.castShadow = true;
+        quarryGroup!.add(lintel);
+        // pitch-black back plug closes the bore
+        const plug = new THREE.Mesh(new THREE.BoxGeometry(4.6, 3.3, 0.6), aditDarkMat);
+        plug.position.set(a.x + a.ax * (a.depth - 0.9), fy + 1.55, a.z + a.az * (a.depth - 0.9));
+        plug.rotation.y = Math.atan2(tx, tz);
+        quarryGroup!.add(plug);
+        // rubble dressing at the mouth
+        for (let b = 0; b < 2; b++) {
+          const rr = 0.7 + rnd() * 0.8;
+          const rb = new THREE.Mesh(new THREE.DodecahedronGeometry(rr, 0), quarryRockMat!);
+          const bx = a.x - a.ax * 2.4 + tx * (b ? 3.1 : -2.6) + (rnd() - 0.5) * 1.2;
+          const bz = a.z - a.az * 2.4 + tz * (b ? 3.1 : -2.6) + (rnd() - 0.5) * 1.2;
+          rb.position.set(bx, terrainHeight(bx, bz) + rr * 0.3, bz);
+          rb.rotation.set(rnd() * 3, rnd() * 3, rnd() * 3);
+          rb.castShadow = true;
+          rb.userData.wc = { x: bx, z: bz };
+          rb.userData.quarryAdit = true;
+          quarryGroup!.add(rb);
+          shootable.push(rb);
+        }
+        mark(a.x, a.z, 8);
+        // dark-interior record: caveDarkAt drives the sun block (no
+        // shield regen inside), the cave gloom and the cave fog
+        caves.push({
+          mx: a.x,
+          mz: a.z,
+          ax: a.ax,
+          az: a.az,
+          len: a.depth,
+          mouthY: fy,
+          floorY: fy,
+          halfW: ADIT_HALF - 0.2,
+          adit: true,
+        });
+      }
 
       // ---- MACHINERY YARD, on the flat deck around the crest ----
       // The deck is exactly flat for r <= Q_YARD_R - 60, so every
@@ -8434,6 +8652,464 @@ export default function BattleRoyaleGame() {
         quarryGroup.add(rock);
         mark(rx, rz, r + 2.5);
       }
+
+      // ----------------------------------------------------
+      // Task P — THE WORKING PLANT: heavy excavators, giant ore
+      // trucks, bench-hopping conveyor belts (every run ends in a
+      // transfer tower so the belt never buries itself in a bench
+      // face) and openable wooden crates. All static PBR meshes over
+      // solids: movement blocks on the hulls, bullets soak on the
+      // bodies, the veg placer keeps scrub off every footprint.
+      // ----------------------------------------------------
+      const plantYellowMat = pbrMaterial({ color: 0xb9820f, metalness: 0.5, roughness: 0.52 }, 'painted');
+      const plantSteelMat = pbrMaterial({ color: 0x53555c, metalness: 0.72, roughness: 0.5 }, 'metal');
+      const plantGlassMat = pbrMaterial({ color: 0x11161d, metalness: 0.85, roughness: 0.14 }, 'metal');
+      const plantRubberMat = pbrMaterial({ color: 0x17181c, roughness: 0.95 }, 'generic');
+      const plantDarkMat = pbrMaterial({ color: 0x2c2e33, metalness: 0.4, roughness: 0.7 }, 'metal');
+      quarryBeaconMat = pbrMaterial({ color: 0x8a5310, emissive: 0xff9a1f, emissiveIntensity: 1.4 }, 'generic');
+      quarryPlantMats.push(plantYellowMat, plantSteelMat, plantGlassMat, plantRubberMat, plantDarkMat, quarryBeaconMat);
+
+      // rubber belt: dark chevron canvas whose uv scrolls in update()
+      const beltCanvas = document.createElement('canvas');
+      beltCanvas.width = 64;
+      beltCanvas.height = 64;
+      {
+        const bc = beltCanvas.getContext('2d')!;
+        bc.fillStyle = '#17181c';
+        bc.fillRect(0, 0, 64, 64);
+        bc.strokeStyle = '#26282e';
+        bc.lineWidth = 7;
+        for (let i = -2; i < 4; i++) {
+          bc.beginPath();
+          bc.moveTo(0, i * 24);
+          bc.lineTo(64, i * 24 + 14);
+          bc.stroke();
+        }
+        bc.fillStyle = 'rgba(190,160,110,0.16)';
+        for (let i = 0; i < 90; i++) bc.fillRect(Math.floor(rnd() * 64), Math.floor(rnd() * 64), 2, 1);
+      }
+      const beltTex = new THREE.CanvasTexture(beltCanvas);
+      beltTex.wrapS = beltTex.wrapT = THREE.RepeatWrapping;
+      beltTex.repeat.set(1, 9.6); // one chevron tile per 1.4 m of belt run
+      quarryBeltMat = pbrMaterial({ color: 0x9a9aa2 }, 'generic');
+      quarryBeltMat.map = beltTex;
+      quarryPlantMats.push(quarryBeltMat);
+
+      // register one machine: hull solid + soakable body meshes
+      const plantSolids: SolidBox[] = [];
+      const rigUp = (
+        x: number,
+        z: number,
+        y: number,
+        rot: number,
+        hx: number,
+        hz: number,
+        top: number,
+        soak: THREE.Object3D[]
+      ) => {
+        const sb: SolidBox = { x, z, hx, hz, bottom: y - 0.4, top };
+        solids.push(sb);
+        plantSolids.push(sb);
+        for (const s of soak) {
+          s.userData.wc = { x, z };
+          s.userData.quarryPlant = true;
+          shootable.push(s);
+        }
+        mark(x, z, Math.max(hx, hz) + 3);
+      };
+
+      // --- HEAVY EXCAVATOR, mid-size tracked digger, bucket down a heap ---
+      const buildExcavator = (): THREE.Group => {
+        const g = new THREE.Group();
+        for (const sx of [-1.08, 1.08]) {
+          part(g, new THREE.BoxGeometry(1.05, 0.95, 5.1), plantRubberMat, sx, 0.5, 0);
+        }
+        part(g, new THREE.BoxGeometry(2.95, 0.42, 4.7), plantDarkMat, 0, 1.13, 0); // deck
+        part(g, new THREE.BoxGeometry(2.7, 1.32, 3.3), plantYellowMat, 0, 2.0, -0.55); // house
+        part(g, new THREE.BoxGeometry(1.38, 1.32, 1.5), plantYellowMat, 0.62, 2.02, 0.95); // cab
+        part(g, new THREE.BoxGeometry(1.2, 0.52, 1.42), plantGlassMat, 0.62, 2.24, 1.0); // glass
+        part(g, new THREE.CylinderGeometry(0.13, 0.16, 0.85, 10), plantDarkMat, -0.8, 3.05, -1.15); // stack
+        part(g, new THREE.CylinderGeometry(0.12, 0.12, 0.22, 10), quarryBeaconMat!, 0.62, 2.8, 0.95); // beacon
+        const boom = new THREE.Group();
+        boom.position.set(0, 2.35, 0.55);
+        boom.rotation.x = -0.62;
+        part(boom, new THREE.BoxGeometry(0.62, 0.55, 4.5), plantYellowMat, 0, 0, 2.25);
+        const stick = new THREE.Group();
+        stick.position.set(0, -0.1, 4.4);
+        stick.rotation.x = 1.02;
+        part(stick, new THREE.BoxGeometry(0.5, 0.44, 3.1), plantYellowMat, 0, 0, 1.55);
+        part(stick, new THREE.BoxGeometry(1.05, 0.85, 0.95), plantSteelMat, 0, -0.28, 3.35); // bucket
+        boom.add(stick);
+        g.add(boom);
+        return g;
+      };
+
+      // --- GIANT ORE TRUCK: 9 m rust-red hauler, empty bed parked ---
+      const buildOreTruck = (): THREE.Group => {
+        const g = new THREE.Group();
+        part(g, new THREE.BoxGeometry(3.1, 0.7, 8.6), plantDarkMat, 0, 1.38, -0.2); // chassis
+        const bed = new THREE.Group();
+        bed.position.set(0, 2.85, -1.35);
+        bed.rotation.x = -0.07;
+        part(bed, new THREE.BoxGeometry(3.35, 1.9, 5.3), plantYellowMat, 0, 0, 0);
+        for (const sx of [-1.68, 1.68]) part(bed, new THREE.BoxGeometry(0.22, 0.42, 5.3), plantSteelMat, sx, 1.05, 0);
+        g.add(bed);
+        part(g, new THREE.BoxGeometry(2.05, 1.45, 1.85), plantYellowMat, 0, 2.62, 3.15); // cab
+        part(g, new THREE.BoxGeometry(1.88, 0.55, 1.9), plantGlassMat, 0, 2.9, 3.2); // glass band
+        part(g, new THREE.BoxGeometry(2.15, 0.65, 0.5), plantDarkMat, 0, 1.95, 4.35); // grille
+        part(g, new THREE.BoxGeometry(2.45, 0.45, 0.35), plantSteelMat, 0, 1.32, 4.55); // bumper
+        part(g, new THREE.CylinderGeometry(0.12, 0.12, 0.22, 10), quarryBeaconMat!, 0, 3.44, 3.15); // beacon
+        const wheelGeo = new THREE.CylinderGeometry(1.02, 1.02, 0.72, 16);
+        for (const sx of [-1.86, 1.86]) {
+          for (const sz of [-2.9, -1.35, 2.15]) {
+            const wheel = new THREE.Mesh(wheelGeo, plantRubberMat);
+            wheel.rotation.z = Math.PI / 2;
+            wheel.position.set(sx, 1.02, sz);
+            wheel.castShadow = true;
+            g.add(wheel);
+          }
+        }
+        for (const sx of [-0.55, 0.55]) part(g, new THREE.BoxGeometry(0.09, 1.35, 0.09), plantSteelMat, sx, 1.05, 4.2); // ladder rails
+        return g;
+      };
+
+      // --- CONVEYOR SEGMENT (fixed 13.5 m runs so one belt texture fits
+      // every run): tail hopper at A, head drum + chute at B, legs to the
+      // ground. The run rides along local +Z; legs stand in WORLD space
+      // under the belt line (children of the mine group, not the tilted
+      // frame, so they stay plumb).
+      const buildConveyorSegment = (a: THREE.Vector3, b: THREE.Vector3): THREE.Group => {
+        const g = new THREE.Group();
+        const len = a.distanceTo(b);
+        part(g, new THREE.BoxGeometry(0.85, 0.4, len), plantSteelMat, 0, -0.32, 0); // stringer
+        part(g, new THREE.BoxGeometry(0.95, 0.16, len), quarryBeltMat!, 0, 0, 0); // moving belt
+        const drumGeo = new THREE.CylinderGeometry(0.3, 0.3, 1.02, 14);
+        for (const dz of [0, len]) {
+          const drum = new THREE.Mesh(drumGeo, plantDarkMat);
+          drum.rotation.z = Math.PI / 2;
+          drum.position.set(0, -0.02, dz);
+          g.add(drum);
+        }
+        part(g, new THREE.CylinderGeometry(0.5, 1.15, 1.25, 4), plantSteelMat, 0, 1.15, 0.2, 0); // tail hopper
+        part(g, new THREE.BoxGeometry(1.1, 0.8, 0.8), plantSteelMat, 0, -0.75, len - 0.35); // head chute
+        g.position.copy(a);
+        g.lookAt(b.x, a.y, b.z); // horizontal turn first
+        g.rotation.x = -Math.asin(Math.max(-1, Math.min(1, (b.y - a.y) / len))); // then the incline
+        const legs = Math.max(2, Math.round(len / 11));
+        const dx = (b.x - a.x) / Math.max(0.01, Math.hypot(b.x - a.x, b.z - a.z));
+        const dz = (b.z - a.z) / Math.max(0.01, Math.hypot(b.x - a.x, b.z - a.z));
+        for (let i = 0; i <= legs; i++) {
+          const f = i / legs;
+          const wp = new THREE.Vector3().lerpVectors(a, b, f);
+          const gh = terrainHeight(wp.x, wp.z);
+          const topY = wp.y - 0.35;
+          if (topY - gh < 0.25) continue; // belt near ground: no leg
+          const px = -dz; // across the run
+          const pz = dx;
+          for (const sd of [-0.52, 0.52]) {
+            const lx = wp.x + px * sd;
+            const lz = wp.z + pz * sd;
+            const leg = new THREE.Mesh(new THREE.BoxGeometry(0.22, topY - gh, 0.22), plantSteelMat);
+            leg.position.set(lx, gh + (topY - gh) / 2, lz);
+            leg.castShadow = true;
+            quarryGroup!.add(leg);
+            const sb: SolidBox = { x: lx, z: lz, hx: 0.4, hz: 0.4, bottom: gh, top: topY };
+            solids.push(sb);
+            plantSolids.push(sb);
+          }
+        }
+        return g;
+      };
+      const conveyorSegAt = (x: number, y: number, z: number, dirX: number, dirZ: number) => {
+        const L = 13.5;
+        return {
+          a: new THREE.Vector3(x, y, z),
+          b: new THREE.Vector3(x + dirX * L, y + 0.9, z + dirZ * L),
+          L,
+        };
+      };
+
+      // ---- MACHINERY: 2 excavators + 3 giant ore trucks ----
+      const placeMachine = (
+        builder: () => THREE.Group,
+        x: number,
+        z: number,
+        rot: number,
+        hx: number,
+        hz: number,
+        top: number
+      ) => {
+        const g = builder();
+        const y = terrainHeight(x, z);
+        g.position.set(x, y, z);
+        g.rotation.y = rot;
+        g.traverse((o: any) => {
+          if (o.isMesh) o.castShadow = true;
+        });
+        quarryGroup!.add(g);
+        const soak: THREE.Object3D[] = [];
+        g.traverse((o: any) => {
+          if (o.isMesh && soak.length < 3) soak.push(o);
+        });
+        rigUp(x, z, y, rot, hx, hz, y + top, soak);
+        quarryMachineryCount++;
+      };
+      // excavator digging a floor heap (bucket at the ready)
+      {
+        const th = 2.35;
+        placeMachine(buildExcavator, Math.cos(th) * 36, Math.sin(th) * 36, th + Math.PI + 0.5, 2.9, 3.0, 3.4);
+      }
+      // excavator parked on a mid bench, clear of the road
+      {
+        let px = 0;
+        let pz = 0;
+        for (let t = 0; t < 60; t++) {
+          const th = rnd() * Math.PI * 2;
+          const r = Q_RIM - 8.5 * Q_RW - 4;
+          px = Math.cos(th) * r;
+          pz = Math.sin(th) * r;
+          if (!quarryRoadAt(px, pz, r)) break;
+        }
+        placeMachine(buildExcavator, px, pz, rnd() * Math.PI * 2, 2.9, 3.0, 3.4);
+      }
+      // two giant ore trucks on the pit floor, one on a low bench, one by
+      // the yard silo — the haul road itself stays clean for walking
+      placeMachine(buildOreTruck, Math.cos(-0.8) * 54, Math.sin(-0.8) * 54, -0.8 + Math.PI / 2 + 0.35, 2.1, 4.6, 4.6);
+      {
+        let px = 0;
+        let pz = 0;
+        for (let t = 0; t < 60; t++) {
+          const th = rnd() * Math.PI * 2;
+          const r = Q_RIM - 12 * Q_RW - 4;
+          px = Math.cos(th) * r;
+          pz = Math.sin(th) * r;
+          if (!quarryRoadAt(px, pz, r)) break;
+        }
+        placeMachine(buildOreTruck, px, pz, rnd() * Math.PI * 2, 2.1, 4.6, 4.6);
+      }
+      // yard: one truck + one excavator by the silo (flat deck, y = Q_YARD_Y)
+      placeMachine(buildOreTruck, Math.cos(ang(-95)) * 472, Math.sin(ang(-95)) * 472, ang(-95) + 1.9, 2.1, 4.6, 4.6);
+      placeMachine(buildExcavator, Math.cos(ang(10)) * 478, Math.sin(ang(10)) * 478, ang(10) + 0.4, 2.9, 3.0, 3.4);
+
+      // ---- CONVEYOR BELTS: two bench-hopping lines + one yard line ----
+      // Line 1: pit floor -> transfer tower -> bench 16 floor.
+      const buildTransferTower = (x: number, y0: number, z: number, ax: number, az: number, mat: THREE.Material) => {
+        const g = new THREE.Group();
+        const h = 16 + 4.2;
+        part(g, new THREE.BoxGeometry(4.4, h, 3.6), mat, 0, y0 + h / 2, 0);
+        part(g, new THREE.BoxGeometry(4.9, 0.5, 4.1), plantSteelMat, 0, y0 + h - 0.25, 0);
+        const dark = new THREE.Mesh(new THREE.BoxGeometry(3.1, 2.4, 0.4), plantDarkMat);
+        dark.position.set(0, y0 + 1.9, -1.75);
+        g.add(dark);
+        const dark2 = new THREE.Mesh(new THREE.BoxGeometry(3.1, 2.6, 0.4), plantDarkMat);
+        dark2.position.set(0, y0 + 17.4, 1.75);
+        g.add(dark2);
+        g.position.set(x, 0, z);
+        g.rotation.y = Math.atan2(ax, az);
+        g.traverse((o: any) => {
+          if (o.isMesh) o.castShadow = true;
+        });
+        quarryGroup!.add(g);
+        const sb: SolidBox = { x, z, hx: 2.6, hz: 2.2, bottom: y0, top: y0 + h };
+        solids.push(sb);
+        plantSolids.push(sb);
+        mark(x, z, 6);
+      };
+      const buildBenchConveyor = (bench: number, th: number) => {
+        const rf = Q_RIM - bench * Q_RW;
+        const fy = -(bench + 1) * Q_BENCH_H; // lower bench floor
+        const fyu = -bench * Q_BENCH_H; // upper bench floor
+        const cx = Math.cos(th);
+        const cz = Math.sin(th);
+        // tail on the lower bench, in front of the face
+        const tailX = cx * (rf - 14.5);
+        const tailZ = cz * (rf - 14.5);
+        const tailY = fy + 1.35;
+        // transfer tower flush against the face
+        const towerX = cx * (rf + 1.6);
+        const towerZ = cz * (rf + 1.6);
+        buildTransferTower(towerX, fy - 0.3, towerZ, cx, cz, quarryRockMat!);
+        // segment 1: tail -> tower mouth
+        const seg1 = conveyorSegAt(tailX, tailY, tailZ, cx, cz);
+        quarryGroup!.add(buildConveyorSegment(seg1.a, seg1.b));
+        // segment 2: tower back -> head drum over the upper bench
+        const outX = cx * (rf + 3.4);
+        const outZ = cz * (rf + 3.4);
+        const seg2 = conveyorSegAt(outX, fyu + 1.25, outZ, cx, cz);
+        quarryGroup!.add(buildConveyorSegment(seg2.a, seg2.b));
+        // small ore pile under the head chute
+        const hx = cx * (rf + 17.5);
+        const hz2 = cz * (rf + 17.5);
+        const heap = new THREE.Mesh(new THREE.ConeGeometry(2.6, 1.7, 7), quarryOreMat!);
+        heap.position.set(hx, fyu + 0.6, hz2);
+        heap.castShadow = true;
+        heap.userData.wc = { x: hx, z: hz2 };
+        quarryGroup!.add(heap);
+        shootable.push(heap);
+        mark(tailX, tailZ, 7);
+        mark(outX + cx * 13, outZ + cz * 13, 7);
+        quarryConveyorCount++;
+      };
+      // site the two bench lines off the haul road, away from the adits
+      const conveyorSpots: Array<{ bench: number; th: number }> = [];
+      for (let tries = 0; conveyorSpots.length < 2 && tries < 300; tries++) {
+        const bench = 8 + Math.floor(rnd() * 6); // benches 8..13
+        const th = -Math.PI + rnd() * Math.PI * 2;
+        const rf = Q_RIM - bench * Q_RW;
+        let blocked = false;
+        for (let rr = rf - 18; rr <= rf + 22 && !blocked; rr += 2.5) {
+          if (quarryRoadAt(Math.cos(th) * rr, Math.sin(th) * rr, rr)) blocked = true;
+        }
+        for (const a of quarryAdits) {
+          if (a.bench >= bench - 1 && a.bench <= bench + 1 && angDist(a.th, th) < 0.25) blocked = true;
+        }
+        for (const o of conveyorSpots) {
+          if (o.bench === bench || angDist(o.th, th) < 0.5) blocked = true;
+        }
+        if (!blocked) conveyorSpots.push({ bench, th });
+      }
+      for (const s of conveyorSpots) buildBenchConveyor(s.bench, s.th);
+      // yard line: heap -> riser -> the silo's side hatch (flat deck),
+      // aimed at the silo the yard ring already built
+      {
+        const silo = yardAt(-118, 515);
+        const tailR = Math.hypot(silo.x, silo.z) - 33;
+        const yTh = Math.atan2(silo.z, silo.x);
+        const tailX = Math.cos(yTh) * tailR;
+        const tailZ = Math.sin(yTh) * tailR;
+        const heap = new THREE.Mesh(new THREE.ConeGeometry(3.1, 2.1, 7), quarryOreMat!);
+        heap.position.set(tailX, Q_YARD_Y + 0.8, tailZ);
+        heap.castShadow = true;
+        heap.userData.wc = { x: tailX, z: tailZ };
+        quarryGroup!.add(heap);
+        shootable.push(heap);
+        mark(tailX, tailZ, 6);
+        const seg1 = {
+          a: new THREE.Vector3(tailX, Q_YARD_Y + 2.4, tailZ),
+          b: new THREE.Vector3(Math.cos(yTh) * (tailR + 13.5), Q_YARD_Y + 3.3, Math.sin(yTh) * (tailR + 13.5)),
+        };
+        quarryGroup!.add(buildConveyorSegment(seg1.a, seg1.b));
+        const seg2 = {
+          a: new THREE.Vector3(seg1.b.x, Q_YARD_Y + 3.5, seg1.b.z),
+          b: new THREE.Vector3(Math.cos(yTh) * (tailR + 27), Q_YARD_Y + 4.4, Math.sin(yTh) * (tailR + 27)),
+        };
+        quarryGroup!.add(buildConveyorSegment(seg2.a, seg2.b));
+        quarryConveyorCount++;
+      }
+
+      // ---- OPENABLE WOODEN CRATES on the terraces + the pit floor ----
+      // No trees grow in the mine: shot-open crates ARE the wood economy
+      // (and they spill loot). Instanced bodies + lids: one draw call
+      // each, per-instance hide when opened.
+      const crateSpots: Array<{ x: number; z: number; rot: number; inAdit: boolean }> = [];
+      const crateBlocked = (x: number, z: number, r: number) => {
+        if (quarryRoadAt(x, z, r)) return true;
+        for (const a of quarryAdits) {
+          const t = (x - a.x) * a.ax + (z - a.z) * a.az;
+          const s = -(x - a.x) * a.az + (z - a.z) * a.ax;
+          if (t > -4 && t < a.depth + 4 && Math.abs(s) < ADIT_BLEND + 3) return true;
+        }
+        for (const m of plantSolids) {
+          if (Math.hypot(x - m.x, z - m.z) < m.hx + m.hz + 3.5) return true;
+        }
+        for (const c of crateSpots) {
+          if (Math.hypot(x - c.x, z - c.z) < 5.5) return true;
+        }
+        return false;
+      };
+      // one crate per terrace bench (0..17) + 7 on the pit floor + 2 in
+      // adits + 2 in the yard — ~29 total, spread by the seeded rnd
+      for (let b = 0; b < 18; b++) {
+        for (let t = 0; t < 40; t++) {
+          const th = -Math.PI + rnd() * Math.PI * 2;
+          const rIn = Q_RIM - (b + 1) * Q_RW + 3;
+          const rOut = Q_RIM - b * Q_RW - 3;
+          const r = rIn + rnd() * Math.max(0, rOut - rIn);
+          const x = Math.cos(th) * r;
+          const z = Math.sin(th) * r;
+          if (crateBlocked(x, z, r)) continue;
+          crateSpots.push({ x, z, rot: rnd() * Math.PI, inAdit: false });
+          break;
+        }
+      }
+      for (let k = 0; k < 7; k++) {
+        for (let t = 0; t < 40; t++) {
+          const th = -Math.PI + rnd() * Math.PI * 2;
+          const r = 16 + rnd() * 62;
+          const x = Math.cos(th) * r;
+          const z = Math.sin(th) * r;
+          if (crateBlocked(x, z, r)) continue;
+          crateSpots.push({ x, z, rot: rnd() * Math.PI, inAdit: false });
+          break;
+        }
+      }
+      for (let k = 0; k < 2 && k < quarryAdits.length; k++) {
+        const a = quarryAdits[k];
+        const t = a.depth * 0.55;
+        crateSpots.push({ x: a.x + a.ax * t, z: a.z + a.az * t, rot: rnd() * Math.PI, inAdit: true });
+      }
+      for (const [yx, yz] of [
+        [Math.cos(ang(-52)) * 505, Math.sin(ang(-52)) * 505],
+        [Math.cos(ang(30)) * 512, Math.sin(ang(30)) * 512],
+      ] as Array<[number, number]>) {
+        crateSpots.push({ x: yx, z: yz, rot: rnd() * Math.PI, inAdit: false });
+      }
+      if (crateSpots.length) {
+        quarryCrateBodyMat = pbrMaterial({ color: 0x9a7748 }, 'plank');
+        const bodyGeo = new THREE.BoxGeometry(1.15, 0.78, 0.88);
+        const lidGeo = new THREE.BoxGeometry(1.2, 0.1, 0.93);
+        quarryCrateBodies = new THREE.InstancedMesh(bodyGeo, quarryCrateBodyMat, crateSpots.length);
+        quarryCrateLids = new THREE.InstancedMesh(lidGeo, quarryCrateBodyMat, crateSpots.length);
+        quarryCrateBodies.castShadow = true;
+        quarryCrateBodies.receiveShadow = true;
+        quarryCrateLids.castShadow = true;
+        quarryCrateBodies.userData.cratePlant = true; // bullets: which instance?
+        const m4 = new THREE.Matrix4();
+        const q = new THREE.Quaternion();
+        const up = new THREE.Vector3(0, 1, 0);
+        const tmpC = new THREE.Color();
+        for (let i = 0; i < crateSpots.length; i++) {
+          const s = crateSpots[i];
+          const y = terrainHeight(s.x, s.z);
+          q.setFromAxisAngle(up, s.rot);
+          m4.compose(new THREE.Vector3(s.x, y + 0.39, s.z), q, new THREE.Vector3(1, 1, 1));
+          quarryCrateBodies.setMatrixAt(i, m4);
+          q.setFromAxisAngle(up, s.rot + 0.09);
+          m4.compose(new THREE.Vector3(s.x, y + 0.82, s.z), q, new THREE.Vector3(1, 1, 1));
+          quarryCrateLids.setMatrixAt(i, m4);
+          const tint = 0.86 + rnd() * 0.24;
+          tmpC.setRGB(tint, tint * 0.94, tint * 0.82);
+          quarryCrateBodies.setColorAt(i, tmpC);
+          tmpC.setRGB(tint * 0.8, tint * 0.74, tint * 0.62);
+          quarryCrateLids.setColorAt(i, tmpC);
+          const sb: SolidBox = { x: s.x, z: s.z, hx: 0.62, hz: 0.55, bottom: y, top: y + 0.9 };
+          solids.push(sb);
+          plantSolids.push(sb);
+          // loot table: a weapon or shield + ammo or a grenade, wood 6..12
+          const gun = rnd() < 0.08 ? 'rpg' : ['pistol', 'smg', 'sk', 'sniper', 'betgun'][Math.floor(rnd() * 5)];
+          const second =
+            rnd() < 0.3 ? 'shield' : rnd() < 0.62 ? (rnd() < 0.5 ? 'light' : 'heavy') : rnd() < 0.5 ? 'blast' : 'fire';
+          quarryCrates.push({
+            x: s.x,
+            y,
+            z: s.z,
+            hp: CRATE_HP,
+            opened: false,
+            solid: sb,
+            wood: 6 + Math.floor(rnd() * 7),
+            loot: [gun, second],
+            inAdit: s.inAdit,
+          });
+          if (!s.inAdit) mark(s.x, s.z, 2.6);
+        }
+        quarryCrateBodies.instanceMatrix.needsUpdate = true;
+        quarryCrateLids.instanceMatrix.needsUpdate = true;
+        if (quarryCrateBodies.instanceColor) quarryCrateBodies.instanceColor.needsUpdate = true;
+        if (quarryCrateLids.instanceColor) quarryCrateLids.instanceColor.needsUpdate = true;
+        quarryGroup!.add(quarryCrateBodies, quarryCrateLids);
+        shootable.push(quarryCrateBodies);
+      }
+
       scene.add(quarryGroup);
 
       // ---- Map chips: the yard deck, the ramp break, the pit floor ----
@@ -8443,7 +9119,73 @@ export default function BattleRoyaleGame() {
       return quarryDressingSpots.length;
     }
 
+    // ----------------------------------------------------
+    // Task P — CRATE DAMAGE / OPEN. Bullets chip (wood thunk +
+    // splinters); at zero HP the crate bursts: both instances
+    // un-render, the solid leaves, debris flies, WOOD grants and the
+    // loot table pops as pickups around the splinters. Blast bombs
+    // and rockets reach the same path through explode().
+    // ----------------------------------------------------
+    function damageQuarryCrate(i: number, dmg: number, at: THREE.Vector3) {
+      const c = quarryCrates[i];
+      if (!c || c.opened) return;
+      c.hp -= dmg;
+      spawnDebris(at.x, at.y, at.z, quarryCrateWood, 2);
+      playSfx('wood_hit');
+      if (c.hp <= 0) openQuarryCrate(i);
+    }
+
+    function openQuarryCrate(i: number) {
+      const c = quarryCrates[i];
+      if (!c || c.opened) return;
+      c.opened = true;
+      // un-render the body + lid: scale-0 matrices are the cheapest hide
+      const hide = new THREE.Matrix4().makeScale(0.0001, 0.0001, 0.0001);
+      if (quarryCrateBodies) {
+        quarryCrateBodies.setMatrixAt(i, hide);
+        quarryCrateBodies.instanceMatrix.needsUpdate = true;
+      }
+      if (quarryCrateLids) {
+        quarryCrateLids.setMatrixAt(i, hide);
+        quarryCrateLids.instanceMatrix.needsUpdate = true;
+      }
+      const si = solids.indexOf(c.solid);
+      if (si >= 0) solids.splice(si, 1);
+      spawnDebris(c.x, c.y + 0.45, c.z, quarryCrateWood, 9);
+      grantWood(c.wood, new THREE.Vector3(c.x, c.y + 0.7, c.z));
+      for (let k = 0; k < c.loot.length; k++) {
+        const kind = c.loot[k];
+        const a = (k === 0 ? Math.PI / 5 : Math.PI * 1.15) + Math.random() * 0.4;
+        const lx = c.x + Math.cos(a) * 1.25;
+        const lz = c.z + Math.sin(a) * 1.25;
+        const group = pickupMesh(kind);
+        group.position.set(lx, terrainHeight(lx, lz) + 0.06, lz);
+        if (quarryGroup) quarryGroup.add(group);
+        else scene.add(group);
+        pickups.push({ kind, x: lx, z: lz, group, taken: false, timer: 0, dropped: true, armed: false, gone: false });
+      }
+      playSfx('shatter');
+      showDamagePopup('📦 CRATE OPENED', new THREE.Vector3(c.x, c.y + 1.15, c.z), '#e0a860', true);
+    }
+
+    // Task P — plant idle animation: the belt texture scrolls and the
+    // amber beacons breathe. One shared material each, one tick.
+    function updateQuarryPlant(dt: number) {
+      if (worldKind !== 'quarry' || !quarryGroup) return;
+      if (quarryBeltMat?.map) quarryBeltMat.map.offset.y -= dt * 0.15; // ~1.4 m/s of belt
+      quarryBeaconT += dt;
+      if (quarryBeaconMat) quarryBeaconMat.emissiveIntensity = 1.1 + 0.9 * (0.5 + 0.5 * Math.sin(quarryBeaconT * 3.6));
+    }
+
     function clearQuarry() {
+      // plant registries first (they reference the group + materials)
+      for (let i = shootable.length - 1; i >= 0; i--) {
+        const u = (shootable[i] as THREE.Object3D).userData as any;
+        if (u?.quarryAdit || u?.quarryPlant || u?.cratePlant) shootable.splice(i, 1);
+      }
+      for (let i = caves.length - 1; i >= 0; i--) {
+        if ((caves[i] as CaveSite).adit) caves.splice(i, 1);
+      }
       if (quarryGroup) {
         scene.remove(quarryGroup);
         quarryGroup.traverse((o: any) => {
@@ -8457,6 +9199,19 @@ export default function BattleRoyaleGame() {
       quarryRockMat = null;
       quarryOreMat = null;
       quarrySteelMat = null;
+      // Task P: the working mine's own materials + registries
+      for (const m of quarryPlantMats) m.dispose();
+      quarryPlantMats.length = 0;
+      quarryCrateBodyMat?.dispose();
+      quarryCrateBodyMat = null;
+      quarryBeltMat?.dispose();
+      quarryBeltMat = null;
+      quarryBeaconMat?.dispose();
+      quarryBeaconMat = null;
+      quarryCrateBodies = null;
+      quarryCrateLids = null;
+      quarryAdits.length = 0;
+      quarryCrates.length = 0;
       quarryDressingSpots.length = 0;
       // the quarry's own chips leave with the mine
       for (let i = harborMarks.length - 1; i >= 0; i--) {
@@ -10102,6 +10857,75 @@ export default function BattleRoyaleGame() {
                 count: caves.length,
               };
             },
+            // Task P — quarry plant + crate probes: nearest intact crate
+            // (aim point for __debug.shootPoint), the first adit's mouth,
+            // and a full crate snapshot.
+            quarryPlant: () => {
+              const list = quarryCrates.map((c, i) => ({
+                i,
+                x: +c.x.toFixed(1),
+                y: +c.y.toFixed(1),
+                z: +c.z.toFixed(1),
+                hp: +c.hp.toFixed(0),
+                opened: c.opened,
+                inAdit: c.inAdit,
+              }));
+              let best: { i: number; d: number; x: number; y: number; z: number } | null = null;
+              for (let i = 0; i < quarryCrates.length; i++) {
+                const c = quarryCrates[i];
+                if (c.opened || c.inAdit) continue;
+                const d = Math.hypot(c.x - camera.position.x, c.z - camera.position.z);
+                if (!best || d < best.d) best = { i, d: +d.toFixed(1), x: c.x, y: c.y + 0.42, z: c.z };
+              }
+              const a = quarryAdits[0];
+              return {
+                crates: list.length,
+                adits: quarryAdits.length,
+                machinery: quarryMachineryCount,
+                conveyors: quarryConveyorCount,
+                nearestCrate: best,
+                firstAdit: a
+                  ? { x: +a.x.toFixed(1), z: +a.z.toFixed(1), floor: +(-(a.bench + 1) * Q_BENCH_H).toFixed(1), depth: +a.depth.toFixed(1) }
+                  : null,
+              };
+            },
+            // Task P — REAL GLSL compile probe for the POM injection:
+            // flips the lite switch off, builds a fresh terrain-kind
+            // material with enablePom, force-renders one frame (the
+            // program compiles synchronously) and reports anything the
+            // GLSL compiler raised. Headless SwiftShader == WebGL2/GLSL3,
+            // the same language level real devices compile.
+            pomCompileProbe: () => {
+              const captured: string[] = [];
+              const origErr = (window.console.error as (...a: unknown[]) => void).bind(window.console);
+              (window.console as unknown as { error: (...a: unknown[]) => void }).error = (...a: unknown[]) => {
+                captured.push(a.map((x) => String(x)).join(' '));
+              };
+              let ok = false;
+              let pomOn = false;
+              try {
+                setLitePBR(false);
+                const m = pbrMaterial({ color: 0x8a6f4f }, 'terrain');
+                enablePom(m, 'terrain', { depth: 0.045, steps: 8, near: 6, far: 10 });
+                pomOn = !!m.onBeforeCompile && !!m.userData.pom && m.userData.pom.lite === false;
+                const plane = new THREE.Mesh(new THREE.PlaneGeometry(6, 6), m);
+                plane.position.set(camera.position.x + 8, camera.position.y - 0.6, camera.position.z - 6);
+                plane.lookAt(camera.position.x, camera.position.y, camera.position.z);
+                scene.add(plane);
+                renderer.render(scene, camera);
+                scene.remove(plane);
+                plane.geometry.dispose();
+                m.dispose();
+                ok = true;
+              } catch (e) {
+                captured.push('throw: ' + String(e));
+              } finally {
+                (window.console as unknown as { error: (...a: unknown[]) => void }).error = origErr;
+                setLitePBR(isHeadless);
+              }
+              const shaderErrs = captured.filter((s) => /shader error|failed to compile|glsl|error:/i.test(s));
+              return { compiled: ok && pomOn && shaderErrs.length === 0, pomOn, shaderErrs };
+            },
             // Task N — snap the storm circle to a late stage so e2e can
             // test the darkzone without waiting out the 78 s first hold
             zoneJump: (stage = 2) => {
@@ -10384,10 +11208,67 @@ export default function BattleRoyaleGame() {
                             ramp: rampHeights,
                             dressingSpots: quarryDressingSpots.length,
                             marks: harborMarks.map((m) => m.label),
+                            // Task P — the working mine: adits, machinery,
+                            // conveyors, crates + the state of each
+                            plant: (() => {
+                              const firstAdit = quarryAdits[0];
+                              const aditMid = firstAdit
+                                ? {
+                                    x: +(firstAdit.x + firstAdit.ax * firstAdit.depth * 0.6).toFixed(1),
+                                    z: +(firstAdit.z + firstAdit.az * firstAdit.depth * 0.6).toFixed(1),
+                                    floor: +terrainHeight(
+                                      firstAdit.x + firstAdit.ax * firstAdit.depth * 0.6,
+                                      firstAdit.z + firstAdit.az * firstAdit.depth * 0.6
+                                    ).toFixed(1),
+                                    mouthFloor: +(-(firstAdit.bench + 1) * Q_BENCH_H).toFixed(1),
+                                    upperFloor: +(-firstAdit.bench * Q_BENCH_H).toFixed(1),
+                                    sunlit:
+                                      probeSunlit(
+                                        firstAdit.x + firstAdit.ax * firstAdit.depth * 0.6,
+                                        firstAdit.z + firstAdit.az * firstAdit.depth * 0.6,
+                                        -(firstAdit.bench + 1) * Q_BENCH_H + 1.6
+                                      ) || null,
+                                    darkInside: !!caveDarkAt(
+                                      firstAdit.x + firstAdit.ax * firstAdit.depth * 0.6,
+                                      -(firstAdit.bench + 1) * Q_BENCH_H + 1.6,
+                                      firstAdit.z + firstAdit.az * firstAdit.depth * 0.6
+                                    ),
+                                  }
+                                : null;
+                              return {
+                                adits: quarryAdits.length,
+                                aditDarkRecords: caves.filter((c) => c.adit).length,
+                                aditMid,
+                                machinery: quarryMachineryCount,
+                                conveyors: quarryConveyorCount,
+                                beltScrolling: quarryBeltMat?.map ? +quarryBeltMat.map.offset.y.toFixed(3) : null,
+                                beaconPulse: quarryBeaconMat ? +quarryBeaconMat.emissiveIntensity.toFixed(2) : null,
+                                crates: quarryCrates.length,
+                                cratesOpen: quarryCrates.filter((c) => c.opened).length,
+                                cratesInAdits: quarryCrates.filter((c) => c.inAdit && !c.opened).length,
+                                crateInstanced: !!quarryCrateBodies,
+                              };
+                            })(),
                           }
                         : null,
                   };
                 })(),
+                // Task P — POM: which materials march relief, with the
+                // fade window + step count. "wired" is observable even
+                // under LITE (the userData marker); "injected" is the
+                // real shader hook (true only on non-headless devices).
+                pom: {
+                  lite: isHeadless,
+                  terrain: !!terrainMat.userData.pom,
+                  terrainInjected: !!terrainMat.customProgramCacheKey,
+                  rock: !!(caveRockMat?.userData.pom || quarryRockMat?.userData.pom),
+                  rockInjected: !!(caveRockMat?.customProgramCacheKey || quarryRockMat?.customProgramCacheKey),
+                  spec: terrainMat.userData.pom || null,
+                  texTerrain: terrainMat.map ? ((terrainMat.map.image as HTMLCanvasElement)?.width ?? 0) : 0,
+                  texRock: caveRockMat?.map ? ((caveRockMat.map.image as HTMLCanvasElement)?.width ?? 0) : 0,
+                  texCrate: quarryCrateBodyMat?.map ? ((quarryCrateBodyMat.map.image as HTMLCanvasElement)?.width ?? 0) : 0,
+                  terrainNormals: !!terrainMat.normalMap,
+                },
                 fog: f ? { type: f.isFogExp2 ? 'FogExp2' : 'Fog', density: f.density, color: '#' + f.color.getHexString() } : null,
                 env: !!scene.environment,
                 envIntensity: scene.environmentIntensity,
@@ -10461,10 +11342,10 @@ export default function BattleRoyaleGame() {
                 treeCrowns: vegLib ? { trunkOnly: true, defs: Object.keys(vegLib).filter((k) => k.includes(TRK)).length } : null,
               };
             },
-            // Task M: HUD overlap resolver — force a pass, then read state
+            // Task M/P: HUD overlap resolver — force a pass, then read state
             hudResolve: () => {
-              const culled = resolveHudOverlaps();
-              return { ...hudOverlapInfo(), lastCulled: culled };
+              const handled = resolveHudOverlaps();
+              return { ...hudOverlapInfo(), lastHandled: handled };
             },
             hudOverlapInfo: () => hudOverlapInfo(),
             // Task K: tap-to-loot entry point (screen coords) for e2e
@@ -11474,6 +12355,13 @@ export default function BattleRoyaleGame() {
       const out: THREE.Object3D[] = [];
       for (const o of shootable) {
         const u = (o as any).userData ?? {};
+        // Task P — the crate cloud spans the whole pit: always test it
+        // (two InstancedMesh raycasts, ~30 boxes — cheaper than any
+        // distance pre-filter could save).
+        if (u.cratePlant) {
+          out.push(o);
+          continue;
+        }
         const vox = u.vox as VoxelBox | undefined;
         const ant = u.antenna as any;
         // Antenna meshes live in a group placed at world coords, so their
@@ -11591,6 +12479,10 @@ export default function BattleRoyaleGame() {
               hit.point,
               calculateStructureDamage(w.kind || 'sk', s.dmg)
             );
+          } else if (hit.object.userData.cratePlant && hit.instanceId != null) {
+            // Task P — the mine's wooden crates crack open under fire
+            const s = shotDamage(w, hit.distance);
+            damageQuarryCrate(hit.instanceId as number, s.dmg, hit.point);
           }
         }
       }
@@ -13711,6 +14603,14 @@ export default function BattleRoyaleGame() {
       }
       // Structures eat what is left: chew voxel chunks near the centre
       carveBlast(x, by, z, radius, dmg);
+      // Task P — the mine's wooden crates burst open in blasts (and
+      // rockets land here through blast()): one hit, whole crate.
+      for (let i = 0; i < quarryCrates.length; i++) {
+        const c = quarryCrates[i];
+        if (c.opened) continue;
+        const cd = Math.hypot(c.x - x, c.z - z);
+        if (cd < radius) damageQuarryCrate(i, dmg * share(cd), new THREE.Vector3(c.x, c.y + 0.45, c.z));
+      }
       // Demolition: player-built walls inside the blast radius take structural damage
       for (const dest of Array.from(wallDests.values())) {
         const dDist = Math.hypot(dest.bounds.x - x, dest.bounds.z - z);
@@ -15890,6 +16790,9 @@ export default function BattleRoyaleGame() {
       // so underwater tinting still wins while submerged.
       updateDarkness(dt);
       updateLights(dt);
+      // Task P — the working mine idles: conveyor belts scroll, beacons
+      // breathe (one tick, two shared materials, quarry only).
+      updateQuarryPlant(dt);
       updatePickups(dt);
       updateWeapon(dt);
       if (mouseHeld) shoot();
@@ -15923,14 +16826,19 @@ export default function BattleRoyaleGame() {
     }
 
     // ----------------------------------------------------
-    // HUD OVERLAP RESOLVER — "if two things are overlapping, the
-    // less important one is removed." Every listed HUD element
-    // carries a PRIORITY; a periodic layout pass measures real DOM
-    // rects and any element colliding with a higher-priority kept
-    // box is hidden (class hud-culled). It returns automatically
-    // once the overlap goes away — rotating back to landscape or
-    // closing the map brings culled elements straight back. Modal
-    // overlays, menus and the fx layers never participate.
+    // HUD OVERLAP RESOLVER, Task P edition — "the less important
+    // buttons do NOT disappear: they automatically REARRANGE
+    // themselves in a place where they don't overlap." Every listed
+    // HUD element carries a PRIORITY; the periodic layout pass
+    // measures real DOM rects, and a lower-priority element that
+    // collides with a kept box SEARCHES outward in rings for the
+    // nearest free spot (viewport-clamped) and slides there via the
+    // CSS `translate` property — independent of `transform`, so the
+    // press feedback and entrance animations compose untouched.
+    // The moment the overlap clears (rotate back, close the map, a
+    // chip times out) the next pass sends it home. NOTHING is ever
+    // hidden; `.hud-culled` survives only as the can't-fit-anywhere
+    // fallback for an element larger than the viewport itself.
     // ----------------------------------------------------
     const HUD_RULES: Array<[string, number]> = [
       // core controls — the game is unplayable without these
@@ -15941,13 +16849,13 @@ export default function BattleRoyaleGame() {
       ['#gPick', 96], // active interaction while open (skipped when closed)
       ['#slots', 94],
       ['.hud.ammo', 94],
+      ['#turret', 93], // Task P: the ability plate OWNS the top-right corner
       ['#gBtn', 92],
       ['#touchBuildBtn', 92],
       ['#minimap', 90],
       ['#dropPrompt', 88],
       ['#aliveChip', 86],
       ['#zoneChip', 86],
-      ['#turret', 84],
       ['#gPlate', 84],
       ['#buildWallBtn', 84],
       ['.hud.downs', 82],
@@ -15962,11 +16870,12 @@ export default function BattleRoyaleGame() {
     ];
     const HUD_EXCLUDE = '.overlay, .menu, .downed, .scope, .shield-fx, .hurt-fx, .smoke-fx, .water-fx';
     const hudCulled = new Set<Element>();
+    const hudMoved = new Map<Element, { dx: number; dy: number }>();
     let hudPasses = 0;
     let hudT = 0;
 
     // Stable readable key for reports: id when present, else the class
-    // chain minus our own marker (".hud.downs", never ".hud.downs.hud-culled").
+    // chain minus our own markers (".hud.downs", never ".hud.downs.hud-culled").
     const hudKey = (el: Element) =>
       el.id ||
       '.' +
@@ -15974,12 +16883,20 @@ export default function BattleRoyaleGame() {
           .filter((c) => c !== 'hud-culled')
           .join('.');
 
+    const rectsClash = (a: DOMRect, b: DOMRect, m: number) =>
+      a.left < b.right - m && a.right > b.left + m && a.top < b.bottom - m && a.bottom > b.top + m;
+
     function resolveHudOverlaps(): string[] {
       const root = containerRef.current;
       if (!root) return [];
-      // un-cull everything this system hid, then re-apply from scratch
+      // HOME first: clear every offset this system applied and un-cull
+      // the fallbacks, so each pass re-solves from the true layout.
+      for (const el of hudMoved.keys()) (el as HTMLElement).style.translate = '';
+      hudMoved.clear();
       for (const el of hudCulled) el.classList.remove('hud-culled');
       hudCulled.clear();
+      const vw = window.innerWidth;
+      const vh = window.innerHeight;
       const seen = new Set<Element>();
       const parts: Array<{ el: Element; prio: number; r: DOMRect }> = [];
       for (const [sel, prio] of HUD_RULES) {
@@ -15994,29 +16911,52 @@ export default function BattleRoyaleGame() {
         }
       }
       // highest priority first: each element keeps its box; anything
-      // colliding with an already-kept box loses (M = near-miss margin)
+      // colliding with an already-kept box REARRANGES (M = margin).
       parts.sort((a, b) => b.prio - a.prio);
       const M = 6;
       const kept: Array<{ el: Element; prio: number; r: DOMRect }> = [];
       const report: string[] = [];
       for (const p of parts) {
-        let clash = false;
-        for (const k of kept) {
-          if (
-            p.r.left < k.r.right - M &&
-            p.r.right > k.r.left + M &&
-            p.r.top < k.r.bottom - M &&
-            p.r.bottom > k.r.top + M
-          ) {
-            clash = true;
-            break;
-          }
+        if (!kept.some((k) => rectsClash(p.r, k.r, M))) {
+          kept.push(p);
+          continue;
         }
-        if (clash) {
+        // never big enough for ANY free spot? the lone true fallback
+        if (p.r.width > vw - 8 || p.r.height > vh - 8) {
           p.el.classList.add('hud-culled');
           hudCulled.add(p.el);
           report.push(hudKey(p.el));
+          continue;
+        }
+        // ring search: nearest clamped offset with no kept-box clash
+        const RADII = [16, 30, 46, 64, 88, 116, 150, 192, 240, 296, 360, 440];
+        let placed: DOMRect | null = null;
+        let pdx = 0;
+        let pdy = 0;
+        for (let ri = 0; ri < RADII.length && !placed; ri++) {
+          const rad = RADII[ri];
+          for (let dir = 0; dir < 16; dir++) {
+            const ang = (dir / 16) * Math.PI * 2 + (ri % 2 ? Math.PI / 16 : 0);
+            const dx = Math.round(Math.cos(ang) * rad);
+            const dy = Math.round(Math.sin(ang) * rad);
+            const cand = new DOMRect(p.r.left + dx, p.r.top + dy, p.r.width, p.r.height);
+            if (cand.left < 4 || cand.top < 4 || cand.right > vw - 4 || cand.bottom > vh - 4) continue;
+            if (kept.some((k) => rectsClash(cand, k.r, M))) continue;
+            placed = cand;
+            pdx = dx;
+            pdy = dy;
+            break;
+          }
+        }
+        if (placed) {
+          (p.el as HTMLElement).style.translate = pdx + 'px ' + pdy + 'px';
+          hudMoved.set(p.el, { dx: pdx, dy: pdy });
+          kept.push({ el: p.el, prio: p.prio, r: placed });
+          report.push(hudKey(p.el));
         } else {
+          // no free spot right now: stay home and VISIBLE (a button that
+          // overlaps beats a button that vanishes) — later elements
+          // still dodge it, and the next pass retries.
           kept.push(p);
         }
       }
@@ -16028,6 +16968,7 @@ export default function BattleRoyaleGame() {
       return {
         passes: hudPasses,
         culled: [...hudCulled].map(hudKey),
+        moved: [...hudMoved.entries()].map(([el, o]) => ({ key: hudKey(el), dx: o.dx, dy: o.dy })),
         rules: HUD_RULES.length,
       };
     }

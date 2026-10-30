@@ -793,9 +793,12 @@ body.touch .slot-name {
 .turret.is-pressed { transform: scale(0.94); }
 
 body.touch .turret {
+  /* Task P: the USE-ABILITIES button owns the TOP-RIGHT corner (the
+     grenade's old spot); the grenade is back at the middle-left. */
   left: auto;
-  right: calc(134px + env(safe-area-inset-right, 0px));
-  bottom: calc(104px + env(safe-area-inset-bottom, 0px));
+  right: calc(14px + env(safe-area-inset-right, 0px));
+  bottom: auto;
+  top: calc(14px + env(safe-area-inset-top, 0px));
   width: 72px;
   height: 72px;
   min-width: 0;
@@ -1800,10 +1803,13 @@ body.reloading .ammo .count { animation: reload-pulse 0.9s ease-in-out infinite;
   position: fixed;
   z-index: 1;
   pointer-events: none;
-  /* Portrait overhaul: the grenade/ability button owns the top-right
-     corner (was bottom-left) — clears the joystick cluster entirely. */
-  top: calc(14px + env(safe-area-inset-top, 0px));
-  right: calc(14px + env(safe-area-inset-right, 0px));
+  /* Task P: the grenade button is BACK at the middle-left edge — it
+     yields the top-right corner it borrowed during the portrait
+     overhaul; the ability plate owns that corner now. */
+  left: calc(14px + env(safe-area-inset-left, 0px));
+  right: auto;
+  top: 50%;
+  margin-top: -36px;
   width: 72px;
   height: 72px;
   border-radius: 50%;
@@ -2507,6 +2513,27 @@ body.touch .vitals {
   top: calc(128px + env(safe-area-inset-top, 0px));
 }
 
+/* Task P — LANDSCAPE touch layout: the top-left column compacts so the
+   MIDDLE-LEFT grenade lane stays empty (vitals would otherwise sit right
+   on the grenade button's home and the resolver would have to shuffle a
+   core control every pass). Build moves beside the fullscreen toggle,
+   vitals rides the TOP-CENTRE, the kill feed starts lower. */
+@media (max-height: 520px) and (orientation: landscape) {
+  body.touch .touch-build {
+    left: calc(68px + env(safe-area-inset-left, 0px));
+    top: calc(14px + env(safe-area-inset-top, 0px));
+  }
+  body.touch .vitals {
+    left: 50%;
+    transform: translateX(-50%);
+    top: calc(12px + env(safe-area-inset-top, 0px));
+  }
+  body.touch .killfeed {
+    top: calc(150px + env(safe-area-inset-top, 0px));
+    max-height: calc(100dvh - 160px);
+  }
+}
+
 /* BR chips slot under the top row on touch screens */
 body.touch .br-alive { top: calc(54px + env(safe-area-inset-top, 0px)); }
 body.touch .zonechip { top: calc(94px + env(safe-area-inset-top, 0px)); }
@@ -2554,7 +2581,8 @@ body.touch .kf {
 }
 body.touch .pickhint { display: none; }
 
-/* Grenade sheet opens DOWNWARD from the top-right button */
+/* Grenade sheet opens DOWNWARD from wherever the grenade button sits
+   (middle-left now) — the JS positions + clamps it to the viewport. */
 .gpick.below { flex-direction: column; }
 
 /* Portrait ammo plate: the fire-mode segment keeps its full labels

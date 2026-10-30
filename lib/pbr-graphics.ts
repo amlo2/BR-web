@@ -113,21 +113,28 @@ interface KindSpec {
   warm: number; // -1 cool .. +1 warm hue shift
   cells: number; // base noise lattice density
   seed: number;
+  // Task P — HIGH-DETAIL normals: environmental surfaces (rock faces,
+  // gravel, dirt, crates, timber) render 512px texture sets with an extra
+  // fine-grain octave so their normal maps carry macro relief AND
+  // cm-scale micro detail. Everything else stays 256px (screen-adjacent
+  // props where 256 already reads crisp).
+  size?: number; // texture edge in px (default 256)
+  fine?: number; // fine-octave blend weight 0..1 (adds a 2-octave high-freq lattice)
 }
 
 const KINDS: Record<PBRKind, KindSpec> = {
   generic:   { octaves: 6, contrast: 0.38, grain: 0.10, roughLo: 0.62, roughHi: 0.92, metal: 0.04, normal: 0.55, repeat: 1.6,  warm: 0.0,  cells: 8,  seed: 11 },
-  terrain:   { octaves: 6, contrast: 0.52, grain: 0.12, roughLo: 0.82, roughHi: 1.00, metal: 0.0,  normal: 0.62, repeat: 0.16, warm: 0.0,  cells: 8,  seed: 27 },
+  terrain:   { octaves: 5, contrast: 0.52, grain: 0.12, roughLo: 0.82, roughHi: 1.00, metal: 0.0,  normal: 0.8,  repeat: 0.16, warm: 0.0,  cells: 8,  seed: 27, size: 512, fine: 0.28 },
   grass:     { octaves: 6, contrast: 0.55, grain: 0.13, roughLo: 0.80, roughHi: 1.00, metal: 0.0,  normal: 0.5,  repeat: 0.2,  warm: 0.05, cells: 10, seed: 33 },
   foliage:   { octaves: 6, contrast: 0.45, grain: 0.11, roughLo: 0.75, roughHi: 0.95, metal: 0.0,  normal: 0.45, repeat: 1.0,  warm: 0.05, cells: 9,  seed: 41 },
   bark:      { octaves: 5, contrast: 0.52, grain: 0.13, roughLo: 0.80, roughHi: 1.00, metal: 0.0,  normal: 0.9,  repeat: 2.0,  warm: 0.12, cells: 7,  seed: 57 },
-  wood:      { octaves: 5, contrast: 0.50, grain: 0.12, roughLo: 0.62, roughHi: 0.9,  metal: 0.0,  normal: 0.6,  repeat: 1.8,  warm: 0.15, cells: 7,  seed: 63 },
-  plank:     { octaves: 5, contrast: 0.55, grain: 0.13, roughLo: 0.58, roughHi: 0.88, metal: 0.0,  normal: 0.7,  repeat: 1.8,  warm: 0.12, cells: 6,  seed: 71 },
+  wood:      { octaves: 5, contrast: 0.50, grain: 0.12, roughLo: 0.62, roughHi: 0.9,  metal: 0.0,  normal: 0.75, repeat: 1.8,  warm: 0.15, cells: 7,  seed: 63, size: 512, fine: 0.22 },
+  plank:     { octaves: 5, contrast: 0.55, grain: 0.13, roughLo: 0.58, roughHi: 0.88, metal: 0.0,  normal: 0.85, repeat: 1.8,  warm: 0.12, cells: 6,  seed: 71, size: 512, fine: 0.24 },
   metal:     { octaves: 5, contrast: 0.38, grain: 0.08, roughLo: 0.24, roughHi: 0.58, metal: 0.45, normal: 0.35, repeat: 2.0,  warm: -0.06, cells: 8, seed: 83 },
   painted:   { octaves: 5, contrast: 0.32, grain: 0.07, roughLo: 0.34, roughHi: 0.6,  metal: 0.28, normal: 0.3,  repeat: 2.0,  warm: 0.0,  cells: 8,  seed: 91 },
   concrete:  { octaves: 6, contrast: 0.45, grain: 0.14, roughLo: 0.68, roughHi: 0.98, metal: 0.0,  normal: 0.7,  repeat: 1.7,  warm: 0.04, cells: 8, seed: 103 },
-  rock:      { octaves: 6, contrast: 0.60, grain: 0.14, roughLo: 0.66, roughHi: 1.00, metal: 0.0,  normal: 1.0,  repeat: 1.6,  warm: -0.04, cells: 7, seed: 109 },
-  sand:      { octaves: 6, contrast: 0.40, grain: 0.12, roughLo: 0.85, roughHi: 1.00, metal: 0.0,  normal: 0.4,  repeat: 2.0,  warm: 0.18, cells: 9, seed: 127 },
+  rock:      { octaves: 5, contrast: 0.60, grain: 0.14, roughLo: 0.66, roughHi: 1.00, metal: 0.0,  normal: 1.15, repeat: 1.6,  warm: -0.04, cells: 7, seed: 109, size: 512, fine: 0.3 },
+  sand:      { octaves: 5, contrast: 0.40, grain: 0.12, roughLo: 0.85, roughHi: 1.00, metal: 0.0,  normal: 0.55, repeat: 2.0,  warm: 0.18, cells: 9, seed: 127, size: 512, fine: 0.32 },
   fabric:    { octaves: 5, contrast: 0.35, grain: 0.11, roughLo: 0.74, roughHi: 0.96, metal: 0.0,  normal: 0.4,  repeat: 2.4,  warm: 0.02, cells: 10, seed: 131 },
   skin:      { octaves: 4, contrast: 0.2,  grain: 0.06, roughLo: 0.42, roughHi: 0.62, metal: 0.0,  normal: 0.22, repeat: 3.0,  warm: 0.2,  cells: 9, seed: 139 },
   glass:     { octaves: 3, contrast: 0.10, grain: 0.02, roughLo: 0.04, roughHi: 0.12, metal: 0.06, normal: 0.1,  repeat: 1.0,  warm: -0.02, cells: 4, seed: 149 },
@@ -137,6 +144,7 @@ interface PBRTextures {
   map: THREE.Texture;
   roughnessMap: THREE.Texture;
   normalMap: THREE.Texture;
+  heightMap: THREE.Texture; // Task P: greyscale relief for POM (uploaded only when a material uses it)
 }
 
 // Lite mode for software-rasterized test environments (headless Chrome /
@@ -152,15 +160,24 @@ export function setLitePBR(on: boolean) {
 const TEX_SIZE = 256;
 const texCache = new Map<PBRKind, PBRTextures>();
 
-/** Builds (and caches) the three procedural maps for a kind. All
+/** Builds (and caches) the four procedural maps for a kind. All
  *  materials of one kind share one texture set — GPU memory stays
  *  bounded no matter how many materials the game spawns. */
 function kindTextures(kind: PBRKind): PBRTextures {
   const hit = texCache.get(kind);
   if (hit) return hit;
   const s = KINDS[kind] ?? KINDS.generic;
-  const S = TEX_SIZE;
+  const S = s.size ?? TEX_SIZE;
   const hgt = fbmField(S, s.cells, s.seed, s.octaves);
+  // Task P — fine-grain octave: a second, high-frequency lattice blended
+  // into the field so hi-res normal maps carry cm-scale relief (gravel
+  // chips, wood grain, craggy rock) on top of the macro forms.
+  const fine = s.fine ?? 0;
+  if (fine > 0) {
+    const f2 = fbmField(S, s.cells * 4, s.seed + 5, 2);
+    const w2 = 1 - fine;
+    for (let i = 0; i < hgt.length; i++) hgt[i] = hgt[i] * w2 + f2[i] * fine;
+  }
 
   const alb = document.createElement('canvas');
   alb.width = alb.height = S;
@@ -176,6 +193,11 @@ function kindTextures(kind: PBRKind): PBRTextures {
   norC.width = norC.height = S;
   const nCtx = norC.getContext('2d')!;
   const nImg = nCtx.createImageData(S, S);
+
+  const hgtC = document.createElement('canvas');
+  hgtC.width = hgtC.height = S;
+  const hCtx = hgtC.getContext('2d')!;
+  const hImg = hCtx.createImageData(S, S);
 
   const at = (x: number, y: number) => hgt[((y % S) + S) % S * S + (((x % S) + S) % S)];
   const strength = 2.2; // sobel gain
@@ -213,11 +235,19 @@ function kindTextures(kind: PBRKind): PBRTextures {
       nImg.data[p + 1] = Math.round(((-dy / nl) * 0.5 + 0.5) * 255);
       nImg.data[p + 2] = Math.round((1 / nl) * 0.5 * 255 + 127.5);
       nImg.data[p + 3] = 255;
+      // height: the relief field itself — POM ray-marches this to push
+      // real depth into rock walls and terraced ground up close.
+      const hv = Math.round(255 * Math.min(1, Math.max(0, h)));
+      hImg.data[p] = hv;
+      hImg.data[p + 1] = hv;
+      hImg.data[p + 2] = hv;
+      hImg.data[p + 3] = 255;
     }
   }
   aCtx.putImageData(aImg, 0, 0);
   rCtx.putImageData(rImg, 0, 0);
   nCtx.putImageData(nImg, 0, 0);
+  hCtx.putImageData(hImg, 0, 0);
 
   const mk = (cv: HTMLCanvasElement, srgb: boolean) => {
     const t = new THREE.CanvasTexture(cv);
@@ -232,6 +262,7 @@ function kindTextures(kind: PBRKind): PBRTextures {
     map: mk(alb, true),
     roughnessMap: mk(rgh, false),
     normalMap: mk(norC, false),
+    heightMap: mk(hgtC, false),
   };
   texCache.set(kind, set);
   return set;
@@ -261,6 +292,115 @@ export function pbrMaterial(
   // stay dielectric-ish so their dark paints never read as black blobs)
   if (params.metalness === undefined) m.metalness = LITE ? 0 : s.metal;
   if (params.roughness === undefined) m.roughness = 1.0;
+  return m;
+}
+
+// ---------------------------------------------------------------------------
+// Task P — PARALLAX OCCLUSION MAPPING (POM), mobile-safe
+//
+// Real ray-marched relief on top of MeshStandardMaterial: the fragment
+// walks a few layers INTO the height texture along the tangent-space view
+// ray and shifts every map sample (albedo / roughness / normal) to the
+// silhouetted surface point. Mobile guardrails, exactly as requested:
+//   * STRICT DISTANCE FADE — full strength within `near` metres, gone by
+//     `far` (default 6 -> 10 m): outside the fade window the shader
+//     short-circuits to the flat uv (zero extra texture fetches).
+//   * LOW STEP COUNT — 8 height taps per fragment, hard-capped loop.
+//   * the relief depth itself scales down with the fade so nothing pops
+//     when the boundary crosses a pixel.
+// Applied to the rock walls / terraced ground materials (kind 'terrain'
+// and 'rock'). Headless/LITE never injects the shader at all.
+// ---------------------------------------------------------------------------
+
+export interface PomOptions {
+  depth?: number; // relief depth in uv units (grazing max shift)
+  steps?: number; // march layers (low = mobile-smooth)
+  near?: number; // full POM inside this camera distance (m)
+  far?: number; // POM fully faded beyond this camera distance (m)
+}
+
+export function enablePom(
+  m: THREE.MeshStandardMaterial,
+  kind: PBRKind,
+  opts: PomOptions = {}
+): THREE.MeshStandardMaterial {
+  const o = {
+    depth: opts.depth ?? 0.05,
+    steps: Math.max(2, Math.min(12, Math.round(opts.steps ?? 8))),
+    near: opts.near ?? 6,
+    far: opts.far ?? 10,
+  };
+  // Wiring marker — set even under LITE so e2e can prove the hookup.
+  m.userData.pom = { kind, lite: LITE, ...o };
+  if (LITE) return m; // software raster: never pay for the march
+  if (!m.map || !m.normalMap) return m; // POM samples those varyings
+  const heightMap = kindTextures(kind).heightMap;
+  m.onBeforeCompile = (shader: any) => {
+    shader.uniforms.uPomHeight = { value: heightMap };
+    shader.uniforms.uPomDepth = { value: o.depth };
+    shader.uniforms.uPomSteps = { value: o.steps };
+    shader.uniforms.uPomNear = { value: o.near };
+    shader.uniforms.uPomFar = { value: o.far };
+    const chunks: Record<string, string> = (THREE as any).ShaderChunk ?? {};
+    // Same chunk bodies three would inline — only the sampled uv is
+    // swapped to the parallax-shifted one (version-proof: the source
+    // strings come from the installed three, not from memory).
+    const swapUv = (name: string, from: string) => {
+      const src = chunks[name];
+      if (typeof src !== 'string' || !src.includes(from)) {
+        throw new Error('pbr-graphics enablePom: chunk ' + name + ' does not sample ' + from);
+      }
+      return src.split(from).join('vUvPom');
+    };
+    const POM_PRELUDE = [
+      'uniform sampler2D uPomHeight;',
+      'uniform float uPomDepth;',
+      'uniform float uPomSteps;',
+      'uniform float uPomNear;',
+      'uniform float uPomFar;',
+      'vec2 vUvPom = vMapUv;',
+      '{',
+      '  float pomDist = length(vViewPosition);',
+      '  float pomW = 1.0 - smoothstep(uPomNear, uPomFar, pomDist);',
+      '  if (pomW > 0.001) {',
+      '    vec3 pomV = normalize(vViewPosition);',
+      '    mat3 pomTBN = getTangentFrame(-vViewPosition, normalize(vNormal), vNormalMapUv);',
+      '    vec3 pomTv = normalize(vec3(dot(pomTBN[0], pomV), dot(pomTBN[1], pomV), dot(pomTBN[2], pomV)));',
+      '    if (pomTv.z > 0.02) {',
+      '      vec2 pomP = (pomTv.xy / max(abs(pomTv.z), 0.15)) * uPomDepth * pomW;',
+      '      vec2 pomDelta = pomP / uPomSteps;',
+      '      float pomLayer = 1.0 / uPomSteps;',
+      '      float pomCurLayer = 0.0;',
+      '      vec2 pomCur = vMapUv;',
+      '      float pomDepthVal = 1.0 - texture2D(uPomHeight, pomCur).r;',
+      '      for (int pomI = 0; pomI < 16; pomI++) {',
+      '        if (float(pomI) >= uPomSteps || pomCurLayer >= pomDepthVal) break;',
+      '        pomCur -= pomDelta;',
+      '        pomDepthVal = 1.0 - texture2D(uPomHeight, pomCur).r;',
+      '        pomCurLayer += pomLayer;',
+      '      }',
+      '      vec2 pomPrev = pomCur + pomDelta;',
+      '      float pomAfter = pomDepthVal - pomCurLayer;',
+      '      float pomBefore = (1.0 - texture2D(uPomHeight, pomPrev).r) - (pomCurLayer - pomLayer);',
+      '      float pomWt = clamp(pomAfter / (pomAfter - pomBefore + 1e-4), 0.0, 1.0);',
+      '      vUvPom = mix(pomCur, pomPrev, pomWt);',
+      '    }',
+      '  }',
+      '}',
+    ].join('\n');
+    let f = shader.fragmentShader;
+    // 1. uniforms into the pars scope (before main)
+    f = f.replace('#include <common>', '#include <common>\n' + POM_PRELUDE.split('\n').slice(0, 5).join('\n'));
+    // 2. the march itself at the very top of main()
+    f = f.replace('#include <clipping_planes_fragment>', '#include <clipping_planes_fragment>\n' + POM_PRELUDE.split('\n').slice(5).join('\n'));
+    // 3. every map now samples the parallax-shifted uv
+    f = f.replace('#include <map_fragment>', swapUv('map_fragment', 'vMapUv'));
+    f = f.replace('#include <roughnessmap_fragment>', swapUv('roughnessmap_fragment', 'vRoughnessMapUv'));
+    f = f.replace('#include <normal_fragment_maps>', swapUv('normal_fragment_maps', 'vNormalMapUv'));
+    shader.fragmentShader = f;
+  };
+  // POM programs must never be shared with plain PBR programs
+  m.customProgramCacheKey = () => 'pom|' + kind + '|' + o.depth + '|' + o.steps + '|' + o.near + '|' + o.far;
   return m;
 }
 
