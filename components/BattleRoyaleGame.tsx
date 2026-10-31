@@ -85,6 +85,13 @@ export default function BattleRoyaleGame() {
       e.stopPropagation();
       setFireMode('manual');
     });
+    // Task Q — the reload button inside the weapon panel (desktop
+    // keeps the persistent plate; touch opens it with a slot hold).
+    // startReload is idempotent while a reload is already running.
+    $('reloadBtn')?.addEventListener('click', (e) => {
+      e.stopPropagation();
+      startReload();
+    });
     const sliderEl = $('slider');
     const sliderKnobEl = $('sliderKnob');
     const pickHintEl = $('pickHint');
@@ -105,6 +112,32 @@ export default function BattleRoyaleGame() {
       typeof navigator !== 'undefined' &&
       (navigator.maxTouchPoints > 0 || window.matchMedia('(pointer: coarse)').matches);
     document.body.classList.toggle('touch', touchDevice);
+
+    // ----------------------------------------------------
+    // Task Q — THE 20% SMALLER MOBILE UI. Every HUD/menu element
+    // lives inside #uiScale; on touch devices that layer is 125%
+    // of the viewport with transform: scale(0.8). Anything that
+    // READS geometry keeps using getBoundingClientRect (viewport
+    // px, already scale-correct). Anything that WRITES pixel
+    // offsets INTO the layer must divide by this factor first —
+    // one px inside the layer renders 0.8 px on screen.
+    // ----------------------------------------------------
+    const uiScaleEl = $('uiScale');
+    function uiScale() {
+      if (!uiScaleEl || !document.body.classList.contains('touch')) return 1;
+      const t = getComputedStyle(uiScaleEl).transform;
+      if (!t || t === 'none') return 1;
+      try {
+        const a = new DOMMatrix(t).a;
+        return a > 0.1 ? a : 1;
+      } catch {
+        return 1;
+      }
+    }
+    // viewport px -> scaled-layer px (for style.left/top writes)
+    const toLayerPx = (px: number) => px / uiScale();
+    // expose for the e2e overlap-injection helpers
+    (window as any).__uiScale = uiScale;
 
     // ----------------------------------------------------
     // Renderer, scene, camera
@@ -1307,7 +1340,20 @@ export default function BattleRoyaleGame() {
     const TILE_DEEP = new THREE.Color(0x2f5d70);
     const TILE_WASTE = new THREE.Color(0x99855c); // ashen wasteland dirt
     const TILE_CLIFF = new THREE.Color(0x4c4f55); // bare dark cliff rock
-    const tiles = new Map<string, { mesh: THREE.Mesh; cx: number; cz: number; veg?: THREE.Mesh | null; leaf?: THREE.Mesh | null; blob?: THREE.Mesh | null; vegSolids?: SolidBox[]; vegTreeVox?: VoxelBox[] }>();
+    const tiles = new Map<
+      string,
+      {
+        mesh: THREE.Mesh;
+        cx: number;
+        cz: number;
+        cull?: THREE.Sphere;
+        veg?: THREE.Mesh | null;
+        leaf?: THREE.Mesh | null;
+        blob?: THREE.Mesh | null;
+        vegSolids?: SolidBox[];
+        vegTreeVox?: VoxelBox[];
+      }
+    >();
 
     // GERSTNER OCEAN: rolling open-water swell (gentle steepness, no
     // lumps), tight sun sparkles, a whisper of subsurface teal at the
@@ -1481,10 +1527,34 @@ export default function BattleRoyaleGame() {
       if (veg?.mesh) scene.add(veg.mesh);
       if (veg?.leafMesh) scene.add(veg.leafMesh);
       if (veg?.blobMesh) scene.add(veg.blobMesh);
+      // Task Q — CULL BOUNDS FROM THE REAL GEOMETRY. The old pass tested
+      // a y=0-centred sphere of TILE*0.75, which is fine on the island
+      // but WRONG in the quarry: the pit floor sits 320 m below sea
+      // level, so once the camera descended the ramp every tile's test
+      // sphere floated hundreds of metres ABOVE the player and the
+      // surrounding terrain "unrendered". All tile meshes carry
+      // world-space vertices, so the union of their bounding spheres is
+      // the true screen footprint (terrain + vegetation + leaves).
+      const cull = new THREE.Sphere();
+      let cullInit = false;
+      for (const m of [mesh, veg?.mesh ?? null, veg?.leafMesh ?? null, veg?.blobMesh ?? null]) {
+        if (!m) continue;
+        m.geometry.computeBoundingSphere();
+        const bs = m.geometry.boundingSphere;
+        if (!bs) continue;
+        if (!cullInit) {
+          cull.copy(bs);
+          cullInit = true;
+        } else {
+          cull.union(bs);
+        }
+      }
+      if (cullInit) cull.radius += 8; // paint margin: decals, skirts
       tiles.set(tx + ',' + tz, {
         mesh,
         cx: (tx + 0.5) * TILE,
         cz: (tz + 0.5) * TILE,
+        cull: cullInit ? cull : undefined,
         veg: veg?.mesh ?? null,
         leaf: veg?.leafMesh ?? null,
         blob: veg?.blobMesh ?? null,
@@ -1493,7 +1563,15 @@ export default function BattleRoyaleGame() {
       });
     }
 
-    function disposeTile(t: { mesh: THREE.Mesh; veg?: THREE.Mesh | null; leaf?: THREE.Mesh | null; blob?: THREE.Mesh | null; vegSolids?: SolidBox[]; vegTreeVox?: VoxelBox[] }) {
+    function disposeTile(t: {
+      mesh: THREE.Mesh;
+      cull?: THREE.Sphere;
+      veg?: THREE.Mesh | null;
+      leaf?: THREE.Mesh | null;
+      blob?: THREE.Mesh | null;
+      vegSolids?: SolidBox[];
+      vegTreeVox?: VoxelBox[];
+    }) {
       scene.remove(t.mesh);
       t.mesh.geometry.dispose();
       if (t.veg) {
@@ -6293,6 +6371,12 @@ export default function BattleRoyaleGame() {
         setFireMode('manual');
         return;
       }
+      // Task Q: the panel's reload button — click it without the
+      // click also counting as a fire press
+      if (inRect($('reloadBtn'), e.clientX, e.clientY, 4)) {
+        startReload();
+        return;
+      }
       if (inRect(sliderEl, e.clientX, e.clientY, 6)) {
         sliderTouch = { id: -1, x0: e.clientX, y0: e.clientY, committed: false, down: false };
         sliderEl?.classList.add('is-pressed');
@@ -11071,6 +11155,87 @@ export default function BattleRoyaleGame() {
               }
               return { harbor: { hidden: hid, shown }, props: { hidden: ph, shown: ps }, loot: { hidden: lh, shown: ls } };
             },
+            // Task Q: the 20% smaller UI + the slot-anchored weapon
+            // panel + the bounds-correct terrain cull (quarry pit)
+            taskqInfo: () => {
+              const plate = ammoPlateEl;
+              const pr = plate ? plate.getBoundingClientRect() : null;
+              const sr = slotEls.map((el) => (el ? el.getBoundingClientRect() : null));
+              let tilesTotal = 0;
+              let tilesVisible = 0;
+              let deepTiles = 0;
+              let deepVisible = 0;
+              const deepList: Array<{ cx: number; cy: number; r: number; vis: boolean }> = [];
+              for (const t of tiles.values()) {
+                tilesTotal++;
+                if (t.mesh.visible) tilesVisible++;
+                if (t.cull && t.cull.center.y - t.cull.radius < -100) {
+                  deepTiles++;
+                  if (t.mesh.visible) deepVisible++;
+                  if (deepList.length < 10)
+                    deepList.push({
+                      cx: +t.cx.toFixed(0),
+                      cy: +t.cull.center.y.toFixed(0),
+                      r: +t.cull.radius.toFixed(0),
+                      vis: t.mesh.visible,
+                    });
+                }
+              }
+              const slot = weaponPanel ? sr[weaponPanel.slot] : null;
+              return {
+                scale: +uiScale().toFixed(3),
+                layer: uiScaleEl
+                  ? {
+                      layout: uiScaleEl.offsetWidth,
+                      visual: Math.round(uiScaleEl.getBoundingClientRect().width),
+                      viewport: window.innerWidth,
+                    }
+                  : null,
+                panel: {
+                  open: !!weaponPanel,
+                  slot: weaponPanel ? weaponPanel.slot : -1,
+                  cls: plate ? plate.className : '',
+                  left: plate ? plate.style.left : '',
+                  right: plate ? plate.style.right : '',
+                  top: plate ? plate.style.top : '',
+                  rect: pr
+                    ? {
+                        x: Math.round(pr.x),
+                        y: Math.round(pr.y),
+                        r: Math.round(pr.right),
+                        b: Math.round(pr.bottom),
+                        w: Math.round(pr.width),
+                        h: Math.round(pr.height),
+                      }
+                    : null,
+                  leftOfSlot: !!(pr && slot && pr.right <= slot.left + 1),
+                  overlapSlot: !!(pr && slot && pr.right > slot.left && pr.left < slot.right),
+                },
+                slots: sr.map((r) => (r ? { x: Math.round(r.x), y: Math.round(r.y), r: Math.round(r.right), b: Math.round(r.bottom) } : null)),
+                reloadBtn: reloadBtnEl ? { exists: true, text: reloadBtnEl.textContent, busy: reloadBtnEl.classList.contains('busy') } : { exists: false },
+                wpanelLog: wpanelLog.slice(-12),
+                fall: { safe: FALL_SAFE, perM: FALL_DMG_PER_M, cap: 85 },
+                cull: { tilesTotal, tilesVisible, deepTiles, deepVisible, deepList },
+                cam: { x: +camera.position.x.toFixed(1), y: +camera.position.y.toFixed(1), z: +camera.position.z.toFixed(1) },
+              };
+            },
+            // Task Q: force the 0.35 s culling pass right now (e2e)
+            runCull: () => {
+              cullT = 0;
+              cullingPass(0);
+              return true;
+            },
+            // Task Q: weapon/ammo state + a spend tap for reload e2e
+            ammoNow: () =>
+              current
+                ? { kind: current.kind, loaded: current.loaded, mag: current.mag, reserve: reserve[current.ammo] || 0 }
+                : null,
+            taskqSpendAmmo: (n: number) => {
+              if (!current) return -1;
+              current.loaded = Math.max(0, current.loaded - Math.min(+n || 0, current.loaded));
+              refreshHud();
+              return current.loaded;
+            },
             // Task L: e2e A/B — toggle the ground's procedural map live
             setGroundMap: (on: boolean) => {
               const m = ground.material as THREE.MeshStandardMaterial;
@@ -11549,6 +11714,7 @@ export default function BattleRoyaleGame() {
       aimBtn?.classList.remove('is-pressed');
       slotEls.forEach((el) => el?.classList.remove('is-pressed'));
       slotHold = null;
+      slotPress = null;
       cancelGrenadePress();
     }
 
@@ -11570,6 +11736,12 @@ export default function BattleRoyaleGame() {
       };
       if (inRect($('fireModeAuto'), x, y, 6)) return 'fireModeAuto';
       if (inRect($('fireModeManual'), x, y, 6)) return 'fireModeManual';
+      // Task Q: the weapon panel's own controls. The SLOTS are tested
+      // BEFORE the panel body — the panel floats NEXT to a slot, and a
+      // tap on the slot must always win, even mid-anchor-jitter.
+      if (inRect($('reloadBtn'), x, y, 8)) return 'reload';
+      if (slotAt(x, y) >= 0) return 'slot';
+      if (weaponPanel && inRect(ammoPlateEl, x, y, 10)) return 'weaponPanel';
       if (inRect(minimapEl, x, y, 8)) return 'minimap';
       if (near(stickBase, 1.5)) return 'stick';
       if (near(aimBtn, 1.2)) return 'aim';
@@ -11578,7 +11750,6 @@ export default function BattleRoyaleGame() {
       if (inRect(gBtnEl, x, y, 12)) return 'grenade';
       if (inRect(inventoryBtnEl, x, y, 6)) return 'inventory';
       if (inRect(sliderEl, x, y, 6)) return 'slider';
-      if (slotAt(x, y) >= 0) return 'slot';
       return 'look';
     }
 
@@ -11612,7 +11783,10 @@ export default function BattleRoyaleGame() {
       }
       const kx = THREE.MathUtils.clamp(dx, -SLIDER_KNOB_R, SLIDER_KNOB_R);
       const ky = THREE.MathUtils.clamp(dy, -SLIDER_KNOB_R, SLIDER_KNOB_R);
-      if (sliderKnobEl) sliderKnobEl.style.transform = `translate(${kx}px, ${ky}px)`;
+      // Task Q: the knob lives in the scaled layer — undo the scale so
+      // it still tracks the thumb 1:1 on screen
+      const ks = uiScale();
+      if (sliderKnobEl) sliderKnobEl.style.transform = `translate(${kx / ks}px, ${ky / ks}px)`;
     }
 
     function sliderEnd() {
@@ -11671,9 +11845,21 @@ export default function BattleRoyaleGame() {
           aimPressed();
         }
         if (role === 'slot' && slot >= 0) {
-          pressSlot(slot);
+          // Task Q: taps and holds are told apart at RELEASE time — a
+          // touch-down only ARMS the slot. Hold >= 0.35 s opens the
+          // weapon panel (updateWeaponPanel); a short, still touch is
+          // the classic tap (switch / DESELECT the weapon).
+          slotPress = { i: slot, t0: nowMs(), moved: false, held: false };
           slotEls[slot]?.classList.add('is-pressed');
         }
+        if (role === 'reload') {
+          startReload();
+          refreshWeaponPanel();
+        }
+        if (role === 'weaponPanel') refreshWeaponPanel();
+        // any touch that is NOT on the weapon panel (and not on a slot
+        // that is busy holding it open) dismisses the panel
+        if (weaponPanel && (role === 'look' || role === 'stick' || role === 'aim')) closeWeaponPanel();
         if (role === 'slider') sliderStart(t);
         if (role === 'turret') {
           primaryAction();
@@ -11703,6 +11889,13 @@ export default function BattleRoyaleGame() {
         if (tc.role === 'stick') setStick(t.clientX, t.clientY);
         if (tc.role === 'slider') sliderMove(t);
         if (tc.role === 'grenade') grenadeSlide(t.identifier, t.clientY);
+        if (tc.role === 'slot' && slotPress && !slotPress.held) {
+          // a drag off the slot is neither a tap nor a hold — cancel it
+          if (Math.hypot(t.clientX - tc.x0, t.clientY - tc.y0) > 24) {
+            slotPress.moved = true;
+            slotEls[slotPress.i]?.classList.remove('is-pressed');
+          }
+        }
         if (tc.role === 'look' || tc.role === 'aim') {
           const sens = TOUCH_SENS * lookScale();
           yaw -= (t.clientX - tc.x) * sens;
@@ -11729,6 +11922,11 @@ export default function BattleRoyaleGame() {
         grenadeUp('touch', t.identifier);
         const tc = touches.get(t.identifier);
         if (tc?.role === 'slot' && tc.slot >= 0) {
+          // Task Q: the release decides — held (panel opened) does
+          // nothing further; a short still touch is the TAP: switch
+          // weapons or DESELECT (holster) the one in hand.
+          if (slotPress && !slotPress.held && !slotPress.moved) pressSlot(tc.slot);
+          slotPress = null;
           releaseSlot(tc.slot);
           slotEls[tc.slot]?.classList.remove('is-pressed');
         }
@@ -12128,6 +12326,7 @@ export default function BattleRoyaleGame() {
       scopeT = 0;
       scopeEl?.classList.remove('on');
       slotHold = null;
+      slotPress = null;
       current = null;
     }
 
@@ -12165,6 +12364,127 @@ export default function BattleRoyaleGame() {
 
     function releaseSlot(i: number) {
       slotHold = null;
+    }
+
+    // ----------------------------------------------------
+    // Task Q — THE WEAPON PANEL AT THE WEAPON SLOTS.
+    // On touch the ammo plate (weapon name, ammo count, the
+    // auto/manual selector and the RELOAD button) only appears
+    // while a weapon slot is HELD DOWN (~0.35 s) and anchors
+    // itself to the LEFT of that slot. A short tap keeps the
+    // classic contract: tap the active slot -> weapon DESELECTED
+    // (holstered), tap the other slot -> switch. The panel stays
+    // open a few seconds after the hold (or until a tap outside)
+    // so its buttons are actually reachable.
+    // ----------------------------------------------------
+    const ammoPlateEl = document.querySelector('.hud.ammo') as HTMLElement | null;
+    const reloadBtnEl = $('reloadBtn');
+    let slotPress: { i: number; t0: number; moved: boolean; held: boolean } | null = null;
+    let weaponPanel: { open: boolean; slot: number; until: number } | null = null;
+    const WEAPON_PANEL_STICKY = 6000; // ms of panel inactivity before auto-close
+    const wpanelLog: string[] = []; // e2e/debug: who opened/closed it, when
+    const wlog = (m: string) => {
+      if (wpanelLog.length > 40) wpanelLog.shift();
+      wpanelLog.push(Math.round(nowMs() % 100000) + ' ' + m);
+    };
+
+    let lastAnchorKey = '';
+    function anchorWeaponPanel() {
+      if (!weaponPanel || !ammoPlateEl) return;
+      const slotEl = slotEls[weaponPanel.slot];
+      if (!slotEl) return;
+      const s = uiScale();
+      let r = slotEl.getBoundingClientRect(); // viewport px (scale-aware)
+      // The slot's HOME box: the overlap resolver parks dodge offsets
+      // on the #slots container as a CSS `translate` (local px), and
+      // the press feedback scales the slot itself — anchor to the
+      // un-dodged home position so the panel never drifts onto the slot.
+      const cont = slotEl.parentElement as HTMLElement | null;
+      if (cont && cont.style.translate) {
+        const parts = cont.style.translate.split(/\s+/);
+        const tx = (parseFloat(parts[0]) || 0) * s;
+        const ty = (parts[1] !== undefined ? parseFloat(parts[1]) || 0 : 0) * s;
+        r = new DOMRect(r.left - tx, r.top - ty, r.width, r.height);
+      }
+      const ph = ammoPlateEl.offsetHeight;
+      const vw = window.innerWidth;
+      const vh = window.innerHeight;
+      // PIN THE RIGHT EDGE to the left of the slot (10 local px lane):
+      // anchoring by right instead of left means a content-driven width
+      // change can never push the panel ONTO the slot — it grows left.
+      const right = toLayerPx(vw) - toLayerPx(r.left) + 10;
+      let top = toLayerPx(r.top);
+      if (top + ph > toLayerPx(vh - 6)) top = Math.max(toLayerPx(6), toLayerPx(vh - 6) - ph);
+      if (top < toLayerPx(6)) top = toLayerPx(6);
+      const key = Math.round(right) + ':' + Math.round(top);
+      if (key === lastAnchorKey) return; // settled — no style churn
+      lastAnchorKey = key;
+      ammoPlateEl.style.left = 'auto';
+      ammoPlateEl.style.right = Math.round(right) + 'px';
+      ammoPlateEl.style.top = Math.round(top) + 'px';
+    }
+
+    function openWeaponPanel(i: number) {
+      // guard on the body class (not the touchDevice const) so the e2e
+      // body.touch override and real phones behave identically
+      if (!ammoPlateEl || !document.body.classList.contains('touch')) return;
+      weaponPanel = { open: true, slot: i, until: nowMs() + WEAPON_PANEL_STICKY };
+      wlog('open slot' + i + ' held');
+      ammoPlateEl.classList.remove('open');
+      // display it (block) so it can be measured, position it, then
+      // reveal — all in one tick, so nothing flashes at the old spot
+      void ammoPlateEl.offsetWidth;
+      ammoPlateEl.classList.add('open', 'transient');
+      lastAnchorKey = '';
+      anchorWeaponPanel();
+      try {
+        navigator.vibrate?.(12);
+      } catch {
+        /* no haptics — fine */
+      }
+    }
+
+    function closeWeaponPanel() {
+      wlog('close' + (weaponPanel ? ' slot' + weaponPanel.slot : ' idle'));
+      weaponPanel = null;
+      if (!ammoPlateEl) return;
+      ammoPlateEl.classList.remove('open', 'transient');
+      ammoPlateEl.style.left = '';
+      ammoPlateEl.style.right = '';
+      ammoPlateEl.style.top = '';
+    }
+
+    function refreshWeaponPanel(ms = WEAPON_PANEL_STICKY) {
+      if (weaponPanel) {
+        weaponPanel.until = nowMs() + ms;
+        wlog('refresh +' + ms);
+      }
+    }
+
+    function updateWeaponPanel() {
+      // the hold: 0.35 s of still pressure on a slot opens the panel
+      // (and suppresses the tap action that fires on release). A drag
+      // off the slot cancelled the press already.
+      if (slotPress && !slotPress.held && !slotPress.moved && nowMs() - slotPress.t0 >= HOLD_TIME * 1000) {
+        slotPress.held = true;
+        openWeaponPanel(slotPress.i);
+      }
+      if (!weaponPanel) return;
+      if (nowMs() > weaponPanel.until) {
+        closeWeaponPanel();
+        return;
+      }
+      // keep the panel glued to its slot's HOME box every tick (the
+      // change guard inside the anchor skips redundant style writes)
+      anchorWeaponPanel();
+      // live reload button state
+      if (reloadBtnEl) {
+        const w = current;
+        const busy = !!w && reloadT > 0;
+        const full = !!w && w.loaded >= w.mag;
+        reloadBtnEl.classList.toggle('busy', busy);
+        reloadBtnEl.textContent = busy ? 'Reloading…' : full ? 'Loaded' : 'Reload';
+      }
     }
 
     function cycleWeapon() {
@@ -12582,13 +12902,9 @@ export default function BattleRoyaleGame() {
         if (on) w.flare.scale.setScalar(w.flare.scale.x * (1 - 2.4 * dt)); // quick decay
       }
       kick *= Math.exp(-12 * dt);
-      if (slotHold && !slotHold.held) {
-        slotHold.t += dt;
-        if (slotHold.t >= HOLD_TIME) {
-          slotHold.held = true;
-          startReload();
-        }
-      }
+      // Task Q — slot holds open the weapon panel; taps (released
+      // before the hold threshold) keep the deselect/switch contract.
+      updateWeaponPanel();
       if (w && reloadT > 0) {
         reloadT -= dt;
         if (reloadT <= 0) {
@@ -13626,11 +13942,15 @@ export default function BattleRoyaleGame() {
     // Drops past the safe band bite HEALTH directly, so mountains,
     // towers and roof-hopping all carry real risk. Water landings are
     // free (swimming never prices a drop) — dive from anything.
-    const FALL_SAFE = 4.6; // metres you can drop without a scratch
-    const FALL_DMG_PER_M = 9; // HP per metre beyond the safe drop
+    // Task Q — LESS AGGRESSIVE: the safe band is nearly doubled and
+    // the per-metre bite halved, so bench hops and roof drops cost a
+    // sliver instead of half a health bar (a 12 m drop: 20 HP now,
+    // was 67; a 20 m drop: 60, was 95-cap).
+    const FALL_SAFE = 8; // metres you can drop without a scratch
+    const FALL_DMG_PER_M = 5; // HP per metre beyond the safe drop
     function checkFallDamage(drop: number) {
       if (playerDown || drop <= FALL_SAFE) return;
-      const dmg = Math.min(95, (drop - FALL_SAFE) * FALL_DMG_PER_M);
+      const dmg = Math.min(85, (drop - FALL_SAFE) * FALL_DMG_PER_M);
       life = Math.max(0, life - dmg);
       sinceHurt = 0;
       hurtFlash = 0.4;
@@ -13641,6 +13961,7 @@ export default function BattleRoyaleGame() {
     }
 
     function goDown() {
+      if (weaponPanel) closeWeaponPanel();
       if (bombArmed) {
         bombArmed = false;
         updateBombHud();
@@ -14401,21 +14722,24 @@ export default function BattleRoyaleGame() {
       if (!p || !gPickEl) return;
       const anchor = document.body.classList.contains('touch') ? gBtnEl : gPlateEl;
       if (!anchor) return;
+      // Task Q: the picker is positioned from VIEWPORT rects but lives
+      // inside the scaled UI layer — write the offsets in layer px.
+      const gs = uiScale();
       const r = anchor.getBoundingClientRect();
-      gPickEl.style.left = Math.max(8, Math.min(window.innerWidth - 128, r.left + r.width / 2 - 60)) + 'px';
-      // The grenade button now lives at the TOP-RIGHT (portrait HUD
-      // overhaul), so the sheet opens DOWNWARD from it and the flick
-      // gesture runs down the rows. Desktop's bottom-left plate and any
-      // future bottom anchor keep the old open-above behaviour.
+      gPickEl.style.left =
+        Math.max(8 / gs, Math.min(toLayerPx(window.innerWidth) - 128, toLayerPx(r.left + r.width / 2) - 60)) + 'px';
+      // The grenade button now lives at the MIDDLE-LEFT (Task P), so the
+      // sheet opens DOWNWARD from it and the flick gesture runs down the
+      // rows. Any bottom-anchored button keeps the old open-above path.
       const below = r.top < 200;
       gPickEl.classList.toggle('below', below);
       if (below) {
         gPickEl.style.bottom = 'auto';
-        gPickEl.style.top = r.bottom + 12 + 'px';
-        p.bottomY = r.bottom + 12; // flick reference: the sheet's top row
+        gPickEl.style.top = toLayerPx(r.bottom + 12) + 'px';
+        p.bottomY = r.bottom + 12; // flick reference: the sheet's top row (viewport px)
       } else {
         gPickEl.style.top = 'auto';
-        gPickEl.style.bottom = window.innerHeight - r.top + 12 + 'px';
+        gPickEl.style.bottom = toLayerPx(window.innerHeight - r.top + 12) + 'px';
         p.bottomY = r.top - 12;
       }
       p.down = below;
@@ -15062,6 +15386,9 @@ export default function BattleRoyaleGame() {
       if (downsEl) downsEl.textContent = String(downs);
       playerDown = false;
       respawnT = 0;
+      // Task Q: leaving a run folds the slot-anchored weapon panel
+      if (weaponPanel) closeWeaponPanel();
+      slotPress = null;
       life = lifeMax();
       shield = shieldMax();
       sinceHurt = 99;
@@ -15485,7 +15812,10 @@ export default function BattleRoyaleGame() {
         el.dataset.state = 'edge';
         if (dirEl) dirEl.style.transform = `rotate(${(Math.atan2(dy, dx) * 180) / Math.PI + 90}deg)`;
       }
-      el.style.transform = `translate(${sx.toFixed(1)}px, ${sy.toFixed(1)}px)`;
+      // Task Q: trackers live inside the scaled UI layer — write their
+      // position in layer px so they still sit exactly on their target
+      const ts = uiScale();
+      el.style.transform = `translate(${(sx / ts).toFixed(1)}px, ${(sy / ts).toFixed(1)}px)`;
       const txt = text(Math.round(dist));
       if (tagEl && tagEl.textContent !== txt) tagEl.textContent = txt;
     }
@@ -15792,6 +16122,8 @@ export default function BattleRoyaleGame() {
       if (mapOpen === open) return;
       mapOpen = open;
       if (mapOverlayEl) mapOverlayEl.hidden = !open;
+      // Task Q: opening the tactical map dismisses the weapon panel
+      if (open && weaponPanel) closeWeaponPanel();
     }
 
     function updateMapHud() {
@@ -16694,7 +17026,12 @@ export default function BattleRoyaleGame() {
     //                  skip even when nearby (three.js still frustum-
     //                  culls individual meshes, but whole-group skips
     //                  cut scene-graph traversal + shadow passes too).
-    // Sphere radii are generous so nothing ever pops at screen edges.
+    // Task Q: every test sphere is centred at the object's REAL
+    // altitude (tiles carry a bounds sphere computed from their actual
+    // geometry — the quarry pit floor is 320 m below sea level, and
+    // the old y=0-centred spheres made the terrain vanish as the
+    // player drove down the mine ramp). Radii stay generous so
+    // nothing ever pops at screen edges.
     const CULL_R = 700; // just past the fog: nothing pops in view
     const cullFrustum = new THREE.Frustum();
     const cullProjMatrix = new THREE.Matrix4();
@@ -16711,29 +17048,40 @@ export default function BattleRoyaleGame() {
       const pz = camera.position.z;
       const r2 = CULL_R * CULL_R;
       const isFar = (x: number, z: number) => (x - px) ** 2 + (z - pz) ** 2 > r2;
-      const inView = (x: number, z: number, r: number) => {
-        cullSphere.center.set(x, 0, z);
+      const inView = (x: number, y: number, z: number, r: number) => {
+        cullSphere.center.set(x, y, z);
         cullSphere.radius = r;
         return cullFrustum.intersectsSphere(cullSphere);
       };
+      const inViewSphere = (s: THREE.Sphere) => {
+        cullSphere.center.copy(s.center);
+        cullSphere.radius = s.radius;
+        return cullFrustum.intersectsSphere(cullSphere);
+      };
       for (const child of harborGroup.children) {
-        const vis = !isFar(child.position.x, child.position.z) && inView(child.position.x, child.position.z, 46);
+        const vis =
+          !isFar(child.position.x, child.position.z) &&
+          inView(child.position.x, child.position.y + 12, child.position.z, 46);
         if (child.visible !== vis) child.visible = vis;
       }
       for (const wp of warProps) {
-        const vis = !isFar(wp.x, wp.z) && inView(wp.x, wp.z, 16);
+        const vis = !isFar(wp.x, wp.z) && inView(wp.x, wp.group.position.y + 7, wp.z, 18);
         if (wp.group.visible !== vis) wp.group.visible = vis;
       }
       for (const p of pickups) {
         if (p.taken || p.gone) continue;
-        const vis = !isFar(p.x, p.z) && inView(p.x, p.z, 3);
+        // loot can sit hundreds of metres down on the quarry floor —
+        // test the sphere at the loot's own altitude
+        const vis = !isFar(p.x, p.z) && inView(p.x, p.group.position.y + 0.8, p.z, 3);
         if (p.group.visible !== vis) p.group.visible = vis;
       }
       // Terrain tiles stream by distance already — add the frustum
       // test so the half-world behind the camera stops drawing (terrain
-      // mesh, merged vegetation, leaf cards, AO decals together).
+      // mesh, merged vegetation, leaf cards, AO decals together). The
+      // sphere is the tile's TRUE bounds (see addTile), so deep-pit
+      // geometry stays visible from the pit floor.
       for (const t of tiles.values()) {
-        const vis = inView(t.cx, t.cz, TILE * 0.75);
+        const vis = t.cull ? inViewSphere(t.cull) : inView(t.cx, 0, t.cz, TILE * 0.75);
         if (t.mesh.visible !== vis) t.mesh.visible = vis;
         if (t.veg && t.veg.visible !== vis) t.veg.visible = vis;
         if (t.leaf && t.leaf.visible !== vis) t.leaf.visible = vis;
@@ -16889,6 +17237,10 @@ export default function BattleRoyaleGame() {
     function resolveHudOverlaps(): string[] {
       const root = containerRef.current;
       if (!root) return [];
+      // Task Q: offsets are computed in VIEWPORT px but written into
+      // the scaled UI layer, where one px renders at 0.8 px — divide
+      // by the live scale so a 40 px dodge reads as 40 px on screen.
+      const s = uiScale();
       // HOME first: clear every offset this system applied and un-cull
       // the fallbacks, so each pass re-solves from the true layout.
       for (const el of hudMoved.keys()) (el as HTMLElement).style.translate = '';
@@ -16902,6 +17254,9 @@ export default function BattleRoyaleGame() {
       for (const [sel, prio] of HUD_RULES) {
         for (const el of root.querySelectorAll(sel)) {
           if (seen.has(el) || el.closest(HUD_EXCLUDE)) continue;
+          // transient popovers (the Task Q weapon panel) are hand-
+          // anchored to their slot — the resolver leaves them alone
+          if (el.classList.contains('transient')) continue;
           // the grenade picker only participates while it is actually open
           if (el.id === 'gPick' && !el.classList.contains('open')) continue;
           seen.add(el);
@@ -16949,7 +17304,8 @@ export default function BattleRoyaleGame() {
           }
         }
         if (placed) {
-          (p.el as HTMLElement).style.translate = pdx + 'px ' + pdy + 'px';
+          // write into the scaled layer: local px = viewport px / scale
+          (p.el as HTMLElement).style.translate = pdx / s + 'px ' + pdy / s + 'px';
           hudMoved.set(p.el, { dx: pdx, dy: pdy });
           kept.push({ el: p.el, prio: p.prio, r: placed });
           report.push(hudKey(p.el));
@@ -17059,22 +17415,29 @@ export default function BattleRoyaleGame() {
 
   return (
     <div ref={containerRef} className="relative w-full h-full overflow-hidden select-none touch-none">
-      {/* Fullscreen toggle — pinned upper-left, lives above both the menu
-          and the in-game HUD. Deploy also auto-requests fullscreen. */}
-      <button type="button" className="fs-btn" id="fsBtn" aria-label="Toggle fullscreen" aria-pressed="false" title="Fullscreen (Deploy also enters it)">
-        <svg className="fs-expand" viewBox="0 0 24 24" aria-hidden="true">
-          <path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" />
-        </svg>
-        <svg className="fs-shrink" viewBox="0 0 24 24" aria-hidden="true">
-          <path d="M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" />
-        </svg>
-      </button>
       <canvas id="game" ref={canvasRef} aria-label="First-person view" />
       <div className="storm-fx" id="stormFx" aria-hidden="true" />
       <div className="shield-fx" id="shieldFx" aria-hidden="true" />
       <div className="hurt-fx" id="hurtFx" aria-hidden="true" />
       <div className="smoke-fx" id="smokeFx" aria-hidden="true" />
       <div className="water-fx" id="waterFx" aria-hidden="true" />
+
+      {/* Task Q — THE SCALED UI LAYER: every HUD / menu / overlay element
+          lives inside .ui-scale so the whole mobile interface renders 20%
+          smaller (desktop: display:contents, byte-identical behaviour).
+          The canvas + the full-screen fx layers stay OUTSIDE so the WebGL
+          resolution and the vignettes are untouched by the scale. */}
+      <div className="ui-scale" id="uiScale">
+        {/* Fullscreen toggle — pinned upper-left, lives above both the menu
+            and the in-game HUD. Deploy also auto-requests fullscreen. */}
+        <button type="button" className="fs-btn" id="fsBtn" aria-label="Toggle fullscreen" aria-pressed="false" title="Fullscreen (Deploy also enters it)">
+          <svg className="fs-expand" viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" />
+          </svg>
+          <svg className="fs-shrink" viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" />
+          </svg>
+        </button>
 
       {/* Antenna minimap (passive — tap it or M for the tactical map).
           The compass strip is gone: portrait screens are too narrow for
@@ -17242,8 +17605,12 @@ export default function BattleRoyaleGame() {
         </div>
       </button>
 
-      {/* Ammo Plate */}
-      <div className="hud ammo">
+      {/* Ammo Plate — Task Q: on touch this is the WEAPON PANEL. It only
+          appears while a weapon slot is HELD DOWN (a short tap keeps the
+          old contract: tap the active slot -> weapon DESELECTED, tap the
+          other -> switch), anchors itself to the LEFT of that slot, and
+          carries the reload button. Desktop keeps the persistent plate. */}
+      <div className="hud ammo" id="ammoPlate">
         <div className="weapon-header">
           <div className="weapon" id="weapon">
             Pistol
@@ -17272,7 +17639,12 @@ export default function BattleRoyaleGame() {
           <span id="ammo">12</span>
           <small id="mag"> / 12</small>
         </div>
-        <div className="reserve" id="reserve">LIGHT 60</div>
+        <div className="ammo-foot">
+          <div className="reserve" id="reserve">LIGHT 60</div>
+          <button type="button" className="reload-btn" id="reloadBtn" aria-label="Reload weapon">
+            Reload
+          </button>
+        </div>
       </div>
 
       {/* Touch UI (Mobile) */}
@@ -18102,6 +18474,8 @@ export default function BattleRoyaleGame() {
           </div>
         </div>
       </div>
+      </div>
+      {/* end .ui-scale — Task Q scaled mobile UI layer */}
     </div>
   );
 }

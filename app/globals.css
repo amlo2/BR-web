@@ -90,6 +90,57 @@ canvas#game {
   touch-action: none;
 }
 
+/* ----------------------------------------------------
+   Task Q — THE ENTIRE MOBILE UI IS 20% SMALLER.
+   Every HUD / menu / overlay element now lives inside one
+   scaled layer (.ui-scale): on touch devices the layer is
+   125% of the viewport and carries transform: scale(0.8),
+   so every button, plate, chip and menu renders at exactly
+   80% of its designed size while keeping its proportional
+   position. Desktop is untouched (display: contents — no
+   box, no transform, identical behaviour).
+   JS that measures elements keeps using getBoundingClientRect
+   (viewport px, scale-correct); JS that WRITES pixel offsets
+   into this layer divides by window.__uiScale() first.
+   ---------------------------------------------------- */
+.ui-scale {
+  display: contents;
+  /* viewport-unit shims (identity on desktop) */
+  --ui-vw: 100vw;
+  --ui-vh: 100vh;
+  --ui-dvh: 100dvh;
+  --ui-vmin: 100vmin;
+  --ui-vmax: 100vmax;
+}
+
+body.touch .ui-scale {
+  display: block;
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 125%;   /* 100% / 0.8 — after scaling, exactly the viewport */
+  height: 125%;
+  transform: scale(0.8);
+  transform-origin: 0 0;
+  pointer-events: none; /* children re-enable their own */
+  z-index: 1;
+  /* Screen-fraction sizes inside the scaled layer must reference
+     the layer's own box (125%), not the raw viewport units. */
+  --ui-vw: 125vw;
+  --ui-vh: 125vh;
+  --ui-dvh: 125dvh;
+  --ui-vmin: 125vmin;
+  --ui-vmax: 125vmax;
+}
+
+/* Real interactive roots re-enable pointer events (the menu already
+   follows this pattern internally: .menu is none, its cards are auto) */
+body.touch .ui-scale .overlay,
+body.touch .ui-scale button,
+body.touch .ui-scale [role='button'] {
+  pointer-events: auto;
+}
+
 .hud {
   position: fixed;
   z-index: 1;
@@ -203,11 +254,14 @@ body.aiming .crosshair {
   position: absolute;
   left: 50%;
   top: 50%;
-  width: min(88vh, 88vw);
+  /* Task Q: viewport-unit shims — inside the scaled mobile layer these
+     resolve against the 125% layer box, so the lens still covers 88% of
+     the REAL screen and the vignette still swallows every edge. */
+  width: min(calc(0.88 * var(--ui-vh, 100vh)), calc(0.88 * var(--ui-vw, 100vw)));
   aspect-ratio: 1;
   transform: translate(-50%, -50%);
   border-radius: 50%;
-  box-shadow: 0 0 0 100vmax #000;
+  box-shadow: 0 0 0 var(--ui-vmax, 100vmax) #000;
   background: radial-gradient(circle, var(--reticle) 0 1.5px, transparent 2px);
 }
 
@@ -310,7 +364,7 @@ body.aiming .crosshair {
 .vitals {
   top: 60px; /* tucked under the Downs plate */
   left: 16px;
-  width: min(200px, calc(100vw - 32px));
+  width: min(200px, calc(var(--ui-vw, 100vw) - 32px));
   padding: 7px 9px;
   display: grid;
   gap: 7px;
@@ -559,12 +613,91 @@ body.aiming .crosshair {
 }
 
 body:not(.touch) .touch-ui { display: none; }
+
+/* ----------------------------------------------------
+   Task Q — THE WEAPON PANEL LIVES AT THE WEAPON SLOTS.
+   On touch the ammo plate (weapon name, ammo count,
+   auto/manual selector, reload button) is INVISIBLE until a
+   weapon slot is HELD (~0.35 s); it then anchors itself to
+   the LEFT of that slot. A short tap keeps the old contract:
+   tap the active slot -> weapon DESELECTED (holstered),
+   tap the other slot -> switch. Desktop keeps the persistent
+   bottom-right plate.
+   ---------------------------------------------------- */
 body.touch .ammo {
-  /* right column: ability button (top) -> minimap -> ammo plate */
-  top: calc(240px + env(safe-area-inset-top, 0px));
-  right: 14px;
+  top: auto;
+  right: auto;
   bottom: auto;
-  max-width: 170px;
+  left: auto;
+  max-width: 176px;
+  text-align: left;
+  display: none; /* only a slot HOLD opens it */
+}
+
+body.touch .ammo.open {
+  display: block;
+  animation: wpanel-in 0.16s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes wpanel-in {
+  from {
+    opacity: 0;
+    scale: 0.94 1;
+  }
+  to {
+    opacity: 1;
+    scale: 1 1;
+  }
+}
+
+.ammo-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+/* Touch: the reload button is the panel's key action — give it the
+   full width of the panel (the reserve stacks above it) */
+body.touch .ammo-foot {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+}
+
+.reload-btn {
+  width: auto;
+  margin-top: 0;
+  padding: 8px 14px;
+  border-radius: 8px;
+  border: 1px solid rgba(242, 165, 22, 0.55);
+  background: rgba(242, 165, 22, 0.16);
+  color: #ffd98a;
+  font: 800 0.72rem/1 var(--font-display);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  pointer-events: auto;
+  cursor: pointer;
+  transition: transform 0.06s, filter 0.12s;
+}
+
+body.touch .reload-btn {
+  width: 100%;
+  padding: 9px 10px;
+}
+
+.reload-btn:active {
+  transform: scale(0.96);
+  filter: brightness(1.2);
+}
+
+.reload-btn[disabled] {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.reload-btn.busy {
+  animation: reload-pulse 0.9s ease-in-out infinite;
 }
 
 
@@ -1937,8 +2070,8 @@ body.touch .gplate { display: none; }
   max-width: 560px;
   display: flex;
   flex-direction: column;
-  max-height: calc(100vh - 32px);
-  max-height: calc(100dvh - 32px);
+  max-height: calc(var(--ui-vh, 100vh) - 32px);
+  max-height: calc(var(--ui-dvh, 100dvh) - 32px);
 }
 
 .inventory-body {
@@ -2221,8 +2354,11 @@ body:not(.touch) .touch-build { display: none; }
 }
 
 body.touch .minimap {
-  top: calc(90px + env(safe-area-inset-top, 0px));
-  right: 14px;
+  /* Task Q: the antenna map moved UP — it now sits in the TOP-RIGHT
+     cluster, directly BESIDE the use-abilities button (which keeps
+     the corner). Turret (72px at right 14) + 10px lane + this disc. */
+  top: calc(14px + env(safe-area-inset-top, 0px));
+  right: calc(96px + env(safe-area-inset-right, 0px));
   padding: 6px;
 }
 
@@ -2288,8 +2424,8 @@ body.touch .minimap-key {
 }
 
 .map-wrap canvas {
-  width: min(80vw, 520px);
-  height: min(80vw, 520px);
+  width: min(calc(0.8 * var(--ui-vw, 100vw)), 520px);
+  height: min(calc(0.8 * var(--ui-vw, 100vw)), 520px);
   border-radius: 12px;
   border: 1px solid rgba(255, 255, 255, 0.14);
 }
@@ -2347,8 +2483,8 @@ body.touch .minimap-key {
   }
 
   .map-wrap canvas {
-    width: min(88vw, 420px);
-    height: min(88vw, 420px);
+    width: min(calc(0.88 * var(--ui-vw, 100vw)), 420px);
+    height: min(calc(0.88 * var(--ui-vw, 100vw)), 420px);
   }
 }
 
@@ -2391,10 +2527,12 @@ body.touch .minimap-key {
   animation: low-pulse 1.05s ease-in-out infinite;
 }
 
-/* Kill feed — right edge, newest on top */
+/* Kill feed — right edge, newest on top (desktop keeps clear of the
+   antenna minimap: top 92 + 176 canvas); on touch it moves to the
+   LEFT column (see the Task K block below) */
 .killfeed {
   display: none;
-  top: 292px; /* below the antenna minimap (top 92 + 176 canvas) */
+  top: 292px;
   right: 14px;
   flex-direction: column;
   align-items: flex-end;
@@ -2494,12 +2632,13 @@ body.br .downed { display: none; }
 }
 
 /* ----------------------------------------------------
-   Portrait HUD overhaul (Task K):
+   Portrait HUD overhaul (Task K) + Task Q updates:
    - compass strip removed; minimap (antenna) is the only nav
    - pick-up button removed — tap the item itself (mobile)
    - wood purse lives in the Inventory sheet
    - ability button top-right, build button top-left
-   - right column: ability -> minimap -> ammo; kill feed left
+   - Task Q: minimap BESIDE the ability button; the weapon
+     panel anchors at the slots; everything 20% smaller
    ---------------------------------------------------- */
 body.touch .downs {
   /* clears the fullscreen button + build button that own the corner */
@@ -2530,7 +2669,7 @@ body.touch .vitals {
   }
   body.touch .killfeed {
     top: calc(150px + env(safe-area-inset-top, 0px));
-    max-height: calc(100dvh - 160px);
+    max-height: calc(var(--ui-dvh, 100dvh) - 160px);
   }
 }
 
@@ -2545,7 +2684,7 @@ body.touch .killfeed {
   right: auto;
   top: calc(252px + env(safe-area-inset-top, 0px));
   align-items: flex-start;
-  max-height: calc(100dvh - 268px);
+  max-height: calc(var(--ui-dvh, 100dvh) - 268px);
   overflow: hidden;
 }
 body.touch .kf {
